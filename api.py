@@ -124,14 +124,6 @@ class Store:
                     return None
             return None
 
-    def audit(self, actor, action, detail):
-        with self.lock:
-            self.db.execute(
-                "INSERT INTO audit(at,actor,action,detail) VALUES (?,?,?,?)",
-                (now_ms(), actor, action, json.dumps(detail)[:2000]),
-            )
-            self.db.commit()
-
     def gate(self):
         with self.lock:
             rev, mode, message, since, _ = self.db.execute(
@@ -147,16 +139,16 @@ class Store:
         }
 
     def set_gate(self, mode, message, actor_id, actor_role, expected, key):
-        if mode not in MODES:
+        if not isinstance(mode, str) or mode not in MODES:
             raise Bad("mode: open, draining или maintenance.")
         if not isinstance(message, str):
             raise Bad("message must be a string.")
         message = message.strip()[:MAX_MESSAGE]
-        if not actor_id or len(actor_id) > 128:
+        if not isinstance(actor_id, str) or not actor_id or len(actor_id) > 128:
             raise Bad("actor.id missing.")
-        if actor_role not in ACTOR_ROLES:
+        if not isinstance(actor_role, str) or actor_role not in ACTOR_ROLES:
             raise Bad("actor.role: owner или admin.")
-        if not key or len(key) > 128:
+        if not isinstance(key, str) or not key or len(key) > 128:
             raise Bad("idempotencyKey missing.")
         with self.lock:
             rev, cur, _, since, _ = self.db.execute(
@@ -266,7 +258,8 @@ class Handler(BaseHTTPRequestHandler):
         name = self.server.store.check(self._bearer(), READ_SCOPE)
         if not name:
             return self._send(401, {"error": "unauthorized"})
-        self.server.store.audit(name, "gate:get", {})
+        # Reads never write: the proxy polls every 5 s, an audit row per poll
+        # would grow the DB ~17k rows/day. Token use stays in last_used_at.
         return self._send(200, self.server.store.gate())
 
     def do_POST(self):
