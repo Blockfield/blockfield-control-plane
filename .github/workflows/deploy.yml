@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       digest:
-        description: "Image digest to pin (sha256:...); empty pins what :latest currently serves"
+        description: "Image digest to deploy (sha256:...); empty deploys what :main currently serves"
         required: false
 permissions:
   contents: read
@@ -14,15 +14,11 @@ concurrency:
 jobs:
   deploy:
     runs-on: blockfield-deploy
-    # Pin the digest, redeploy and verify; failure re-pins the running digest.
-    timeout-minutes: 60
     env:
-      # One-time owner setup (see docs/DEPLOY.md): DOKPLOY_API_URL (Dokploy
-      # dashboard base URL) and DOKPLOY_API_TOKEN (profile settings -> API/CLI)
-      # repository secrets. No registry credentials are stored in the app.
-      DOKPLOY_API_URL: ${{ secrets.DOKPLOY_API_URL }}
-      DOKPLOY_API_TOKEN: ${{ secrets.DOKPLOY_API_TOKEN }}
-      DIGEST: ${{ inputs.digest }}
+      # Redeploys only the control plane's release-only :prod channel; no Dokploy API key in Actions.
+      DOKPLOY_CP_WEBHOOK: ${{ secrets.DOKPLOY_CP_WEBHOOK }}
+    # Rollout and its rollback at the deploy-webhooks.py limits.
+    timeout-minutes: 60
     steps:
       - run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
@@ -33,13 +29,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Pin the digest, redeploy and verify the running digest
+      - name: Deploy the digest, roll back to the running digest on failure
+        env:
+          DIGEST: ${{ inputs.digest }}
         run: |
-          set -euo pipefail
-          # deploy() pins the digest, redeploys and verifies that every
-          # running task serves it; on failure it re-pins the running digest.
-          if [ -n "$DIGEST" ]; then
-            python3 -I scripts/dokploy-pin.py deploy "$DIGEST"
-          else
-            python3 -I scripts/dokploy-pin.py deploy
-          fi
+          python3 - <<'PYCODE'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          hooks = __import__('deploy-webhooks')
+          image = 'ghcr.io/blockfield/blockfield-control-plane'
+          digest = os.environ['DIGEST'] or hooks.registry_digest(f'{image}:main')
+          if not hooks.DIGEST.fullmatch(digest):
+              raise SystemExit(f'expected an immutable image digest, got {digest!r}')
+          # Fail closed: without a known-good running digest there is no rollback target.
+          previous = hooks.current('blockfield-control-plane')
+          try:
+              hooks.deploy('blockfield-control-plane', digest)
+          except BaseException:
+              hooks.deploy('blockfield-control-plane', previous)
+              raise
+          PYCODE
