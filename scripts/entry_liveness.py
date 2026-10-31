@@ -230,7 +230,14 @@ def check(args):
         )
     workshop_host = args.workshop_host or workshop_host_from_container()
     if workshop_host is None:
-        print("SKIP tcp_workshop: no BLOCKFIELD_WORKSHOP_HOST found", flush=True)
+        # proxy#48 closed the Workshop leg with no gate catching it: an
+        # unverified Workshop leg fails the gate, it never slips through.
+        record(
+            False,
+            "tcp_workshop",
+            "no BLOCKFIELD_WORKSHOP_HOST: container discovery failed and none "
+            "given (pass --workshop-host; proxy#48 mode: unverified leg)",
+        )
     else:
         try:
             status = status_ping(args.proxy_host, args.tcp_port, workshop_host)
