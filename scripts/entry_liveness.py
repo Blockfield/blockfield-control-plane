@@ -15,10 +15,14 @@ What each probe proves:
   here and names the CP leg.
 - tcp_workshop: the Workshop virtual host answers with its gate applied
   (proves proxy routing to the Workshop leg, not just the default backend).
-- raknet: the RakNet listener players actually use answers an unconnected
-  ping (transport alive; raknetify answers below the login gate).
+- raknet: the RakNet listener players actually use answers Open Connection
+  Request 1 (transport alive; raknetify answers below the login gate, but
+  never answers an unconnected ping).
 - gate_file: the host file leg matches the expected states, so an intended
   maintenance reads as SKIP-worthy instead of a mysterious ping failure.
+  --game-only skips the Workshop legs (tcp_workshop, Workshop gate-file leg):
+  Game deploys use it so a down/asleep/mid-transition Workshop never blocks
+  Game entry verification; Workshop releases keep the full gate.
 
 Exit 0 = entry alive, 1 = entry dead, 2 = usage/config error.
 """
@@ -35,10 +39,13 @@ TAG = __import__("re").compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 # texts the proxy plugin serves when a leg is not open.
 CLOSED_MARKERS = ("технические работы",)
 OPEN_MARKER = "blockfield"
-# RakNet unconnected ping magic, answered by raknetify below the login gate.
+# Raknetify never answers an unconnected ping (0x01 times out); it answers
+# Open Connection Request 1 with the client's protocol version, padded like one.
 RAKNET_MAGIC = bytes.fromhex("00ffff00fefefefefdfdfdfd12345678")
-RAKNET_PING_ID = 0x01
-RAKNET_PONG_ID = 0x1C
+RAKNET_OPEN_REQUEST_1 = 0x05
+RAKNET_OPEN_REPLY_1 = 0x06
+RAKNET_PROTOCOL = 10
+RAKNET_PADDED_SIZE = 1200
 TIMEOUT = 10
 
 
@@ -120,19 +127,27 @@ def status_ping(host, port, server_host):
 
 
 def raknet_ping(host, port):
-    """One RakNet unconnected ping; returns the server MOTD string."""
-    packet = struct.pack(">Bq", RAKNET_PING_ID, 0x123456) + RAKNET_MAGIC
-    packet += struct.pack(">q", 0x789ABC)
+    """One RakNet Open Connection Request 1; returns the server GUID hex.
+
+    Raknetify ignores unconnected pings, so the leg must use the handshake
+    players use. Protocol 10 is answered with 0x06; a wrong protocol (e.g. 11)
+    gets 0x19 incompatible, which fails the leg.
+    """
+    packet = (
+        bytes((RAKNET_OPEN_REQUEST_1,))
+        + RAKNET_MAGIC
+        + bytes((RAKNET_PROTOCOL,))
+        + bytes(RAKNET_PADDED_SIZE - 1 - len(RAKNET_MAGIC) - 1)
+    )
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(TIMEOUT)
         sock.sendto(packet, (host, port))
         data, _ = sock.recvfrom(2048)
-    if len(data) < 35 or data[0] != RAKNET_PONG_ID:
-        raise ValueError("not a RakNet pong")
-    if data[17:33] != RAKNET_MAGIC:
-        raise ValueError("RakNet pong magic mismatch")
-    size = struct.unpack(">H", data[33:35])[0]
-    return data[35 : 35 + size].decode("utf-8", "replace")
+    if not data or data[0] != RAKNET_OPEN_REPLY_1:
+        raise ValueError("not an Open Connection Reply 1")
+    if data[1:17] != RAKNET_MAGIC:
+        raise ValueError("RakNet reply magic mismatch")
+    return data[17:25].hex()
 
 
 def rooms_state(url):
@@ -228,55 +243,79 @@ def check(args):
                 )
             ),
         )
-    workshop_host = args.workshop_host or workshop_host_from_container()
-    if workshop_host is None:
-        # proxy#48 closed the Workshop leg with no gate catching it: an
-        # unverified Workshop leg fails the gate, it never slips through.
-        record(
-            False,
-            "tcp_workshop",
-            "no BLOCKFIELD_WORKSHOP_HOST: container discovery failed and none "
-            "given (pass --workshop-host; proxy#48 mode: unverified leg)",
-        )
+    if args.game_only:
+        # Game deploys never consult the Workshop: skip its vhost probe, which
+        # would fail while the Workshop is down, asleep or mid-transition.
+        record(True, "tcp_workshop", "skipped: Game-only gate")
     else:
-        try:
-            status = status_ping(args.proxy_host, args.tcp_port, workshop_host)
-        except Exception as error:
-            record(False, "tcp_workshop", f"workshop vhost ping failed ({error})")
-        else:
-            description = text(status.get("description", ""))
-            # proxy#55: a closed leg serves a non-empty MOTD, so bool() passed
-            # a shut Workshop. Apply the same marker logic as the game leg.
-            closed = any(marker in description for marker in CLOSED_MARKERS)
-            opened = OPEN_MARKER in description.lower() and not closed
-            want_open = args.expect_workshop in ("public", "builders")
+        workshop_host = args.workshop_host or workshop_host_from_container()
+        if workshop_host is None:
+            # proxy#48 closed the Workshop leg with no gate catching it: an
+            # unverified Workshop leg fails the gate, it never slips through.
             record(
-                opened == want_open,
+                False,
                 "tcp_workshop",
-                f"vhost={workshop_host} motd={description.strip()[:80]!r} "
-                + (
-                    "(workshop leg open)"
-                    if opened
-                    else (
-                        "(workshop leg closed as intended)"
-                        if not want_open
-                        else "(workshop leg closed while builders expected)"
-                    )
-                ),
+                "no BLOCKFIELD_WORKSHOP_HOST: container discovery failed and none "
+                "given (pass --workshop-host; proxy#48 mode: unverified leg)",
             )
+        else:
+            try:
+                status = status_ping(args.proxy_host, args.tcp_port, workshop_host)
+            except Exception as error:
+                record(False, "tcp_workshop", f"workshop vhost ping failed ({error})")
+            else:
+                description = text(status.get("description", ""))
+                # The proxy serves the gate message itself on the workshop
+                # vhost (BackendRouting.onPing), and the controller writes the
+                # maintenance text as that message in every non-public
+                # workshop state: builders and closed show the same refusal
+                # marker. So the leg expects the marker the configured gate
+                # serves, and anything else (game MOTD from a misroute,
+                # empty, or a ping failure above) fails: a dead backend must
+                # not pass.
+                closed = any(marker in description for marker in CLOSED_MARKERS)
+                opened = OPEN_MARKER in description.lower() and not closed
+                if args.expect_workshop == "public":
+                    ok = opened
+                    why = (
+                        "(workshop leg open)"
+                        if opened
+                        else "(workshop leg closed while open expected)"
+                    )
+                elif args.expect_workshop in ("builders", "testers"):
+                    ok = closed
+                    why = (
+                        "(workshop leg serves builders gate)"
+                        if closed
+                        else "(workshop leg down or misrouted: no builders marker)"
+                    )
+                else:
+                    ok = closed
+                    why = (
+                        "(workshop leg closed as intended)"
+                        if closed
+                        else "(workshop leg open while closed expected)"
+                    )
+                record(
+                    ok,
+                    "tcp_workshop",
+                    f"vhost={workshop_host} motd={description.strip()[:80]!r} " + why,
+                )
     try:
-        motd = raknet_ping(args.proxy_host, args.udp_port)
+        guid = raknet_ping(args.proxy_host, args.udp_port)
     except Exception as error:
-        record(False, "raknet", f"unconnected ping failed ({error})")
+        record(False, "raknet", f"open connection request 1 failed ({error})")
     else:
-        record(True, "raknet", f"pong motd={motd[:80]!r}")
+        record(True, "raknet", f"open reply 1 guid={guid}")
     if args.gate_file is not None:
         try:
             states = gate_file_states(args.gate_file)
         except (OSError, ValueError) as error:
             record(False, "gate_file", f"{args.gate_file} unreadable ({error})")
         else:
-            want = {"game": args.expect_game, "workshop": args.expect_workshop}
+            want = {"game": args.expect_game}
+            if not args.game_only:
+                want["workshop"] = args.expect_workshop
             record(
                 all(states.get(leg) == state for leg, state in want.items()),
                 "gate_file",
@@ -301,6 +340,12 @@ def main(argv=None):
     parser.add_argument("--workshop-host", default=None)
     parser.add_argument("--expect-game", default="public")
     parser.add_argument("--expect-workshop", default="builders")
+    parser.add_argument(
+        "--game-only",
+        action="store_true",
+        help="check the Game legs only: skip the Workshop vhost probe and "
+        "the Workshop gate-file leg (Game deploys never consult the Workshop)",
+    )
     args = parser.parse_args(argv)
     if args.tag is not None and not TAG.fullmatch(args.tag):
         parser.error("expected a release tag (vX.Y.Z)")

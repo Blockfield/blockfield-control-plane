@@ -21,7 +21,13 @@ spec.loader.exec_module(probe)
 
 TAG = "v2.79.2"
 OPEN = {"text": "BLOCKFIELD", "color": "gold"}
-CLOSED = {"text": "На сервере проводятся технические работы", "color": "gold"}
+# Recorded read-only from the prod workshop vhost (workshop.blockfield.pro)
+# 2026-10-31 while the controller held the builders gate on healthy prod:
+# the proxy serves the gate message itself, so builders shows this text.
+CLOSED = {
+    "text": "На сервере проводятся технические работы. Обычный вход временно недоступен.",
+    "color": "gold",
+}
 
 
 def status_bytes(description):
@@ -32,11 +38,17 @@ def status_bytes(description):
 
 
 class TcpFake(threading.Thread):
-    """Answers one Java status exchange per connection with a canned description."""
+    """Answers one Java status exchange per connection, per requested vhost.
 
-    def __init__(self, descriptions):
+    The proxy serves a different MOTD per vhost on the same port, so the fake
+    parses the handshake host: anything containing "workshop" gets the
+    workshop description, the rest the game one.
+    """
+
+    def __init__(self, game=OPEN, workshop=CLOSED):
         super().__init__(daemon=True)
-        self.descriptions = descriptions
+        self.game = game
+        self.workshop = workshop
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(("127.0.0.1", 0))
@@ -49,18 +61,38 @@ class TcpFake(threading.Thread):
             with conn:
                 conn.settimeout(5)
                 try:
-                    conn.recv(4096)
-                    conn.sendall(status_bytes(self.descriptions))
+                    data = conn.recv(4096)
+                    conn.sendall(status_bytes(self.pick(data)))
                 except OSError:
                     pass
 
+    def pick(self, data):
+        try:
+            length, offset = probe.read_varint(data)
+            body = data[offset : offset + length]
+            _, offset = probe.read_varint(body)
+            _, offset = probe.read_varint(body, offset)
+            size, offset = probe.read_varint(body, offset)
+            host = body[offset : offset + size].decode("utf-8", "replace")
+        except (IndexError, ValueError, struct.error):
+            host = ""
+        return self.workshop if "workshop" in host else self.game
+
 
 class UdpFake(threading.Thread):
-    """Answers one RakNet unconnected ping with a canned MOTD."""
+    """Answers RakNet Open Connection Request 1 like raknetify.
 
-    def __init__(self, motd="MCPE;BLOCKFIELD"):
+    Unconnected pings and wrong-protocol requests get silence or 0x19,
+    exactly like prod: the probe must use the 0x05 handshake to pass.
+    """
+
+    def __init__(self, answer_protocol=None, incompatible=False):
         super().__init__(daemon=True)
-        self.motd = motd.encode()
+        self.answer_protocol = (
+            probe.RAKNET_PROTOCOL if answer_protocol is None else answer_protocol
+        )
+        self.incompatible = incompatible
+        self.seen = []
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(("127.0.0.1", 0))
         self.port = self.socket.getsockname()[1]
@@ -71,16 +103,24 @@ class UdpFake(threading.Thread):
                 data, addr = self.socket.recvfrom(2048)
             except OSError:
                 return
-            if data[:1] == b"\x01" and probe.RAKNET_MAGIC in data:
-                reply = (
-                    bytes((probe.RAKNET_PONG_ID,))
-                    + data[1:9]
-                    + struct.pack(">q", 0x42)
-                    + probe.RAKNET_MAGIC
-                    + struct.pack(">H", len(self.motd))
-                    + self.motd
-                )
-                self.socket.sendto(reply, addr)
+            self.seen.append(data[:1])
+            if data[:1] != bytes((probe.RAKNET_OPEN_REQUEST_1,)):
+                continue  # raknetify never answers unconnected ping
+            if (
+                data[1:17] != probe.RAKNET_MAGIC
+                or len(data) != probe.RAKNET_PADDED_SIZE
+            ):
+                continue
+            if data[17] != self.answer_protocol or self.incompatible:
+                self.socket.sendto(b"\x19" + probe.RAKNET_MAGIC, addr)
+                continue
+            reply = (
+                bytes((probe.RAKNET_OPEN_REPLY_1,))
+                + probe.RAKNET_MAGIC
+                + struct.pack(">q", 0x42)
+                + bytes(3)
+            )
+            self.socket.sendto(reply, addr)
 
 
 class RoomsFake:
@@ -114,7 +154,7 @@ class RoomsFake:
 
 class EntryLivenessTest(unittest.TestCase):
     def setUp(self):
-        self.tcp = TcpFake(OPEN)
+        self.tcp = TcpFake()
         self.tcp.start()
         self.udp = UdpFake()
         self.udp.start()
@@ -142,6 +182,7 @@ class EntryLivenessTest(unittest.TestCase):
             workshop_host="workshop.test",
             expect_game="public",
             expect_workshop="builders",
+            game_only=False,
         )
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -175,46 +216,76 @@ class EntryLivenessTest(unittest.TestCase):
         detail = next(d for ok, name, d in results if name == "tcp_game")
         self.assertIn("CP", detail)
 
-    def test_closed_workshop_fails_when_builders_expected(self):
-        # proxy#55: a closed Workshop leg served a non-empty MOTD and passed.
-        tcp = TcpFake(CLOSED)
-        tcp.start()
-        gate = {
-            "backend": "game",
-            "gate": "closed",
-            "backends": {
-                "game": {"gate": "closed"},
-                "workshop": {"gate": "builders"},
-            },
-        }
-        self.gate_file.write_text(json.dumps(gate), encoding="utf-8")
-        results = probe.check(
-            self.args(
-                expect_game="closed", expect_workshop="builders", tcp_port=tcp.port
-            )
+    def test_handshake_uses_open_request_not_unconnected_ping(self):
+        # Raknetify never answers 0x01 (prod times out): the probe must send
+        # the 0x05 Open Connection Request 1 to pass.
+        results = probe.check(self.args())
+        self.assertTrue(all(ok for ok, _, _ in results), results)
+        self.assertTrue(self.udp.seen, results)
+        self.assertTrue(
+            all(
+                first == bytes((probe.RAKNET_OPEN_REQUEST_1,))
+                for first in self.udp.seen
+            ),
+            self.udp.seen,
         )
+
+    def test_wrong_protocol_fails_like_prod_incompatible(self):
+        # Prod answers protocol 11 with 0x19: only the 0x06 reply passes.
+        udp = UdpFake(answer_protocol=99)
+        udp.start()
+        results = probe.check(self.args(udp_port=udp.port))
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertFalse(by_name["raknet"][0], results)
+        self.assertTrue(
+            all(ok for name, (ok, _) in by_name.items() if name != "raknet"),
+            results,
+        )
+
+    def test_builders_maintenance_motd_passes(self):
+        # The prod false negative: builders gate serves the maintenance text
+        # on the workshop vhost, and that is the healthy state.
+        results = probe.check(self.args(expect_workshop="builders"))
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertTrue(by_name["tcp_workshop"][0], results)
+
+    def test_builders_misroute_to_game_motd_fails(self):
+        # Workshop vhost serving the game MOTD means routing is broken.
+        tcp = TcpFake(game=OPEN, workshop=OPEN)
+        tcp.start()
+        results = probe.check(self.args(tcp_port=tcp.port))
         by_name = {item[1]: (item[0], item[2]) for item in results}
         self.assertFalse(by_name["tcp_workshop"][0], results)
         self.assertTrue(by_name["tcp_game"][0], results)
 
-    def test_closed_workshop_passes_when_closed_expected(self):
-        tcp = TcpFake(CLOSED)
+    def test_builders_empty_motd_fails(self):
+        # A dead backend serves no gate marker: must not pass as builders.
+        tcp = TcpFake(workshop={"text": ""})
         tcp.start()
-        gate = {
-            "backend": "game",
-            "gate": "closed",
-            "backends": {
-                "game": {"gate": "closed"},
-                "workshop": {"gate": "closed"},
-            },
-        }
-        self.gate_file.write_text(json.dumps(gate), encoding="utf-8")
+        results = probe.check(self.args(tcp_port=tcp.port))
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertFalse(by_name["tcp_workshop"][0], results)
+
+    def test_dead_workshop_port_fails(self):
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        results = probe.check(self.args(tcp_port=port))
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertFalse(by_name["tcp_workshop"][0], results)
+
+    def test_closed_workshop_open_motd_fails(self):
+        # Closed means refusal: an open marker on the workshop vhost fails.
+        tcp = TcpFake(game=CLOSED, workshop=OPEN)
+        tcp.start()
         results = probe.check(
             self.args(expect_game="closed", expect_workshop="closed", tcp_port=tcp.port)
         )
-        self.assertTrue(all(ok for ok, _, _ in results), results)
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertFalse(by_name["tcp_workshop"][0], results)
 
-    def test_intended_maintenance_passes_when_proxy_agrees(self):
+    def test_closed_workshop_passes_when_closed_expected(self):
         tcp = TcpFake(CLOSED)
         tcp.start()
         gate = {
@@ -257,6 +328,49 @@ class EntryLivenessTest(unittest.TestCase):
                     str(self.gate_file),
                 ]
             )
+
+    def test_game_only_skips_a_dead_workshop(self):
+        # A Game deploy never consults the Workshop: no vhost, a mismatched
+        # Workshop gate-file leg, and no container discovery still pass.
+        gate = {
+            "backend": "game",
+            "gate": "public",
+            "backends": {
+                "game": {"gate": "public"},
+                "workshop": {"gate": "closed"},
+            },
+        }
+        self.gate_file.write_text(json.dumps(gate), encoding="utf-8")
+        with patch.object(
+            probe,
+            "workshop_host_from_container",
+            side_effect=AssertionError("no discovery in Game-only mode"),
+        ):
+            results = probe.check(self.args(game_only=True, workshop_host=None))
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertTrue(all(ok for ok, _, _ in results), results)
+        self.assertIn("skipped", by_name["tcp_workshop"][1].lower())
+
+    def test_game_only_still_fails_a_closed_game(self):
+        tcp = TcpFake(game=CLOSED, workshop=CLOSED)
+        tcp.start()
+        results = probe.check(
+            self.args(game_only=True, workshop_host=None, tcp_port=tcp.port)
+        )
+        by_name = {item[1]: item[0] for item in results}
+        self.assertFalse(by_name["tcp_game"], results)
+        self.assertTrue(by_name["tcp_workshop"], results)
+
+    def test_game_only_still_checks_raknet(self):
+        # The RakNet handshake runs in both modes: Game entry needs it too.
+        closed = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        results = probe.check(self.args(game_only=True, udp_port=port))
+        by_name = {item[1]: item[0] for item in results}
+        self.assertFalse(by_name["raknet"], results)
+        self.assertTrue(by_name["tcp_workshop"], results)
 
     def test_bad_tag_is_usage_error(self):
         with self.assertRaises(SystemExit):
