@@ -107,6 +107,44 @@ class GateTest(unittest.TestCase):
             400,
         )  # only owner/admin may toggle
 
+    def test_expected_revision_rejects_bool_and_float(self):
+        # P1-5 (control-plane#8): Python True == 1 / False == 0, so a bool or
+        # float revision slips past `expected != rev` and double-applies.
+        store = api.Store(":memory:")
+        store.bootstrap("prodfix-secret")
+        for bad_revision in (False, True, 0.0, 1.0, "0"):
+            with self.assertRaises(api.Bad, msg=f"expectedRevision={bad_revision!r}"):
+                store.set_gate(
+                    "maintenance",
+                    "",
+                    "owner-8",
+                    "owner",
+                    bad_revision,
+                    f"k-{bad_revision!r}",
+                )
+        self.assertEqual(store.gate()["revision"], 0)
+        self.assertEqual(
+            store.db.execute("SELECT COUNT(*) FROM gate_log").fetchone()[0], 0
+        )
+        out = store.set_gate("maintenance", "", "owner-8", "owner", 0, "k-int")
+        self.assertEqual(out["revision"], 1)
+
+    def test_expected_revision_float_rejected_over_http(self):
+        # Order-independent HTTP cover: float(rev) == rev is always True.
+        _, g = self.req("GET", "/v1/gate", token=self.seeds["proxy"])
+        code, _ = self.req(
+            "POST",
+            "/v1/gate",
+            token=self.seeds["site"],
+            payload={
+                "expectedRevision": float(g["revision"]),
+                "idempotencyKey": "float-k",
+                "mode": g["mode"],
+                "actor": {"id": "owner-8", "role": "owner"},
+            },
+        )
+        self.assertEqual(code, 400)
+
     def test_every_write_is_audited(self):
         _, g = self.req("GET", "/v1/gate", token=self.seeds["proxy"])
         code, out = self.req(

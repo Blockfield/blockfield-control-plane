@@ -150,6 +150,11 @@ class Store:
             raise Bad("actor.role: owner или admin.")
         if not isinstance(key, str) or not key or len(key) > 128:
             raise Bad("idempotencyKey missing.")
+        # bool is an int subclass (True == 1): only a real int guards the revision.
+        if isinstance(expected, bool) or (
+            expected is not None and not isinstance(expected, int)
+        ):
+            raise Bad("expectedRevision must be an integer.")
         with self.lock:
             rev, cur, _, since, _ = self.db.execute(
                 "SELECT * FROM gate_state"

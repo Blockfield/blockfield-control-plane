@@ -245,10 +245,24 @@ def check(args):
             record(False, "tcp_workshop", f"workshop vhost ping failed ({error})")
         else:
             description = text(status.get("description", ""))
+            # proxy#55: a closed leg serves a non-empty MOTD, so bool() passed
+            # a shut Workshop. Apply the same marker logic as the game leg.
+            closed = any(marker in description for marker in CLOSED_MARKERS)
+            opened = OPEN_MARKER in description.lower() and not closed
+            want_open = args.expect_workshop in ("public", "builders")
             record(
-                bool(description.strip()),
+                opened == want_open,
                 "tcp_workshop",
-                f"vhost={workshop_host} motd={description.strip()[:80]!r}",
+                f"vhost={workshop_host} motd={description.strip()[:80]!r} "
+                + (
+                    "(workshop leg open)"
+                    if opened
+                    else (
+                        "(workshop leg closed as intended)"
+                        if not want_open
+                        else "(workshop leg closed while builders expected)"
+                    )
+                ),
             )
     try:
         motd = raknet_ping(args.proxy_host, args.udp_port)
