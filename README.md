@@ -58,9 +58,5 @@ python3 -m unittest test_api -v
    (`BLOCKFIELD_CP_URL`, `BLOCKFIELD_CP_GATE_READ_TOKEN`,
    `BLOCKFIELD_CP_GATE_WRITE_TOKEN`, `BLOCKFIELD_GATE_SOURCE=cp`)
    app environments — never into the CP app itself.
-4. Deploy via the `Deploy control plane` workflow (moves the release-only `:prod`
-   channel to the digest, redeploys through the app webhook and verifies the
-   running digest; rollback is a redeploy of the previous digest — see
-   docs/DEPLOY.md; needs the one-time owner setup of the `DOKPLOY_CP_WEBHOOK`
-   secret), then `GET /v1/openapi.json` from inside the private network.
+4. Deploy, then `GET /v1/openapi.json` from inside the private network.
    Cut-over (removing the gate bind) is U6.

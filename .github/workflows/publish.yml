@@ -25,4 +25,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/blockfield/blockfield-control-plane:main
+          tags: ghcr.io/blockfield/blockfield-control-plane:latest
