@@ -11,6 +11,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "entry_liveness", Path(__file__).parents[1] / "scripts/entry_liveness.py"
@@ -138,7 +139,7 @@ class EntryLivenessTest(unittest.TestCase):
             udp_port=self.udp.port,
             rooms_url=self.rooms.url,
             gate_file=str(self.gate_file),
-            workshop_host=None,
+            workshop_host="workshop.test",
             expect_game="public",
             expect_workshop="builders",
         )
@@ -148,7 +149,22 @@ class EntryLivenessTest(unittest.TestCase):
     def test_open_entry_passes(self):
         results = probe.check(self.args())
         self.assertTrue(all(ok for ok, _, _ in results), results)
-        self.assertEqual(len(results), 4)  # rooms, tcp_game, raknet, gate_file
+        self.assertEqual(
+            len(results), 5
+        )  # rooms, tcp_game, tcp_workshop, raknet, gate_file
+
+    def test_missing_workshop_host_fails_not_skips(self):
+        # proxy#48: an unverified Workshop leg must fail the gate, never slip
+        # through as a silent SKIP.
+        with patch.object(probe, "workshop_host_from_container", return_value=None):
+            results = probe.check(self.args(workshop_host=None))
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertFalse(by_name["tcp_workshop"][0], results)
+        self.assertIn("proxy#48", by_name["tcp_workshop"][1])
+        self.assertTrue(
+            all(ok for name, (ok, _) in by_name.items() if name != "tcp_workshop"),
+            results,
+        )
 
     def test_closed_game_fails_and_names_the_gate(self):
         tcp = TcpFake(CLOSED)
