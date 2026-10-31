@@ -175,7 +175,8 @@ class EntryLivenessTest(unittest.TestCase):
         detail = next(d for ok, name, d in results if name == "tcp_game")
         self.assertIn("CP", detail)
 
-    def test_intended_maintenance_passes_when_proxy_agrees(self):
+    def test_closed_workshop_fails_when_builders_expected(self):
+        # proxy#55: a closed Workshop leg served a non-empty MOTD and passed.
         tcp = TcpFake(CLOSED)
         tcp.start()
         gate = {
@@ -187,7 +188,47 @@ class EntryLivenessTest(unittest.TestCase):
             },
         }
         self.gate_file.write_text(json.dumps(gate), encoding="utf-8")
-        results = probe.check(self.args(expect_game="closed", tcp_port=tcp.port))
+        results = probe.check(
+            self.args(
+                expect_game="closed", expect_workshop="builders", tcp_port=tcp.port
+            )
+        )
+        by_name = {item[1]: (item[0], item[2]) for item in results}
+        self.assertFalse(by_name["tcp_workshop"][0], results)
+        self.assertTrue(by_name["tcp_game"][0], results)
+
+    def test_closed_workshop_passes_when_closed_expected(self):
+        tcp = TcpFake(CLOSED)
+        tcp.start()
+        gate = {
+            "backend": "game",
+            "gate": "closed",
+            "backends": {
+                "game": {"gate": "closed"},
+                "workshop": {"gate": "closed"},
+            },
+        }
+        self.gate_file.write_text(json.dumps(gate), encoding="utf-8")
+        results = probe.check(
+            self.args(expect_game="closed", expect_workshop="closed", tcp_port=tcp.port)
+        )
+        self.assertTrue(all(ok for ok, _, _ in results), results)
+
+    def test_intended_maintenance_passes_when_proxy_agrees(self):
+        tcp = TcpFake(CLOSED)
+        tcp.start()
+        gate = {
+            "backend": "game",
+            "gate": "closed",
+            "backends": {
+                "game": {"gate": "closed"},
+                "workshop": {"gate": "closed"},
+            },
+        }
+        self.gate_file.write_text(json.dumps(gate), encoding="utf-8")
+        results = probe.check(
+            self.args(expect_game="closed", expect_workshop="closed", tcp_port=tcp.port)
+        )
         self.assertTrue(all(ok for ok, _, _ in results), results)
 
     def test_rooms_build_mismatch_fails(self):
