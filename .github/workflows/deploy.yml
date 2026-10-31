@@ -34,9 +34,11 @@ jobs:
           DIGEST: ${{ inputs.digest }}
         run: |
           python3 - <<'PYCODE'
-          import os, sys
+          import os, subprocess, sys
           sys.path.insert(0, 'scripts')
           hooks = __import__('deploy-webhooks')
+          entry = [sys.executable, 'scripts/entry_liveness.py',
+                   '--gate-file', '/srv/minecraft/workshop/gate/gate.json']
           image = 'ghcr.io/blockfield/blockfield-control-plane'
           digest = os.environ['DIGEST'] or hooks.registry_digest(f'{image}:main')
           if not hooks.DIGEST.fullmatch(digest):
@@ -45,7 +47,15 @@ jobs:
           previous = hooks.current('blockfield-control-plane')
           try:
               hooks.deploy('blockfield-control-plane', digest)
+              # Synthetic post-deploy gate: a stale CP lease fails the proxy
+              # closed, so entry must be re-proved after every CP deploy.
+              probe = subprocess.run(entry, capture_output=True, text=True, timeout=300)
+              if probe.returncode != 0:
+                  raise SystemExit('entry dead after CP deploy:\n' + probe.stdout + probe.stderr)
           except BaseException:
               hooks.deploy('blockfield-control-plane', previous)
+              recheck = subprocess.run(entry, capture_output=True, text=True, timeout=300)
+              if recheck.returncode != 0:
+                  raise SystemExit('entry still dead after CP rollback:\n' + recheck.stdout + recheck.stderr)
               raise
           PYCODE
