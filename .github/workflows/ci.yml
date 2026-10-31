@@ -12,3 +12,4 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m unittest test_api -v
+      - run: python3 -m unittest discover -s tests -v
