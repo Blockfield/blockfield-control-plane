@@ -56,3 +56,15 @@ def test_c5_rate_limiter_evicts_lru_instead_of_locking_out_new_keys():
         limiter.check("legit-new-session", global_count=False)
     with pytest.raises(Problem):
         limiter.check("legit-new-session", global_count=False)
+
+
+def test_c8_shared_budget_ignores_uncounted_checks():
+    from cpv2.app import Limits
+    from cpv2.auth import Problem
+
+    limiter = Limits()
+    for i in range(1000):
+        limiter.check(f"authed-{i}")
+    limiter.check("health", global_count=False)
+    with pytest.raises(Problem):
+        limiter.check("one-more")

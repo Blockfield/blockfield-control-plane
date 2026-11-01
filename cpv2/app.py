@@ -29,7 +29,9 @@ class Limits:
             self.window, self.total = window, 0
             self.buckets.clear()
         count = self.buckets.get(key, 0)
-        if self.total >= self.budget or count >= limit:
+        # The shared budget binds only requests counted against it; health and
+        # other uncounted paths draw from per-key limits alone.
+        if (global_count and self.total >= self.budget) or count >= limit:
             raise Problem("rate_limit", 429)
         if key in self.buckets:
             self.buckets.move_to_end(key)

@@ -122,8 +122,9 @@ async def provision(dsn, spec):
         )
         account_id = UUID(spec["accountId"]) if spec.get("accountId") else None
         if account_id:
-            await conn.execute(
-                "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+            created = await one(
+                conn,
+                "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING id",
                 (account_id, spec["displayName"]),
             )
             account = await one(
@@ -134,6 +135,20 @@ async def provision(dsn, spec):
             if account["is_test"] or account["status"] != "active":
                 raise ValueError("ineligible account")
             epoch = account["authorization_epoch"]
+            if spec.get("grants") and not created:
+                # A new account cannot have sessions yet; only a pre-existing
+                # account needs rotation before new grants take effect.
+                # New grants must not ride into existing sessions: rotate the
+                # epoch and revoke exactly like a grant change does, then issue
+                # this credential at the updated epoch.
+                await invalidate(conn, account_id)
+                epoch = (
+                    await one(
+                        conn,
+                        "SELECT authorization_epoch AS epoch FROM accounts WHERE id=%s",
+                        (account_id,),
+                    )
+                )["epoch"]
             for grant in spec.get("grants", []):
                 if grant["role"] not in ROLE_SCOPES:
                     raise ValueError("owner membership only via bootstrap")

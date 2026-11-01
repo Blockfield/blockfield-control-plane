@@ -379,8 +379,11 @@ async def snapshot(conn, identity, cid):
             (namespace, c["environment"], c["backend"], c["resource"], c["resource"]),
         )
         if namespace == "gate" and not any(r["target"] == "*" for r in settings):
-            # A resource-scoped consumer bootstraps the same global gate as '*'.
-            gate = await current_settings(conn, "gate", "prod", "game", "*")
+            # A resource-scoped consumer bootstraps the same global gate as '*',
+            # but never another environment's: resolve from the consumer scope.
+            gate = await current_settings(
+                conn, "gate", c["environment"], c["backend"], "*"
+            )
             if gate["initialized"]:
                 settings.append(
                     {

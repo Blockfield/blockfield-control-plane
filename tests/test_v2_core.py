@@ -1956,3 +1956,99 @@ async def test_c7_provision_locks_the_account_before_reading_epoch(store, monkey
     finally:
         release.set()
         await asyncio.wait_for(task, 5)
+
+
+async def test_c8_provisioning_grants_revokes_existing_sessions(store):
+    account = uuid4()
+    base = {
+        "accountId": str(account),
+        "displayName": "granted",
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    first = await provision(
+        store["admin"],
+        base
+        | {
+            "client": {
+                "id": "c8s1",
+                "via": "cli",
+                "human": True,
+                "ceiling": sorted(OWNER_SCOPES),
+            },
+            "ceiling": sorted(OWNER_SCOPES),
+        },
+    )
+    assert (
+        await store["client"].get(
+            "/v2/settings/gameplay/arena",
+            headers={"Authorization": "Bearer " + first},
+        )
+    ).status_code == 403
+    second = await provision(
+        store["admin"],
+        base
+        | {
+            "client": {
+                "id": "c8s2",
+                "via": "cli",
+                "human": True,
+                "ceiling": sorted(OWNER_SCOPES),
+            },
+            "ceiling": sorted(OWNER_SCOPES),
+            "grants": [
+                {
+                    "role": "builder",
+                    "environment": "prod",
+                    "backend": "game",
+                    "resource": "*",
+                    "grantor": str(store["accounts"]["owner"]),
+                }
+            ],
+        },
+    )
+    assert (
+        await store["client"].get(
+            "/v2/settings/gameplay/arena",
+            headers={"Authorization": "Bearer " + first},
+        )
+    ).status_code == 401
+    assert (
+        await store["client"].get(
+            "/v2/settings/gameplay/arena",
+            headers={"Authorization": "Bearer " + second},
+        )
+    ).status_code == 200
+
+
+async def test_c8_gate_fallback_never_leaks_across_environments(store, tmp_path):
+    token = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "qa",
+                "via": "game",
+                "ceiling": sorted(SERVICE_SCOPES),
+            },
+            "ceiling": sorted(SERVICE_SCOPES),
+            "environment": "qa",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "qa",
+                "generation": str(uuid4()),
+                "capabilities": ["settings.gate"],
+            },
+        },
+    )
+    store["tokens"]["qa-agent"] = token
+    path = tmp_path / "qa-gate.sqlite"
+    legacy = api.Store(str(path))
+    legacy.db.execute("UPDATE gate_state SET mode='maintenance'")
+    legacy.db.commit()
+    legacy.db.close()
+    await import_u1(store["admin"], path)
+    snapshot = await request(store, "GET", "/v2/agents/qa/snapshot", role="qa-agent")
+    assert snapshot.status_code == 200
+    assert [s for s in snapshot.json()["settings"] if s["namespace"] == "gate"] == []
