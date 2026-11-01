@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from pgserver import get_server
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.types.json import Jsonb
 from webauthn.helpers import bytes_to_base64url
 
 import api
@@ -2084,3 +2085,112 @@ async def test_c9_late_revocation_never_demotes_a_sibling_effect(store):
     assert (
         await sql(store, "SELECT status FROM operations WHERE id=%s", (operation_id,))
     )[0]["status"] == "partial"
+
+
+async def test_c10_snapshot_reads_one_consistent_revision(store, monkeypatch):
+    import cpv2.delivery
+
+    await request(store, "PATCH", "/v2/settings/gameplay/arena", patch("c10-base"))
+    original_rows, calls = cpv2.delivery.rows, 0
+    paused, release = asyncio.Event(), asyncio.Event()
+
+    async def pause_after_first_settings(conn, query, args=()):
+        nonlocal calls
+        found = await original_rows(conn, query, args)
+        calls += 1
+        if calls == 1 and "settings_heads" in query:
+            paused.set()
+            await asyncio.wait_for(release.wait(), 5)
+        return found
+
+    monkeypatch.setattr(cpv2.delivery, "rows", pause_after_first_settings)
+    task = asyncio.create_task(
+        request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    )
+    try:
+        await asyncio.wait_for(paused.wait(), 5)
+        assert (
+            await request(
+                store,
+                "PATCH",
+                "/v2/settings/gameplay/arena",
+                patch("c10-race", 1, {"match": {"maxPlayers": 8}}),
+            )
+        ).status_code == 202
+        assert (
+            await request(
+                store,
+                "PATCH",
+                "/v2/settings/gate/*",
+                patch("c10-gate", 0, {"mode": "open"}),
+            )
+        ).status_code == 202
+    finally:
+        release.set()
+    snapshot = await asyncio.wait_for(task, 10)
+    assert snapshot.status_code == 200
+    seen = {
+        (value["namespace"], value["target"]): value["revision"]
+        for value in snapshot.json()["settings"]
+    }
+    assert seen == {("gameplay", "arena"): 1} or seen == {
+        ("gameplay", "arena"): 2,
+        ("gate", "*"): 1,
+    }, f"torn snapshot spanning two commits: {seen}"
+
+
+async def test_c10_concurrent_consumers_drain_shared_fanout_without_deadlock(store):
+    consumers = {
+        row["id"]: row
+        for row in await sql(
+            store, "SELECT * FROM consumers WHERE id IN ('game','workshop')"
+        )
+    }
+    cred = (await sql(store, "SELECT id FROM credentials WHERE client_id='game'"))[0][
+        "id"
+    ]
+    ops = []
+    for _ in range(4):
+        op = uuid4()
+        await sql(
+            store,
+            "INSERT INTO operations(id,credential_id,client_id,via,kind,target,resource,environment,backend,request_hash,idempotency_key,required_scope,deadline,status) VALUES(%s,%s,'game','game','test.drain','arena','arena','prod','game',%s,%s,'settings.read',now()+interval '60 seconds','accepted')",
+            (op, cred, uuid4().hex, uuid4().hex),
+        )
+        ops.append(op)
+    # Same shared operations, opposite outbox orders: without one global lock
+    # order the two drains take these rows in opposite orders and deadlock.
+    for cid, seq_ops in (("game", ops), ("workshop", list(reversed(ops)))):
+        consumer = consumers[cid]
+        for seq, op in enumerate(seq_ops, 1):
+            await sql(
+                store,
+                "INSERT INTO outbox(consumer_id,sequence,epoch,operation_id,generation,payload,payload_hash) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    cid,
+                    seq,
+                    consumer["epoch"],
+                    op,
+                    consumer["generation"],
+                    Jsonb({"n": seq}),
+                    "ab" * 32,
+                ),
+            )
+    go = asyncio.Event()
+
+    async def drain(cid):
+        await go.wait()
+        async with store["app"].state.db.transaction() as conn:
+            identity = await authenticate(conn, store["tokens"][cid + "-agent"])
+            consumer = await one(
+                conn, "SELECT epoch FROM consumers WHERE id=%s", (cid,)
+            )
+            return await delivery.batch(conn, identity, cid, consumer["epoch"], 0)
+
+    first = asyncio.create_task(drain("game"))
+    second = asyncio.create_task(drain("workshop"))
+    await asyncio.sleep(0.2)
+    go.set()
+    game, workshop = await asyncio.wait_for(asyncio.gather(first, second), 30)
+    assert [f["sequence"] for f in game] == [1, 2, 3, 4]
+    assert [f["sequence"] for f in workshop] == [1, 2, 3, 4]

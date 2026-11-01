@@ -151,13 +151,24 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
         "SELECT o.*,p.deadline,p.authorization_epoch FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE consumer_id=%s AND sequence>%s ORDER BY sequence LIMIT 64",
         (cid, cursor),
     )
+    # Lock every shared operation in one global (id) order before touching any
+    # of them: two consumers draining the same fan-out in different sequence
+    # orders must never take these locks in opposite orders and deadlock.
+    by_id = (
+        {
+            o["id"]: o
+            for o in await rows(
+                conn,
+                "SELECT * FROM operations WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
+                (sorted({r["operation_id"] for r in records}),),
+            )
+        }
+        if records
+        else {}
+    )
     result = []
     for record in records:
-        op = await one(
-            conn,
-            "SELECT * FROM operations WHERE id=%s FOR UPDATE",
-            (record["operation_id"],),
-        )
+        op = by_id[record["operation_id"]]
         reason = await valid_operation(conn, op)
         stale_generation = record["generation"] != c["generation"]
         if stale_generation:
@@ -376,6 +387,10 @@ async def acknowledge(conn, identity, attempt, cid, model):
 
 
 async def snapshot(conn, identity, cid):
+    # One consistent snapshot for cursor and settings: under read-committed a
+    # concurrent settings write could otherwise pair new values with an old
+    # cursor (or omit a value the cursor already acknowledges).
+    await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
     c = await consumer_for(conn, identity, cid, "agents.events")
     result = []
     for namespace in ("gameplay", "gate"):
