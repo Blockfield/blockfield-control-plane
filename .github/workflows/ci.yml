@@ -36,67 +36,60 @@ concurrency:
 jobs:
   bot-gate:
     # Enforcing: `check` runs on a PR head only when this job reports
-    # verdict=permit with sha_match=true. Anything else (no verdict yet,
-    # REQUEST_CHANGES, DISMISSED, a verdict on an older SHA) skips `check`,
-    # so the gate fails closed. Always exits 0: denial is expressed through
-    # the outputs, and the bot's own `bot-review` commit status blocks merge.
+    # verdict=permit with sha_match=true for the CURRENT head SHA, resolved
+    # from the API at gate runtime (a push may have landed after the
+    # triggering review event was created; the event payload would still name
+    # the old head). Anything else (no verdict yet, REQUEST_CHANGES,
+    # DISMISSED, a verdict on an older SHA) skips `check`, so the gate fails
+    # closed. Always exits 0: denial is expressed through the outputs, and
+    # the bot's own `bot-review` commit status blocks merge.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: github.event_name == 'pull_request_review'
     outputs:
       verdict: ${{ steps.gate.outputs.verdict }}
       sha_match: ${{ steps.gate.outputs.sha_match }}
+      sha: ${{ steps.gate.outputs.sha }}
     steps:
-      - name: Evaluate blockfield-review-bot verdict for the PR head SHA
+      - name: Evaluate blockfield-review-bot verdict for the current PR head SHA
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          REVIEW_STATE: ${{ github.event.review.state || '' }}
-          REVIEW_LOGIN: ${{ github.event.review.user.login || '' }}
-          REVIEW_SHA: ${{ github.event.review.commit_id || '' }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -u
           bot='blockfield-review-bot[bot]'
           repo="${{ github.repository }}"
-          state="$REVIEW_STATE"
-          # Prefer the just-submitted review when it is the bot's verdict on
-          # the current head SHA; otherwise look the bot's latest verdict for
-          # this SHA up via the API (a newer push re-requires a new verdict).
-          # (The head SHA is spliced into the jq filter; gh --jq takes no
-          # variable arguments.)
-          bot_on_sha=false
-          if [ "$REVIEW_LOGIN" = "$bot" ] && [ "$REVIEW_SHA" = "$HEAD_SHA" ]; then
-            bot_on_sha=true
-          else
-            # Aggregate all pages before picking the latest verdict: gh applies
-            # --jq per page, so >100 reviews would otherwise yield several
-            # states joined by newlines and match nothing (fail-closed, but
-            # a stuck gate). COMMENTED reviews carry no verdict and are
-            # excluded, so a later comment cannot override an earlier verdict.
-            # jq is preinstalled on the runner image.
-            state=$(gh api "repos/$repo/pulls/$PR_NUMBER/reviews" --paginate \
-              --jq '[.[] | select(.user.login == "'"$bot"'" and .commit_id == "'"$HEAD_SHA"'")]' \
-              | jq -r -s '[add[] | select(.state != "COMMENTED")] | sort_by(.id) | last | .state // empty')
-            if [ -n "$state" ]; then bot_on_sha=true; fi
-          fi
-          # Webhook states arrive lowercase ("approved"), the API returns
-          # uppercase ("APPROVED"): normalize before matching.
+          # Current head, not the event snapshot: the review that triggered
+          # this run may predate a newer push.
+          HEAD_SHA=$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq '.head.sha')
+          # Latest verdict-bearing bot review on the current head, aggregated
+          # across API pages (gh --jq applies per page). COMMENTED reviews
+          # carry no verdict and are excluded, so a later comment cannot
+          # override an earlier verdict. (jq is preinstalled on the runner.)
+          # The head SHA is spliced into the jq filter; gh --jq takes no
+          # variable arguments.
+          state=$(gh api "repos/$repo/pulls/$PR_NUMBER/reviews" --paginate             --jq '[.[] | select(.user.login == "'"$bot"'" and .commit_id == "'"$HEAD_SHA"'")]'             | jq -r -s '[add[] | select(.state != "COMMENTED")] | sort_by(.id) | last | .state // empty')
+          # The API returns uppercase states ("APPROVED"); normalize anyway.
           state=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
           verdict=deny-awaiting
           sha_match=false
-          if [ "$bot_on_sha" = true ]; then
-            sha_match=true
-            case "$state" in
-              APPROVED) verdict=permit ;;
-              CHANGES_REQUESTED) verdict=deny ;;
-              # DISMISSED / COMMENTED / empty stay deny-awaiting (fail-closed).
-            esac
-          fi
+          case "$state" in
+            APPROVED)
+              verdict=permit
+              sha_match=true
+              ;;
+            # CHANGES_REQUESTED -> deny; DISMISSED / empty stay deny-awaiting
+            # (fail-closed). `sha` always names the evaluated head so logs
+            # and the checkout below agree on what was gated.
+            CHANGES_REQUESTED) verdict=deny ;;
+          esac
           echo "head=${HEAD_SHA:0:12} bot_state=${state:-none} verdict=$verdict sha_match=$sha_match"
-          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
-          echo "sha_match=$sha_match" >> "$GITHUB_OUTPUT"
+          {
+            echo "verdict=$verdict"
+            echo "sha_match=$sha_match"
+            echo "sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
   test:
     # Main pushes and maintainer dispatches always run; PR heads run only
     # on a gate permit for the exact head SHA.
@@ -105,6 +98,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request_review' && needs.bot-gate.outputs.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
