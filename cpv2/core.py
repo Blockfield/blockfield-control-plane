@@ -490,6 +490,7 @@ async def delegate(conn, identity, attempt, model):
     if (
         not identity.account
         or identity.credential["kind"] != "session"
+        or not identity.client["human"]
         or identity.owner
     ):
         raise Problem("delegation_not_allowed")

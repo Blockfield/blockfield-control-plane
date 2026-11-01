@@ -3335,3 +3335,58 @@ async def test_c16_nonfinite_patch_is_invalid(store):
         content='{"idempotencyKey":"c16-nan","environment":"prod","backend":"game","expectedRevision":0,"patch":{"match":{"maxPlayers":NaN}}}',
     )
     assert response.status_code == 422, response.text
+
+
+async def test_c17_nonhuman_session_cannot_delegate(store):
+    await sql(store, "UPDATE clients SET human=false WHERE id='admin'")
+    response = await request(
+        store,
+        "POST",
+        "/v2/delegations",
+        {
+            "idempotencyKey": "c17-nonhuman",
+            "resource": "arena",
+            "scopes": ["maps.edit"],
+            "expiresInSeconds": 60,
+        },
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "delegation_not_allowed"
+    assert not await sql(store, "SELECT 1 FROM credentials WHERE kind='delegation'")
+
+
+async def test_c17_auth_locks_parent_before_delegation(store, monkeypatch):
+    import cpv2.auth as auth
+
+    response = await request(
+        store,
+        "POST",
+        "/v2/delegations",
+        {
+            "idempotencyKey": "c17-locks",
+            "resource": "arena",
+            "scopes": ["maps.edit"],
+            "expiresInSeconds": 60,
+        },
+    )
+    assert response.status_code == 201, response.text
+    token = response.json()["token"]
+    child = (
+        await sql(
+            store,
+            "SELECT id,parent_id FROM credentials WHERE verifier=%s",
+            (verifier(token),),
+        )
+    )[0]
+    locks = []
+    original = auth.one
+
+    async def observe(conn, query, params=()):
+        if "FROM credentials WHERE id=%s FOR SHARE" in query:
+            locks.append(params[0])
+        return await original(conn, query, params)
+
+    monkeypatch.setattr(auth, "one", observe)
+    async with store["app"].state.db.transaction() as conn:
+        await authenticate(conn, token)
+    assert locks == [child["parent_id"], child["id"]]

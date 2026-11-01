@@ -130,6 +130,13 @@ async def authenticate(conn, token, *, lock_credential=True):
         account = await one(
             conn, "SELECT * FROM accounts WHERE id=%s FOR SHARE", (c["account_id"],)
         )
+    # Parent-before-child matches session revocation and avoids lock inversion.
+    if c["parent_id"]:
+        parent = await one(
+            conn, "SELECT * FROM credentials WHERE id=%s FOR SHARE", (c["parent_id"],)
+        )
+        if not parent or parent["revoked_at"] or parent["expires_at"] <= now():
+            raise Problem("unauthorized", 401)
     if lock_credential:
         c = await one(
             conn, "SELECT * FROM credentials WHERE id=%s FOR SHARE", (c["id"],)
@@ -139,12 +146,6 @@ async def authenticate(conn, token, *, lock_credential=True):
     client = await one(conn, "SELECT * FROM clients WHERE id=%s", (c["client_id"],))
     if client["audience"] != AUDIENCE:
         raise Problem("unauthorized", 401)
-    if c["parent_id"]:
-        parent = await one(
-            conn, "SELECT * FROM credentials WHERE id=%s FOR SHARE", (c["parent_id"],)
-        )
-        if not parent or parent["revoked_at"] or parent["expires_at"] <= now():
-            raise Problem("unauthorized", 401)
     grants, owner = [], False
     if account:
         if (

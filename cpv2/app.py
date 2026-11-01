@@ -480,6 +480,11 @@ def create_app(dsn=None):
     async def revoke(request: Request):
         async with database.transaction() as conn:
             i = await authenticate(conn, request.state.token, lock_credential=False)
+            await one(
+                conn,
+                "SELECT id FROM credentials WHERE id=%s FOR UPDATE",
+                (i.credential["id"],),
+            )
             await conn.execute(
                 "UPDATE credentials SET revoked_at=now() WHERE id=%s OR parent_id=%s",
                 (i.credential["id"], i.credential["id"]),
