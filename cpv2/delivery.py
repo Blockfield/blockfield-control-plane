@@ -159,7 +159,8 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
             (record["operation_id"],),
         )
         reason = await valid_operation(conn, op)
-        if record["generation"] != c["generation"]:
+        stale_generation = record["generation"] != c["generation"]
+        if stale_generation:
             reason = "rejected"
         if record["revision"]:
             payload = record["payload"]
@@ -175,7 +176,13 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
             )
             if head["revision"] != record["revision"]:
                 reason = "superseded"
-        if reason in ("expired", "rejected") and op["status"] not in TERMINAL:
+        # A stale generation is this consumer's verdict only: it must not move
+        # the shared operation status while sibling consumers still execute it.
+        if (
+            reason in ("expired", "rejected")
+            and not stale_generation
+            and op["status"] not in TERMINAL
+        ):
             await event(conn, op["id"], reason)
         terminal = await one(
             conn,

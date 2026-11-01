@@ -29,12 +29,14 @@ class Limits:
             self.window, self.total = window, 0
             self.buckets.clear()
         count = self.buckets.get(key, 0)
-        if (
-            self.total >= self.budget
-            or count >= limit
-            or (key not in self.buckets and len(self.buckets) >= 4096)
-        ):
+        if self.total >= self.budget or count >= limit:
             raise Problem("rate_limit", 429)
+        if key in self.buckets:
+            self.buckets.move_to_end(key)
+        elif len(self.buckets) >= 4096:
+            # LRU eviction, never lockout: a flood of distinct keys must not
+            # deny new legitimate sessions for the rest of the window.
+            self.buckets.popitem(last=False)
         self.total += int(global_count)
         self.buckets[key] = count + 1
 

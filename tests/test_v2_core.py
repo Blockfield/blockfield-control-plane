@@ -19,7 +19,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from pgserver import get_server
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from webauthn.helpers import bytes_to_base64url
 
 import api
@@ -68,7 +68,7 @@ async def store(postgres):
         await conn.execute(f'CREATE DATABASE "{name}"')
     admin = make_conninfo(postgres, dbname=name)
     runtime = make_conninfo(admin, user="cp_api")
-    await migrate(admin)
+    await migrate(admin, name)
     async with await psycopg.AsyncConnection.connect(admin) as conn:
         await conn.execute("GRANT cp_runtime TO cp_api")
     key = ec.generate_private_key(ec.SECP256R1())
@@ -937,10 +937,10 @@ async def test_import_preserves_counts_hashes_gate_revision_and_read_only_tokens
 async def test_uninitialized_service_and_migration_checksums_fail_closed(
     store, postgres
 ):
-    await migrate(store["admin"])
+    await migrate(store["admin"], conninfo_to_dict(store["admin"])["dbname"])
     await sql(store, "UPDATE schema_migrations SET checksum='tampered'")
     with pytest.raises(RuntimeError, match="checksum"):
-        await migrate(store["admin"])
+        await migrate(store["admin"], conninfo_to_dict(store["admin"])["dbname"])
     # Production startup must refuse powerful credentials even after bootstrap.
     app = create_app(store["admin"])
     with pytest.raises(RuntimeError, match="least-privilege"):
@@ -1039,7 +1039,7 @@ async def test_backup_restore_preserves_authority_revisions_audit_and_outbox(
             capture_output=True,
             timeout=10,
         )
-        await migrate(restore_dsn)
+        await migrate(restore_dsn, restore_name)
         for table in (
             "owner_memberships",
             "owner_credentials",
@@ -1690,3 +1690,71 @@ async def test_c4_expired_operation_emits_one_settlement(store, monkeypatch):
         (UUID(op["operationId"]),),
     )
     assert [event["status"] for event in events] == ["accepted", "expired"]
+
+
+async def test_c5_stale_generation_never_rejects_the_shared_operation(store):
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("fanout")
+    )
+    assert accepted.status_code == 202
+    await sql(store, "UPDATE consumers SET generation=%s WHERE id='game'", (uuid4(),))
+    game = await envelopes(store)
+    assert game[0]["reason"] == "rejected" and game[0]["executable"] is False
+    status = (
+        await sql(
+            store,
+            "SELECT status FROM operations WHERE id=%s",
+            (UUID(accepted.json()["operationId"]),),
+        )
+    )[0]["status"]
+    assert status == "accepted", "a stale consumer must not reject the shared operation"
+    workshop = await envelopes(store, cid="workshop")
+    assert workshop[0]["executable"] is True and workshop[0]["reason"] is None
+
+
+async def test_c5_migration_refuses_an_unexpected_database(store):
+    with pytest.raises(RuntimeError, match="expected the dedicated control database"):
+        await migrate(store["admin"], "wrong-database-name")
+    await migrate(store["admin"], conninfo_to_dict(store["admin"])["dbname"])
+
+
+async def test_c5_bootstrap_revokes_pre_existing_sessions(store, postgres):
+    name = "cp_" + uuid4().hex
+    async with await psycopg.AsyncConnection.connect(postgres, autocommit=True) as conn:
+        await conn.execute(f'CREATE DATABASE "{name}"')
+    admin = make_conninfo(postgres, dbname=name)
+    try:
+        await migrate(admin, name)
+        account = uuid4()
+        spec = {
+            "client": {
+                "id": "future-owner",
+                "via": "ui",
+                "human": True,
+                "ceiling": sorted(OWNER_SCOPES),
+            },
+            "accountId": str(account),
+            "displayName": "future-owner",
+            "ceiling": sorted(OWNER_SCOPES),
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        }
+        stale = await provision(admin, spec)
+        async with await psycopg.AsyncConnection.connect(
+            admin, row_factory=psycopg.rows.dict_row
+        ) as conn:
+            assert (await authenticate(conn, stale)).owner is False
+            await bootstrap(admin, account, "owner", store["credential"])
+            with pytest.raises(Problem):
+                await authenticate(conn, stale)
+        fresh = await provision(admin, spec)
+        async with await psycopg.AsyncConnection.connect(
+            admin, row_factory=psycopg.rows.dict_row
+        ) as conn:
+            assert (await authenticate(conn, fresh)).owner is True
+    finally:
+        async with await psycopg.AsyncConnection.connect(
+            postgres, autocommit=True
+        ) as conn:
+            await conn.execute(f'DROP DATABASE "{name}"')

@@ -17,7 +17,14 @@ from psycopg.types.json import Jsonb
 from webauthn.helpers import base64url_to_bytes
 from webauthn.helpers.decode_credential_public_key import decode_credential_public_key
 
-from cpv2.auth import OWNER_SCOPES, ROLE_SCOPES, SERVICE_SCOPES, now, verifier
+from cpv2.auth import (
+    OWNER_SCOPES,
+    ROLE_SCOPES,
+    SERVICE_SCOPES,
+    invalidate,
+    now,
+    verifier,
+)
 from cpv2.db import history, migrate, one, record
 
 
@@ -63,7 +70,8 @@ async def bootstrap(dsn, account_id, name, credential):
                 "already bootstrapped; recovery requires separately reviewed offline migration"
             )
         await conn.execute(
-            "INSERT INTO accounts(id,display_name) VALUES(%s,%s)", (account_id, name)
+            "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+            (account_id, name),
         )
         attempt = uuid4()
         for outcome in ("pending", "accepted"):
@@ -88,6 +96,9 @@ async def bootstrap(dsn, account_id, name, credential):
                     Jsonb({"credentialFingerprint": verifier(credential["publicKey"])}),
                 ),
             )
+        # Sessions provisioned before the account became owner must not ride
+        # into owner authority: revoke every pre-bootstrap credential.
+        await invalidate(conn, account_id)
 
 
 async def provision(dsn, spec):
@@ -206,7 +217,12 @@ async def main():
         help="private file with the migration-role DSN",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("migrate")
+    migrate_cmd = commands.add_parser("migrate")
+    migrate_cmd.add_argument(
+        "--database",
+        required=True,
+        help="expected dedicated control database name; the migration refuses any other database",
+    )
     boot = commands.add_parser("bootstrap")
     boot.add_argument("--account", type=UUID, required=True)
     boot.add_argument("--name", required=True)
@@ -223,7 +239,7 @@ async def main():
     args = parser.parse_args()
     dsn = private_file(args.database_file).strip()
     if args.command == "migrate":
-        await migrate(dsn)
+        await migrate(dsn, args.database)
     elif args.command == "bootstrap":
         await bootstrap(
             dsn, args.account, args.name, json.loads(private_file(args.credential_file))

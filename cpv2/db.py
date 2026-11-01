@@ -69,10 +69,15 @@ async def rows(conn, query, args=()):
     return await (await conn.execute(query, args)).fetchall()
 
 
-async def migrate(dsn):
+async def migrate(dsn, expected_database):
     source = (ROOT / "migrations/001_core.sql").read_bytes()
     checksum = hashlib.sha256(source).hexdigest()
     async with await psycopg.AsyncConnection.connect(dsn, row_factory=dict_row) as conn:
+        actual = await one(conn, "SELECT current_database() AS name")
+        if actual["name"] != expected_database:
+            raise RuntimeError(
+                f"refusing to migrate database {actual['name']!r}: expected the dedicated control database {expected_database!r}"
+            )
         await conn.execute("SELECT pg_advisory_xact_lock(278002)")
         exists = await one(
             conn, "SELECT to_regclass('control.schema_migrations') AS name"
