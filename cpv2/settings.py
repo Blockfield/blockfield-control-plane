@@ -9,6 +9,35 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    @model_validator(mode="after")
+    def representable(self):
+        # The request hash, canonical JSON and PostgreSQL text/jsonb/bigint
+        # columns cannot represent NUL, lone surrogates or out-of-range
+        # integers: reject them as invalid requests before hashing/inserting.
+        def check(value):
+            if isinstance(value, str):
+                if "\x00" in value:
+                    raise ValueError("NUL byte not representable")
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise ValueError("unpaired surrogate not representable") from None
+            elif isinstance(value, bool):
+                pass
+            elif isinstance(value, int):
+                if not -(2**63) <= value <= 2**63 - 1:
+                    raise ValueError("integer outside bigint range")
+            elif isinstance(value, dict):
+                for item in value.values():
+                    check(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    check(item)
+            return value
+
+        check(self.model_dump())
+        return self
+
 
 class Lobby(Strict):
     pvpEnabled: bool = False

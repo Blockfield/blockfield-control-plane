@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import sqlite3
 import struct
 import subprocess
@@ -794,11 +795,13 @@ async def test_revocation_expiry_generation_and_superseded_config_do_not_execute
     )
     value = (await envelopes(store))[0]
     assert value["executable"] is False and value["payload"] is None
+    # Post-policy received/validated are recorded as historical facts; the
+    # frame above stays non-executable, which is the actual safety property.
     assert (
         await request(
             store, "POST", "/v2/agents/game/acks", ack_body(value), "game-agent"
         )
-    ).status_code == 409
+    ).status_code == 200
     assert (
         await request(
             store,
@@ -824,11 +827,23 @@ async def test_revocation_expiry_generation_and_superseded_config_do_not_execute
     settings = (await envelopes(store))[2:]
     assert settings[0]["reason"] == "superseded" and settings[0]["payload"] is None
     assert settings[1]["executable"] is True
+    # Historical receipts upload in cursor order: the expired frame first,
+    # then the obsolete revision. Batch still fences execution, so nothing
+    # here authorizes the old revision.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body((await envelopes(store))[1]),
+            "game-agent",
+        )
+    ).status_code == 200
     assert (
         await request(
             store, "POST", "/v2/agents/game/acks", ack_body(settings[0]), "game-agent"
         )
-    ).status_code == 409
+    ).status_code == 200
 
 
 async def test_unknown_effect_is_terminal_and_multi_consumer_settings_are_partial(
@@ -2194,3 +2209,876 @@ async def test_c10_concurrent_consumers_drain_shared_fanout_without_deadlock(sto
     game, workshop = await asyncio.wait_for(asyncio.gather(first, second), 30)
     assert [f["sequence"] for f in game] == [1, 2, 3, 4]
     assert [f["sequence"] for f in workshop] == [1, 2, 3, 4]
+
+
+async def test_c11_epoch_replacement_settles_retired_frames(store):
+    op = await queued(store, "epoch-old")
+    await queued(store, "epoch-older")
+    frame = (await envelopes(store))[0]
+    new_epoch, new_generation = uuid4(), uuid4()
+    await sql(
+        store,
+        "UPDATE consumers SET epoch=%s, generation=%s WHERE id='game'",
+        (new_epoch, new_generation),
+    )
+    store["generation"] = new_generation
+    # Old-epoch reconnects must resync, not silently reuse the new cursor.
+    assert (
+        await store["client"].get(
+            "/v2/agents/game/events",
+            params={"epoch": frame["epoch"], "cursor": 0},
+            headers={"Authorization": "Bearer " + store["tokens"]["game-agent"]},
+        )
+    ).status_code == 409
+    stale = [f for f in await envelopes(store) if f["sequence"] == 1][0]
+    assert stale["reason"] == "rejected" and stale["executable"] is False
+    current = {
+        **ack_body(stale, "rejected"),
+        "epoch": str(new_epoch),
+        "generation": str(new_generation),
+    }
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", current, "game-agent")
+    ).status_code == 200
+    assert (await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'"))[
+        0
+    ]["received_cursor"] == 1
+    # Historical endpoint identity settles a different retired frame; one
+    # envelope still settles exactly once, so a second terminal state for the
+    # same frame stays a conflict.
+    second = [f for f in await envelopes(store) if f["sequence"] == 2][0]
+    historic = ack_body(second, "unknown")
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", historic, "game-agent")
+    ).status_code == 200
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", historic, "game-agent")
+    ).status_code == 200
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            dict(historic, result="effect_uncertain"),
+            "game-agent",
+        )
+    ).status_code == 409
+    followup = await queued(store, "epoch-new")
+    assert followup["operationId"] != op["operationId"]
+    live = [f for f in await envelopes(store) if f["sequence"] == 3]
+    assert len(live) == 1 and live[0]["executable"] is True
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(live[0]), "game-agent"
+        )
+    ).status_code == 200
+
+
+@pytest.mark.parametrize("kill", ["revoke", "expire"])
+async def test_c11_unknown_preserved_across_settlement(store, kill):
+    first = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("c11-unknown")
+    )
+    assert first.status_code == 202
+    operation_id = UUID(first.json()["operationId"])
+    game_frame = (await envelopes(store))[0]
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(game_frame, "unknown"),
+            "game-agent",
+        )
+    ).status_code == 200
+    assert (
+        await sql(store, "SELECT status FROM operations WHERE id=%s", (operation_id,))
+    )[0]["status"] == "partial"
+    if kill == "revoke":
+        await sql(
+            store,
+            "UPDATE credentials SET revoked_at=now() WHERE account_id=%s",
+            (store["accounts"]["admin"],),
+        )
+    else:
+        await sql(
+            store,
+            "UPDATE operations SET deadline=now()-interval '1 second' WHERE id=%s",
+            (operation_id,),
+        )
+    for _ in range(3):
+        frames = await envelopes(store, cid="workshop")
+        assert frames[0]["reason"] in ("expired", "rejected")
+        assert frames[0]["executable"] is False
+        assert (
+            await sql(
+                store, "SELECT status FROM operations WHERE id=%s", (operation_id,)
+            )
+        )[0]["status"] == "partial"
+    workshop_frame = (await envelopes(store, cid="workshop"))[0]
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/workshop/acks",
+            ack_body(workshop_frame, "rejected"),
+            "workshop-agent",
+        )
+    ).status_code == 200
+    assert (
+        await sql(store, "SELECT status FROM operations WHERE id=%s", (operation_id,))
+    )[0]["status"] == "partial"
+
+
+async def test_c11_rejected_after_applied_conflicts(store):
+    await queued(store, "applied-then-reject")
+    frame = (await envelopes(store))[0]
+    for state in ("received", "validated", "applied"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frame, state),
+                "game-agent",
+            )
+        ).status_code == 200
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frame, "rejected"),
+            "game-agent",
+        )
+    ).status_code == 409
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frame, "unknown"),
+            "game-agent",
+        )
+    ).status_code == 200
+    both = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("c11-both-applied")
+    )
+    assert both.status_code == 202
+    both_id = UUID(both.json()["operationId"])
+    for cid in ("game", "workshop"):
+        role = cid + "-agent"
+        envelope = [
+            f
+            for f in await envelopes(store, cid=cid)
+            if f["operationId"] == str(both_id)
+        ][0]
+        for state in ("received", "validated", "applied"):
+            assert (
+                await request(
+                    store,
+                    "POST",
+                    f"/v2/agents/{cid}/acks",
+                    ack_body(envelope, state),
+                    role,
+                )
+            ).status_code == 200
+        assert (
+            await request(
+                store,
+                "POST",
+                f"/v2/agents/{cid}/acks",
+                ack_body(envelope, "rejected"),
+                role,
+            )
+        ).status_code == 409
+    assert (await sql(store, "SELECT status FROM operations WHERE id=%s", (both_id,)))[
+        0
+    ]["status"] == "applied"
+
+
+async def test_c11_delayed_chain_uploads_as_history(store):
+    await queued(store, "late-a")
+    await queued(store, "late-b")
+    await queued(store, "late-c")
+    await queued(store, "late-d")
+    received_a = (await envelopes(store))[0]
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(received_a), "game-agent"
+        )
+    ).status_code == 200
+    received_b = (await envelopes(store))[1]
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(received_b), "game-agent"
+        )
+    ).status_code == 200
+    await sql(
+        store,
+        "UPDATE credentials SET revoked_at=now() WHERE account_id=%s",
+        (store["accounts"]["moderator"],),
+    )
+    # Loss between received and validated, and after validated: the locally
+    # durable chain uploads after the policy change instead of being discarded.
+    for frame in (received_a, received_b):
+        for state in ("validated", "applied", "effective"):
+            assert (
+                await request(
+                    store,
+                    "POST",
+                    "/v2/agents/game/acks",
+                    ack_body(frame, state),
+                    "game-agent",
+                )
+            ).status_code == 200
+    # Loss before received: the whole chain uploads after the policy change.
+    late_c = [f for f in await envelopes(store) if f["sequence"] == 3][0]
+    for state in ("received", "validated", "applied", "effective"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(late_c, state),
+                "game-agent",
+            )
+        ).status_code == 200
+    # Batch still fences execution of the dead operation.
+    dead = [f for f in await envelopes(store) if f["sequence"] == 4][0]
+    assert dead["reason"] == "rejected" and dead["executable"] is False
+
+
+@pytest.mark.parametrize("kill", ["revoke", "expire_cred", "expire_op"])
+async def test_c11_desired_state_outlives_issuer(store, kill):
+    gameplay = await request(
+        store, "PATCH", "/v2/settings/gameplay/*", patch("c11-desired", 0)
+    )
+    assert gameplay.status_code == 202
+    gate = await request(
+        store, "PATCH", "/v2/settings/gate/*", patch("c11-gate", 0, {"mode": "open"})
+    )
+    assert gate.status_code == 202
+    gameplay_id = UUID(gameplay.json()["operationId"])
+    frame = [f for f in await envelopes(store) if f["operationId"] == str(gameplay_id)][
+        0
+    ]
+    for state in ("received", "validated", "applied"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frame, state),
+                "game-agent",
+            )
+        ).status_code == 200
+    before = await request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    assert before.status_code == 200
+    if kill == "revoke":
+        await sql(
+            store,
+            "UPDATE credentials SET revoked_at=now() WHERE account_id=%s",
+            (store["accounts"]["admin"],),
+        )
+    elif kill == "expire_cred":
+        await sql(
+            store,
+            "UPDATE credentials SET expires_at=now()-interval '1 second' WHERE account_id=%s",
+            (store["accounts"]["admin"],),
+        )
+    else:
+        await sql(
+            store,
+            "UPDATE operations SET deadline=now()-interval '1 second' WHERE id=%s",
+            (gameplay_id,),
+        )
+    live = await envelopes(store)
+    gameplay_live = [f for f in live if f["operationId"] == str(gameplay_id)]
+    assert len(gameplay_live) == 1
+    assert not gameplay_live[0]["executable"]
+    assert gameplay_live[0]["reason"] in ("rejected", "expired", "superseded")
+    after = await request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    assert after.status_code == 200
+    assert after.json()["hash"] == before.json()["hash"]
+    assert after.json()["settings"] == before.json()["settings"]
+    assert (await request(store, "GET", "/v1/gate", role="game-agent")).json()[
+        "mode"
+    ] == "open"
+    assert (
+        await sql(store, "SELECT status FROM operations WHERE id=%s", (gameplay_id,))
+    )[0]["status"] in ("applied", "partial")
+
+
+async def test_c11_snapshot_hash_ignores_row_order(store, monkeypatch):
+    import cpv2.delivery
+
+    await request(store, "PATCH", "/v2/settings/gameplay/zeta", patch("order-a"))
+    await request(store, "PATCH", "/v2/settings/gameplay/arena", patch("order-b"))
+    first = await request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    assert first.status_code == 200
+    original = cpv2.delivery.rows
+
+    async def flip(conn, query, args=()):
+        found = await original(conn, query, args)
+        return list(reversed(found)) if "settings_heads" in query else found
+
+    monkeypatch.setattr(cpv2.delivery, "rows", flip)
+    second = await request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    assert second.status_code == 200
+    assert second.json()["hash"] == first.json()["hash"]
+    assert [(s["namespace"], s["target"]) for s in second.json()["settings"]] == [
+        ("gameplay", "arena"),
+        ("gameplay", "zeta"),
+    ]
+
+
+async def test_c11_consumerless_settings_not_expired_on_read(store):
+    token = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "qa",
+                "via": "cli",
+                "human": True,
+                "ceiling": sorted(OWNER_SCOPES),
+            },
+            "accountId": str(uuid4()),
+            "displayName": "qa",
+            "ceiling": sorted(OWNER_SCOPES),
+            "environment": "qa",
+            "backend": "game",
+            "resource": "*",
+            "grants": [
+                {
+                    "role": "admin",
+                    "environment": "qa",
+                    "backend": "game",
+                    "resource": "*",
+                    "grantor": str(store["accounts"]["owner"]),
+                }
+            ],
+        },
+    )
+    store["tokens"]["qa-admin"] = token
+    accepted = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/arena",
+        dict(patch("qa-only"), environment="qa"),
+        role="qa-admin",
+    )
+    assert accepted.status_code == 202
+    operation_id = UUID(accepted.json()["operationId"])
+    await sql(
+        store,
+        "UPDATE operations SET deadline=now()-interval '1 second' WHERE id=%s",
+        (operation_id,),
+    )
+    view = await request(
+        store, "GET", "/v2/operations/" + str(operation_id), role="qa-admin"
+    )
+    assert view.json()["status"] == "accepted"
+    assert not await sql(
+        store,
+        "SELECT * FROM operation_events WHERE operation_id=%s AND status='expired'",
+        (operation_id,),
+    )
+    consumer = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "qa-game",
+                "via": "game",
+                "ceiling": sorted(SERVICE_SCOPES),
+            },
+            "ceiling": sorted(SERVICE_SCOPES),
+            "environment": "qa",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "qa-game",
+                "generation": str(uuid4()),
+                "capabilities": ["settings.gameplay"],
+            },
+        },
+    )
+    store["tokens"]["qa-game-agent"] = consumer
+    snapshot = await request(
+        store, "GET", "/v2/agents/qa-game/snapshot", role="qa-game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [s for s in snapshot.json()["settings"] if s["target"] == "arena"] != []
+
+
+async def test_c11_historical_duplicate_beats_generation_check(store):
+    await queued(store, "dup-check")
+    frame = (await envelopes(store))[0]
+    effect = None
+    for state in ("received", "validated", "applied", "effective"):
+        effect = ack_body(frame, state)
+        assert (
+            await request(store, "POST", "/v2/agents/game/acks", effect, "game-agent")
+        ).status_code == 200
+    await sql(store, "UPDATE consumers SET generation=%s WHERE id='game'", (uuid4(),))
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", effect, "game-agent")
+    ).status_code == 200
+    changed = dict(effect, result="apply_failed")
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", changed, "game-agent")
+    ).status_code == 409
+
+
+async def test_c11_orphan_rejects_arbitrary_generation(store):
+    ops = [await queued(store, f"orphan-{key}") for key in ("a", "b", "c", "d")]
+    assert all(o["operationId"] for o in ops)
+    new_generation = uuid4()
+    await sql(
+        store, "UPDATE consumers SET generation=%s WHERE id='game'", (new_generation,)
+    )
+    frames = await envelopes(store)
+    assert len(frames) == 4
+    current = dict(ack_body(frames[0], "rejected"), generation=str(new_generation))
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", current, "game-agent")
+    ).status_code == 200
+    historical = ack_body(frames[1], "unknown")
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", historical, "game-agent")
+    ).status_code == 200
+    strange = dict(ack_body(frames[2], "rejected"), generation=str(uuid4()))
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", strange, "game-agent")
+    ).status_code == 409
+    strange_unknown = dict(ack_body(frames[2], "unknown"), generation=str(uuid4()))
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", strange_unknown, "game-agent"
+        )
+    ).status_code == 409
+    fresh_effect = dict(ack_body(frames[3], "received"), generation=str(new_generation))
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", fresh_effect, "game-agent")
+    ).status_code == 409
+
+
+async def test_c11_deadline_rechecked_after_issuer_locks(store, monkeypatch):
+    import cpv2.delivery
+
+    op = await queued(store, "short-deadline")
+    await sql(
+        store,
+        "UPDATE operations SET deadline=now()+interval '1 second' WHERE id=%s",
+        (UUID(op["operationId"]),),
+    )
+    original, started = cpv2.delivery.one, False
+
+    async def pause_after_account_lock(conn, query, args=()):
+        nonlocal started
+        row = await original(conn, query, args)
+        if query.startswith("SELECT * FROM accounts WHERE id=") and not started:
+            started = True
+            await asyncio.sleep(2.5)
+        return row
+
+    monkeypatch.setattr(cpv2.delivery, "one", pause_after_account_lock)
+    frames = await envelopes(store)
+    assert frames[0]["reason"] == "expired" and frames[0]["executable"] is False
+
+
+async def test_c11_grant_expiry_uses_check_time(store, monkeypatch):
+    op = await queued(store, "expiring-grant")
+    operation_id = UUID(op["operationId"])
+    await sql(
+        store,
+        "UPDATE role_grants SET expires_at=now()+interval '1 second' WHERE account_id=%s AND revoked_at IS NULL",
+        (store["accounts"]["moderator"],),
+    )
+    holder = await psycopg.AsyncConnection.connect(
+        store["admin"], options="-c search_path=control,pg_catalog"
+    )
+    try:
+        await holder.execute(
+            "SELECT * FROM operations WHERE id=%s FOR UPDATE", (operation_id,)
+        )
+        task = asyncio.create_task(envelopes(store))
+        await asyncio.sleep(2)
+        await holder.execute("ROLLBACK")
+        frames = await asyncio.wait_for(task, 10)
+    finally:
+        await holder.close()
+    assert frames[0]["reason"] == "rejected" and frames[0]["executable"] is False
+    # Same rule on the authentication path: a lock wait spanning expiry must
+    # not resurrect the grant.
+    await sql(
+        store,
+        "UPDATE role_grants SET expires_at=now()+interval '1 second' WHERE account_id=%s AND revoked_at IS NULL",
+        (store["accounts"]["builder"],),
+    )
+    blocker = await psycopg.AsyncConnection.connect(
+        store["admin"], options="-c search_path=control,pg_catalog"
+    )
+    auth_conn = await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    )
+    try:
+        await blocker.execute(
+            "SELECT * FROM accounts WHERE id=%s FOR UPDATE",
+            (store["accounts"]["builder"],),
+        )
+        auth_task = asyncio.create_task(
+            authenticate(auth_conn, store["tokens"]["builder"])
+        )
+        await asyncio.sleep(2)
+        await blocker.execute("ROLLBACK")
+        identity = await asyncio.wait_for(auth_task, 10)
+    finally:
+        await blocker.close()
+        await auth_conn.close()
+    assert identity.grants == []
+
+
+async def test_c12_unrepresentable_inputs_are_invalid_without_side_effects(store):
+    async def counts():
+        ops = await sql(store, "SELECT count(*) AS n FROM operations")
+        revs = await sql(store, "SELECT count(*) AS n FROM settings_revisions")
+        outbox = await sql(store, "SELECT count(*) AS n FROM outbox")
+        return ops[0]["n"], revs[0]["n"], outbox[0]["n"]
+
+    before = await counts()
+    # A lone surrogate cannot pass through an httpx/json client encoder, so it
+    # travels as raw JSON bytes with an escaped surrogate, exactly as a real
+    # executor would send it.
+    surrogate = (
+        '{"idempotencyKey":"surrogate","environment":"prod","backend":"game",'
+        '"expectedRevision":0,"patch":{"mode":"open","message":"ok\\ud800tail"}}'
+    ).encode()
+    response = await store["client"].request(
+        "PATCH",
+        "/v2/settings/gate/*",
+        content=surrogate,
+        headers={**headers(store), "content-type": "application/json"},
+    )
+    assert 400 <= response.status_code < 500, (response.status_code, response.text)
+    assert response.status_code != 429
+    action = {
+        "idempotencyKey": "nul-reason",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "target": "arena",
+        "playerId": str(uuid4()),
+        "reason": "bad\x00reason",
+        "expiresInSeconds": 60,
+    }
+    bad = [
+        (
+            "PATCH",
+            "/v2/settings/gate/*",
+            patch("nul", 0, {"mode": "open", "message": "a\x00b"}),
+        ),
+        ("PATCH", "/v2/settings/gameplay/arena", dict(patch("bigrange", 2**63))),
+        ("POST", "/v2/actions/moderation.kick", action),
+    ]
+    for method, path, body in bad:
+        response = await request(store, method, path, body)
+        assert 400 <= response.status_code < 500, (
+            method,
+            path,
+            response.status_code,
+            response.text,
+        )
+        assert response.status_code != 429
+    assert await counts() == before
+    invalid = await sql(
+        store,
+        "SELECT * FROM audit_events WHERE outcome='invalid' AND action IN ('PATCH','POST')",
+    )
+    assert len(invalid) >= len(bad) + 1
+    assert "nul-reason" not in str(await sql(store, "SELECT * FROM operations"))
+    # Ordinary non-ASCII text stays representable and is accepted.
+    good = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gate/*",
+        patch("unicode-ok", 0, {"mode": "open", "message": "миграция ✓"}),
+    )
+    assert good.status_code == 202, good.text
+
+
+async def test_c12_import_refuses_a_first_write_committed_during_probe(
+    store, tmp_path, monkeypatch
+):
+    path = tmp_path / "u1.sqlite"
+    legacy = api.Store(str(path))
+    legacy.bootstrap("legacy-test")
+    legacy.set_gate("maintenance", "migration", "forwarded-owner", "owner", 0, "one")
+    legacy.db.close()
+    real_connect = psycopg.AsyncConnection.connect
+    release = asyncio.Event()
+
+    async def spy_connect(*args, **kwargs):
+        conn = await real_connect(*args, **kwargs)
+        original_execute = conn.execute
+
+        async def execute_spy(query, params=()):
+            if "LOCK TABLE settings_heads" in str(query):
+                await asyncio.wait_for(release.wait(), 30)
+            return await original_execute(query, params)
+
+        conn.execute = execute_spy
+        return conn
+
+    monkeypatch.setattr(psycopg.AsyncConnection, "connect", spy_connect)
+    task = asyncio.create_task(import_u1(store["admin"], path))
+    await asyncio.sleep(1)
+    first = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("first-write")
+    )
+    assert first.status_code == 202, first.text
+    release.set()
+    with pytest.raises(ValueError, match="unused staging"):
+        await asyncio.wait_for(task, 30)
+    assert not await sql(store, "SELECT * FROM legacy_imports")
+    assert (
+        await sql(
+            store, "SELECT revision FROM settings_heads WHERE namespace='gameplay'"
+        )
+    )[0]["revision"] == 1
+
+
+async def test_c12_randomized_delivery_walk_preserves_invariants(store):
+    rng = random.Random(20261101)
+    consumers = ("game", "workshop")
+    states = ("received", "validated", "applied", "effective", "rejected", "unknown")
+    valid_statuses = {
+        "accepted",
+        "received",
+        "validated",
+        "applied",
+        "effective",
+        "rejected",
+        "expired",
+        "unknown",
+        "partial",
+    }
+    seen_outbox = set()
+    revoked = False
+    replaced = 0
+    expired = 0
+    prev_snapshot_hash = None
+    acked = {state: 0 for state in states}
+    denied = 0
+    progress = {}
+    advance = ("received", "validated", "applied", "effective")
+
+    async def check_invariants():
+        for cid in consumers:
+            receipts = await sql(
+                store,
+                "SELECT o.sequence, a.state FROM consumer_acks a "
+                "JOIN outbox o ON o.consumer_id=a.consumer_id AND o.sequence=a.sequence "
+                "WHERE a.consumer_id=%s",
+                (cid,),
+            )
+            covered = {
+                r["sequence"]
+                for r in receipts
+                if r["state"] in ("received", "rejected", "unknown")
+            }
+            expect, seq = 0, 1
+            while seq in covered:
+                expect, seq = seq, seq + 1
+            cursor = (
+                await sql(
+                    store, "SELECT received_cursor FROM consumers WHERE id=%s", (cid,)
+                )
+            )[0]["received_cursor"]
+            assert cursor == expect, (cid, cursor, expect)
+            clashes = await sql(
+                store,
+                "SELECT 1 FROM consumer_acks a JOIN consumer_acks b USING (consumer_id, sequence) "
+                "WHERE a.consumer_id=%s AND a.state IN ('applied','effective') "
+                "AND b.state='rejected' LIMIT 1",
+                (cid,),
+            )
+            assert not clashes, cid
+        rows = await sql(
+            store,
+            "SELECT consumer_id, sequence, operation_id, payload_hash FROM outbox",
+        )
+        keys = [(r["consumer_id"], r["sequence"]) for r in rows]
+        assert len(set(keys)) == len(keys)
+        assert seen_outbox <= {(r["consumer_id"], r["sequence"]) for r in rows}
+        seen_outbox.update((r["consumer_id"], r["sequence"]) for r in rows)
+        for op in await sql(store, "SELECT id, status FROM operations"):
+            assert op["status"] in valid_statuses, op
+            agg = await sql(
+                store,
+                "SELECT DISTINCT a.state FROM consumer_acks a JOIN outbox o "
+                "ON o.consumer_id=a.consumer_id AND o.sequence=a.sequence "
+                "WHERE o.operation_id=%s",
+                (op["id"],),
+            )
+            have = {r["state"] for r in agg}
+            if have & {"applied", "effective"}:
+                assert op["status"] not in ("rejected", "expired"), (op, have)
+            if have & {"unknown"} and not have & {"applied", "effective"}:
+                assert op["status"] != "expired", (op, have)
+
+    async def check_snapshots():
+        # Consecutive-read hash stability; called every few steps to stay
+        # within the per-route test rate budget (same window other tests use).
+        nonlocal prev_snapshot_hash
+        current = await request(
+            store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+        )
+        assert current.status_code == 200, (current.status_code, current.text)
+        if prev_snapshot_hash is not None:
+            assert current.json()["hash"] == prev_snapshot_hash
+        prev_snapshot_hash = current.json()["hash"]
+
+    await check_invariants()
+    for step in range(60):
+        roll = rng.random()
+        if roll < 0.30:
+            cid = rng.choice(consumers)
+            role = "moderator" if not revoked else "admin"
+            body = {
+                "idempotencyKey": f"walk-{step}",
+                "environment": "prod",
+                "backend": "game",
+                "consumerId": cid,
+                "generation": str(store["generation"]),
+                "target": "arena",
+                "playerId": str(uuid4()),
+                "expiresInSeconds": 60,
+            }
+            response = await request(
+                store, "POST", "/v2/actions/moderation.kick", body, role
+            )
+            assert response.status_code in (202, 403), response.text
+        elif roll < 0.65:
+            cid = rng.choice(consumers)
+            frames = await envelopes(store, cid=cid)
+            if frames:
+                frames = sorted(frames, key=lambda f: f["sequence"])
+                frame = frames[0] if rng.random() < 0.7 else rng.choice(frames)
+                key = (cid, frame["sequence"])
+                if frame["generation"] != str(store["generation"]):
+                    # Retired frame: settle through a documented endpoint
+                    # identity with a terminal receipt, never as new work.
+                    state = rng.choice(("rejected", "unknown"))
+                else:
+                    idx = progress.get(key, -1)
+                    if idx < 3 and rng.random() < 0.8:
+                        state = advance[idx + 1]
+                    else:
+                        state = rng.choice(states)
+                response = await request(
+                    store,
+                    "POST",
+                    f"/v2/agents/{cid}/acks",
+                    ack_body(frame, state),
+                    cid + "-agent",
+                )
+                assert response.status_code in (200, 409), response.text
+                if response.status_code == 200:
+                    acked[state] += 1
+                    if state in advance:
+                        progress[key] = max(idx, advance.index(state))
+                    else:
+                        progress[key] = 99
+                else:
+                    denied += 1
+        elif roll < 0.75 and replaced < 3:
+            replaced += 1
+            store["generation"] = uuid4()
+            await sql(
+                store,
+                "UPDATE consumers SET generation=%s WHERE id IN ('game','workshop')",
+                (store["generation"],),
+            )
+            cid = rng.choice(consumers)
+            settled = await envelopes(store, cid=cid)
+            if settled:
+                old = rng.choice(sorted(settled, key=lambda f: f["sequence"]))
+                probe = dict(ack_body(old, "rejected"), generation=str(uuid4()))
+                denied_response = await request(
+                    store,
+                    "POST",
+                    f"/v2/agents/{cid}/acks",
+                    probe,
+                    cid + "-agent",
+                )
+                assert denied_response.status_code == 409, denied_response.text
+                denied += 1
+                settle = await request(
+                    store,
+                    "POST",
+                    f"/v2/agents/{cid}/acks",
+                    ack_body(old, "unknown"),
+                    cid + "-agent",
+                )
+                assert settle.status_code == 200, settle.text
+                acked["unknown"] += 1
+                progress[(cid, old["sequence"])] = 99
+        elif roll < 0.85:
+            open_ops = await sql(
+                store, "SELECT id FROM operations WHERE status='accepted' LIMIT 5"
+            )
+            if open_ops:
+                await sql(
+                    store,
+                    "UPDATE operations SET deadline=now()-interval '1 second' WHERE id=%s",
+                    (rng.choice(open_ops)["id"],),
+                )
+                expired += 1
+        elif roll < 0.95 and not revoked:
+            revoked = True
+            await sql(
+                store,
+                "UPDATE credentials SET revoked_at=now() WHERE account_id=%s",
+                (store["accounts"]["moderator"],),
+            )
+        else:
+            frames = await envelopes(store, cid=rng.choice(consumers))
+            assert all(
+                f["executable"] is False or f["payload"] is not None for f in frames
+            )
+        await check_invariants()
+        if step % 5 == 0:
+            await check_snapshots()
+    if acked["rejected"] + acked["unknown"] == 0:
+        # Deterministic tail: the frame at the cursor settles terminally on
+        # first contact, so the walk always exercises terminal receipts.
+        cid = rng.choice(consumers)
+        await queued(store, "walk-tail", "admin", cid)
+        cursor = (
+            await sql(
+                store, "SELECT received_cursor FROM consumers WHERE id=%s", (cid,)
+            )
+        )[0]["received_cursor"]
+        tail = [
+            f for f in await envelopes(store, cid=cid) if f["sequence"] == cursor + 1
+        ][0]
+        response = await request(
+            store,
+            "POST",
+            f"/v2/agents/{cid}/acks",
+            ack_body(tail, "rejected"),
+            cid + "-agent",
+        )
+        assert response.status_code == 200, response.text
+        acked["rejected"] += 1
+        await check_invariants()
+    # The seed must exercise every operator: issuing, each ack outcome class,
+    # replacement, expiry and revocation. Otherwise the walk proves nothing.
+    assert replaced == 3 and expired >= 1 and revoked
+    assert acked["received"] >= 1 and acked["applied"] >= 1
+    assert acked["rejected"] + acked["unknown"] >= 1
+    assert denied >= 1

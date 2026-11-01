@@ -248,6 +248,8 @@ async def settings_change(
         )
         return {"value": after, "diff": diff, "ownerApprovalRequired": protected}
     revision = head["revision"] + 1
+    if revision > 9223372036854775807:
+        raise Problem("revision_exhausted", 409)
     await conn.execute(
         "INSERT INTO settings_revisions(namespace,environment,backend,target,revision,base_revision,value,diff,value_hash,operation_id,actor,rollback_of,state_since) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
@@ -561,8 +563,12 @@ async def read_operation(conn, identity, op_id):
         "received",
         "validated",
     ):
-        await event(conn, op_id, "expired")
-        op["status"] = "expired"
+        # Desired state persists in settings heads; expiry settles delivery.
+        # With no outbox rows nothing was ever queued, so there is no failed
+        # delivery to declare and the read must not fabricate one.
+        if await one(conn, "SELECT 1 FROM outbox WHERE operation_id=%s", (op["id"],)):
+            await event(conn, op_id, "expired")
+            op["status"] = "expired"
     receipts = await rows(
         conn,
         "SELECT consumer_id,sequence,state,result,actual_at,recorded_at FROM consumer_acks WHERE (consumer_id,sequence) IN (SELECT consumer_id,sequence FROM outbox WHERE operation_id=%s) ORDER BY recorded_at",

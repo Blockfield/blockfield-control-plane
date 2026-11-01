@@ -51,6 +51,10 @@ async def import_u1(dsn, path):
         dsn, row_factory=dict_row, options="-c search_path=control,pg_catalog"
     ) as conn:
         await conn.execute("SELECT pg_advisory_xact_lock(278004)")
+        # Fence settings-head writers before probing emptiness: RowExclusive
+        # head writes block on this lock, so the check below cannot be raced
+        # by a concurrent first write to any namespace/target.
+        await conn.execute("LOCK TABLE settings_heads IN EXCLUSIVE MODE")
         prior = await one(
             conn,
             "SELECT manifest FROM legacy_imports WHERE source_hash=%s",

@@ -143,8 +143,8 @@ async def authenticate(conn, token, *, lock_credential=True):
             raise Problem("test_account_privileged_access_denied")
         grants = await rows(
             conn,
-            "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())",
-            (account["id"],),
+            "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+            (account["id"], now()),
         )
         membership = await one(
             conn,

@@ -24,25 +24,25 @@ class Mutation(Strict):
 
 
 class SettingsChange(Mutation):
-    expectedRevision: int = Field(ge=0)
+    expectedRevision: int = Field(ge=0, le=9223372036854775807)
     patch: dict
 
 
 class Rollback(Mutation):
-    expectedRevision: int = Field(ge=0)
-    revision: int = Field(ge=1)
+    expectedRevision: int = Field(ge=0, le=9223372036854775807)
+    revision: int = Field(ge=1, le=9223372036854775807)
 
 
 class GrantChange(Mutation):
     accountId: ID
-    expectedRevision: int = Field(ge=1)
+    expectedRevision: int = Field(ge=1, le=9223372036854775807)
     role: Literal["builder", "moderator", "admin"]
     resource: str = Field(min_length=1, max_length=128)
     revoke: bool = False
 
 
 class TestStatus(Mutation):
-    expectedRevision: int = Field(ge=1)
+    expectedRevision: int = Field(ge=1, le=9223372036854775807)
     isTest: Literal[True]
     reason: str = Field(min_length=1, max_length=500)
     expiresInSeconds: int = Field(ge=1, le=86400)

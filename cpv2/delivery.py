@@ -111,8 +111,8 @@ async def valid_operation(conn, op):
     client = await one(conn, "SELECT * FROM clients WHERE id=%s", (c["client_id"],))
     grants = await rows(
         conn,
-        "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())",
-        (account["id"],),
+        "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+        (account["id"], now()),
     )
     owner = bool(
         c["kind"] == "session"
@@ -135,6 +135,10 @@ async def valid_operation(conn, op):
         )
         if not parent or parent["revoked_at"] or parent["expires_at"] <= now():
             return "rejected"
+    # Rechecked after the issuer locks above: a deadline crossed while waiting
+    # must settle as expired, never as authorized.
+    if op["deadline"] <= now():
+        return "expired"
     return None
 
 
@@ -200,7 +204,7 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
         ):
             effected = await one(
                 conn,
-                "SELECT 1 FROM consumer_acks a JOIN outbox o ON o.consumer_id=a.consumer_id AND o.sequence=a.sequence WHERE o.operation_id=%s AND a.state IN ('applied','effective')",
+                "SELECT 1 FROM consumer_acks a JOIN outbox o ON o.consumer_id=a.consumer_id AND o.sequence=a.sequence WHERE o.operation_id=%s AND a.state IN ('applied','effective','unknown')",
                 (op["id"],),
             )
             if not effected:
@@ -258,20 +262,10 @@ async def acknowledge(conn, identity, attempt, cid, model):
     )
     if (
         not record
-        or model.epoch != c["epoch"]
-        or model.epoch != record["epoch"]
         or model.revision != record["revision"]
         or model.payloadHash != record["payload_hash"]
     ):
         raise Problem("receipt_mismatch", 409)
-    if model.generation != c["generation"] or model.generation != record["generation"]:
-        # An orphaned frame (generation replaced) can only be settled with a
-        # terminal receipt, never attested as received or effected.
-        if record["generation"] == c["generation"] or model.state not in (
-            "rejected",
-            "unknown",
-        ):
-            raise Problem("receipt_mismatch", 409)
     body = model.model_dump(mode="json")
     fingerprint = digest(body)
     prior = await one(
@@ -280,9 +274,35 @@ async def acknowledge(conn, identity, attempt, cid, model):
         (cid, model.sequence, model.state),
     )
     if prior:
+        # Exact historical duplicates succeed before any new-transition
+        # generation/epoch rules; a changed duplicate still conflicts.
         if prior["receipt_hash"] != fingerprint:
             raise Problem("receipt_conflict", 409)
         return {"state": model.state, "sequence": model.sequence}
+    current = (
+        (model.epoch, model.generation)
+        == (c["epoch"], c["generation"])
+        == (
+            record["epoch"],
+            record["generation"],
+        )
+    )
+    retired = (record["epoch"], record["generation"]) != (
+        c["epoch"],
+        c["generation"],
+    )
+    if not current and (
+        not retired
+        or (model.epoch, model.generation)
+        not in (
+            (record["epoch"], record["generation"]),
+            (c["epoch"], c["generation"]),
+        )
+        or model.state not in ("rejected", "unknown")
+    ):
+        # Retired frames settle only through a documented endpoint identity
+        # (historical or current) with a terminal receipt, never as new work.
+        raise Problem("receipt_mismatch", 409)
     op = await one(
         conn,
         "SELECT * FROM operations WHERE id=%s FOR UPDATE",
@@ -296,29 +316,18 @@ async def acknowledge(conn, identity, attempt, cid, model):
     states = {item["state"] for item in existing}
     if states & TERMINAL:
         raise Problem("receipt_terminal", 409)
+    if model.state == "rejected" and states & {"applied", "effective"}:
+        # A rejection cannot erase a recorded effect; report uncertainty instead.
+        raise Problem("receipt_terminal", 409)
     if model.state in STATES:
         index = STATES.index(model.state)
         if index and STATES[index - 1] not in states:
             raise Problem("receipt_order", 409)
         if model.state == "received" and model.sequence != c["received_cursor"] + 1:
             raise Problem("receipt_gap", 409)
-        # Applied/effective ACKs attest past effects, even if policy changed since validation.
-        if model.state in ("received", "validated") and await valid_operation(conn, op):
-            raise Problem("operation_no_longer_authorized", 409)
-        if model.state in ("received", "validated") and record["revision"]:
-            payload = record["payload"]
-            head = await one(
-                conn,
-                "SELECT revision FROM settings_heads WHERE namespace=%s AND environment=%s AND backend=%s AND target=%s",
-                (
-                    payload["namespace"],
-                    c["environment"],
-                    c["backend"],
-                    payload["target"],
-                ),
-            )
-            if not head or head["revision"] != record["revision"]:
-                raise Problem("superseded_revision", 409)
+        # Post-policy received/validated are recorded as historical facts: the
+        # executor reports what it did before losing authorization. Execution
+        # itself stays fenced at batch time, so recording grants nothing.
     elif model.sequence != c["received_cursor"] + 1 and "received" not in states:
         raise Problem("receipt_gap", 409)
     actual = datetime.fromisoformat(model.actualAt)
@@ -417,6 +426,9 @@ async def snapshot(conn, identity, cid):
                     }
                 )
         result.extend({"namespace": namespace, **r} for r in settings)
+    # Deterministic wire order: the snapshot hash must not depend on the
+    # database's physical return order. Documented as (namespace, target).
+    result.sort(key=lambda r: (r["namespace"], r["target"]))
     # A snapshot bootstraps desired state only; it never advances receipt ACKs.
     return {
         "schema": 2,
