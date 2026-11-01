@@ -2052,3 +2052,35 @@ async def test_c8_gate_fallback_never_leaks_across_environments(store, tmp_path)
     snapshot = await request(store, "GET", "/v2/agents/qa/snapshot", role="qa-agent")
     assert snapshot.status_code == 200
     assert [s for s in snapshot.json()["settings"] if s["namespace"] == "gate"] == []
+
+
+async def test_c9_late_revocation_never_demotes_a_sibling_effect(store):
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("c9-effect")
+    )
+    assert accepted.status_code == 202
+    operation_id = UUID(accepted.json()["operationId"])
+    frame = (await envelopes(store))[0]
+    for state in ("received", "validated", "applied"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frame, state),
+                "game-agent",
+            )
+        ).status_code == 200
+    assert (
+        await sql(store, "SELECT status FROM operations WHERE id=%s", (operation_id,))
+    )[0]["status"] == "partial"
+    await sql(
+        store,
+        "UPDATE credentials SET revoked_at=now() WHERE account_id=%s",
+        (store["accounts"]["admin"],),
+    )
+    lagging = (await envelopes(store, cid="workshop"))[0]
+    assert lagging["reason"] == "rejected" and lagging["executable"] is False
+    assert (
+        await sql(store, "SELECT status FROM operations WHERE id=%s", (operation_id,))
+    )[0]["status"] == "partial"

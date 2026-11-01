@@ -180,12 +180,20 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
                 reason = "superseded"
         # A stale generation is this consumer's verdict only: it must not move
         # the shared operation status while sibling consumers still execute it.
+        # Nor may it demote an effect a sibling already recorded: op status
+        # derives from all per-consumer receipts, never from one late verdict.
         if (
             reason in ("expired", "rejected")
             and not stale_generation
             and op["status"] not in TERMINAL
         ):
-            await event(conn, op["id"], reason)
+            effected = await one(
+                conn,
+                "SELECT 1 FROM consumer_acks a JOIN outbox o ON o.consumer_id=a.consumer_id AND o.sequence=a.sequence WHERE o.operation_id=%s AND a.state IN ('applied','effective')",
+                (op["id"],),
+            )
+            if not effected:
+                await event(conn, op["id"], reason)
         terminal = await one(
             conn,
             "SELECT state FROM consumer_acks WHERE consumer_id=%s AND sequence=%s AND state IN ('effective','rejected','unknown')",
