@@ -277,8 +277,8 @@ async def settings_change(
     )
     consumers = await rows(
         conn,
-        "SELECT * FROM consumers WHERE environment=%s AND backend=%s AND %s=ANY(capabilities) AND (resource='*' OR resource=%s)",
-        (env, backend, f"settings.{namespace}", target),
+        "SELECT * FROM consumers WHERE environment=%s AND backend=%s AND %s=ANY(capabilities) AND (resource='*' OR resource=%s OR %s='*')",
+        (env, backend, f"settings.{namespace}", target, target),
     )
     await enqueue(
         conn,

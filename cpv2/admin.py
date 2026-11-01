@@ -127,7 +127,9 @@ async def provision(dsn, spec):
                 (account_id, spec["displayName"]),
             )
             account = await one(
-                conn, "SELECT * FROM accounts WHERE id=%s", (account_id,)
+                conn,
+                "SELECT * FROM accounts WHERE id=%s FOR UPDATE",
+                (account_id,),
             )
             if account["is_test"] or account["status"] != "active":
                 raise ValueError("ineligible account")

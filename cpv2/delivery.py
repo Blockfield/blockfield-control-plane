@@ -174,7 +174,9 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
                     payload["target"],
                 ),
             )
-            if head["revision"] != record["revision"]:
+            if head["revision"] != record["revision"] and not reason:
+                # Authorization/expiry verdicts are terminal: a newer revision
+                # must not whitewash a revoked or expired issuer.
                 reason = "superseded"
         # A stale generation is this consumer's verdict only: it must not move
         # the shared operation status while sibling consumers still execute it.
@@ -239,12 +241,18 @@ async def acknowledge(conn, identity, attempt, cid, model):
         not record
         or model.epoch != c["epoch"]
         or model.epoch != record["epoch"]
-        or model.generation != c["generation"]
-        or model.generation != record["generation"]
         or model.revision != record["revision"]
         or model.payloadHash != record["payload_hash"]
     ):
         raise Problem("receipt_mismatch", 409)
+    if model.generation != c["generation"] or model.generation != record["generation"]:
+        # An orphaned frame (generation replaced) can only be settled with a
+        # terminal receipt, never attested as received or effected.
+        if record["generation"] == c["generation"] or model.state not in (
+            "rejected",
+            "unknown",
+        ):
+            raise Problem("receipt_mismatch", 409)
     body = model.model_dump(mode="json")
     fingerprint = digest(body)
     prior = await one(
@@ -367,14 +375,11 @@ async def snapshot(conn, identity, cid):
             continue
         settings = await rows(
             conn,
-            "SELECT r.target,r.revision,r.value,r.value_hash FROM settings_heads h JOIN settings_revisions r USING(namespace,environment,backend,target,revision) WHERE namespace=%s AND environment=%s AND backend=%s AND (%s='*' OR target=%s)",
+            "SELECT r.target,r.revision,r.value,r.value_hash FROM settings_heads h JOIN settings_revisions r USING(namespace,environment,backend,target,revision) WHERE namespace=%s AND environment=%s AND backend=%s AND (%s='*' OR target=%s OR target='*')",
             (namespace, c["environment"], c["backend"], c["resource"], c["resource"]),
         )
-        if (
-            namespace == "gate"
-            and (c["environment"], c["backend"], c["resource"]) == ("prod", "game", "*")
-            and not any(r["target"] == "*" for r in settings)
-        ):
+        if namespace == "gate" and not any(r["target"] == "*" for r in settings):
+            # A resource-scoped consumer bootstraps the same global gate as '*'.
             gate = await current_settings(conn, "gate", "prod", "game", "*")
             if gate["initialized"]:
                 settings.append(

@@ -1770,3 +1770,189 @@ async def test_c5_bootstrap_revokes_pre_existing_sessions(store, postgres):
             postgres, autocommit=True
         ) as conn:
             await conn.execute(f'DROP DATABASE "{name}"')
+
+
+async def arena_agent(store):
+    token = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "arena",
+                "via": "game",
+                "ceiling": sorted(SERVICE_SCOPES),
+            },
+            "ceiling": sorted(SERVICE_SCOPES),
+            "environment": "prod",
+            "backend": "game",
+            "resource": "arena",
+            "consumer": {
+                "id": "arena",
+                "generation": str(uuid4()),
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        },
+    )
+    store["tokens"]["arena-agent"] = token
+    return token
+
+
+async def test_c7_scoped_consumer_receives_global_settings_and_snapshot(store):
+    await arena_agent(store)
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gameplay/*", patch("global", 0)
+    )
+    assert accepted.status_code == 202
+    frames = await envelopes(store, cid="arena")
+    assert len(frames) == 1 and frames[0]["executable"] is True
+    snapshot = await request(
+        store, "GET", "/v2/agents/arena/snapshot", role="arena-agent"
+    )
+    assert snapshot.status_code == 200
+    scoped = [
+        value
+        for value in snapshot.json()["settings"]
+        if value["namespace"] == "gameplay" and value["target"] == "*"
+    ]
+    assert len(scoped) == 1 and scoped[0]["value"]["lobby"]["pvpEnabled"] is True
+
+
+async def test_c7_scoped_consumer_gets_imported_global_gate(store, tmp_path):
+    await arena_agent(store)
+    path = tmp_path / "arena-gate.sqlite"
+    legacy = api.Store(str(path))
+    legacy.db.execute("UPDATE gate_state SET mode='maintenance'")
+    legacy.db.commit()
+    expected = legacy.gate()
+    legacy.db.close()
+    await import_u1(store["admin"], path)
+    snapshot = await request(
+        store, "GET", "/v2/agents/arena/snapshot", role="arena-agent"
+    )
+    assert snapshot.status_code == 200
+    gates = [
+        value for value in snapshot.json()["settings"] if value["namespace"] == "gate"
+    ]
+    assert gates == [
+        {
+            "namespace": "gate",
+            "target": "*",
+            "revision": 0,
+            "value": {key: expected[key] for key in ("mode", "message")},
+            "value_hash": digest({key: expected[key] for key in ("mode", "message")}),
+        }
+    ]
+
+
+async def test_c7_replaced_generation_settles_orphaned_frames(store):
+    await queued(store, "orphan")
+    (await envelopes(store))[0]
+    new_generation = uuid4()
+    await sql(
+        store, "UPDATE consumers SET generation=%s WHERE id='game'", (new_generation,)
+    )
+    store["generation"] = new_generation
+    stale = (await envelopes(store))[0]
+    assert stale["reason"] == "rejected" and stale["executable"] is False
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(stale), "game-agent"
+        )
+    ).status_code == 409
+    body = ack_body(stale, "rejected")
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", body, "game-agent")
+    ).status_code == 200
+    assert (await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'"))[
+        0
+    ]["received_cursor"] == 1
+    await queued(store, "followup")
+    live = [f for f in await envelopes(store) if f["sequence"] == 2]
+    assert len(live) == 1 and live[0]["executable"] is True
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(live[0]), "game-agent"
+        )
+    ).status_code == 200
+
+
+async def test_c7_revoked_issuer_with_newer_revision_settles_rejected(store):
+    first = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("revoked-one")
+    )
+    assert first.status_code == 202
+    second = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/arena",
+        patch("revoked-two", 1, {"lobby": {"pvpEnabled": False}}),
+    )
+    assert second.status_code == 202
+    await sql(
+        store,
+        "UPDATE credentials SET revoked_at=now() WHERE account_id=%s",
+        (store["accounts"]["admin"],),
+    )
+    frames = await envelopes(store)
+    assert frames[0]["reason"] == "rejected"
+    assert (
+        await sql(
+            store,
+            "SELECT status FROM operations WHERE id=%s",
+            (UUID(first.json()["operationId"]),),
+        )
+    )[0]["status"] == "rejected"
+
+
+async def test_c7_provision_locks_the_account_before_reading_epoch(store, monkeypatch):
+    import cpv2.admin
+
+    account = uuid4()
+    await sql(
+        store,
+        "INSERT INTO accounts(id,display_name) VALUES(%s,'raced')",
+        (account,),
+    )
+    original = cpv2.admin.one
+    selected, release, started = asyncio.Event(), asyncio.Event(), False
+
+    async def pause_after_read(conn, query, args=()):
+        nonlocal started
+        row = await original(conn, query, args)
+        if query.startswith("SELECT * FROM accounts WHERE id=") and not started:
+            started = True
+            selected.set()
+            await asyncio.wait_for(release.wait(), 5)
+        return row
+
+    monkeypatch.setattr(cpv2.admin, "one", pause_after_read)
+    task = asyncio.create_task(
+        provision(
+            store["admin"],
+            {
+                "accountId": str(account),
+                "displayName": "raced",
+                "client": {
+                    "id": "raced",
+                    "via": "cli",
+                    "human": True,
+                    "ceiling": sorted(OWNER_SCOPES),
+                },
+                "ceiling": sorted(OWNER_SCOPES),
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+    )
+    try:
+        await asyncio.wait_for(selected.wait(), 5)
+        # A concurrent grant change must block on the same row, not race past it.
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            await sql(
+                store,
+                "SELECT * FROM accounts WHERE id=%s FOR UPDATE NOWAIT",
+                (account,),
+            )
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 5)
