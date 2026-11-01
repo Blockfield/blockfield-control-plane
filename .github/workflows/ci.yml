@@ -1,10 +1,107 @@
 name: ci
 on:
   push:
-    branches: ['**']
-  pull_request:
+    branches: [main]
+  # Bot-gate (enforcing): PR CI runs only when the GitHub App
+  # `blockfield-review-bot[bot]` approves the CURRENT head SHA. Pushes to a PR
+  # branch fire no workflow run at all; only the bot's `pull_request_review`
+  # (submitted) on the new head starts CI. A stale approval (push between the
+  # review and the run) is rejected by the commit_id == head SHA check below.
+  # Draft PRs get no bot verdict, so no CI runs until the PR is marked ready.
+  # Merge protection pairs this gate with the bot's own `bot-review` commit
+  # status on the head SHA (success = approved, failure = changes requested).
+  # Merge-tree note: review runs test the head tree, not the merge ref. That
+  # is safe only paired with branch protection "require up to date" (an
+  # up-to-date merge == the head tree) plus the main-push same-tree check,
+  # which runs full CI whenever a merge produces a tree no green PR run
+  # tested.
+  pull_request_review:
+    types: [submitted]
+  # Maintainer-only manual override (no bot verdict needed): run it from the
+  # PR branch and record why. Ordinary contributors cannot bypass the gate
+  # with this; misuse is visible in the run history.
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Override reason (maintainers only)"
+        required: true
+        type: string
+permissions:
+  contents: read
+  pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A review must never cancel the run it gates.
+  cancel-in-progress: false
 jobs:
+  bot-gate:
+    # Enforcing: `check` runs on a PR head only when this job reports
+    # verdict=permit with sha_match=true. Anything else (no verdict yet,
+    # REQUEST_CHANGES, DISMISSED, a verdict on an older SHA) skips `check`,
+    # so the gate fails closed. Always exits 0: denial is expressed through
+    # the outputs, and the bot's own `bot-review` commit status blocks merge.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request_review'
+    outputs:
+      verdict: ${{ steps.gate.outputs.verdict }}
+      sha_match: ${{ steps.gate.outputs.sha_match }}
+    steps:
+      - name: Evaluate blockfield-review-bot verdict for the PR head SHA
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_STATE: ${{ github.event.review.state || '' }}
+          REVIEW_LOGIN: ${{ github.event.review.user.login || '' }}
+          REVIEW_SHA: ${{ github.event.review.commit_id || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          bot='blockfield-review-bot[bot]'
+          repo="${{ github.repository }}"
+          state="$REVIEW_STATE"
+          # Prefer the just-submitted review when it is the bot's verdict on
+          # the current head SHA; otherwise look the bot's latest verdict for
+          # this SHA up via the API (a newer push re-requires a new verdict).
+          # (The head SHA is spliced into the jq filter; gh --jq takes no
+          # variable arguments.)
+          bot_on_sha=false
+          if [ "$REVIEW_LOGIN" = "$bot" ] && [ "$REVIEW_SHA" = "$HEAD_SHA" ]; then
+            bot_on_sha=true
+          else
+            # Aggregate all pages before picking the latest verdict: gh applies
+            # --jq per page, so >100 reviews would otherwise yield several
+            # states joined by newlines and match nothing (fail-closed, but
+            # a stuck gate). COMMENTED reviews carry no verdict and are
+            # excluded, so a later comment cannot override an earlier verdict.
+            # jq is preinstalled on the runner image.
+            state=$(gh api "repos/$repo/pulls/$PR_NUMBER/reviews" --paginate \
+              --jq '[.[] | select(.user.login == "'"$bot"'" and .commit_id == "'"$HEAD_SHA"'")]' \
+              | jq -r -s '[add[] | select(.state != "COMMENTED")] | sort_by(.id) | last | .state // empty')
+            if [ -n "$state" ]; then bot_on_sha=true; fi
+          fi
+          # Webhook states arrive lowercase ("approved"), the API returns
+          # uppercase ("APPROVED"): normalize before matching.
+          state=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
+          verdict=deny-awaiting
+          sha_match=false
+          if [ "$bot_on_sha" = true ]; then
+            sha_match=true
+            case "$state" in
+              APPROVED) verdict=permit ;;
+              CHANGES_REQUESTED) verdict=deny ;;
+              # DISMISSED / COMMENTED / empty stay deny-awaiting (fail-closed).
+            esac
+          fi
+          echo "head=${HEAD_SHA:0:12} bot_state=${state:-none} verdict=$verdict sha_match=$sha_match"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "sha_match=$sha_match" >> "$GITHUB_OUTPUT"
   test:
+    # Main pushes and maintainer dispatches always run; PR heads run only
+    # on a gate permit for the exact head SHA.
+    needs: [bot-gate]
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (needs.bot-gate.outputs.verdict == 'permit' && needs.bot-gate.outputs.sha_match == 'true'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
