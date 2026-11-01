@@ -1742,7 +1742,9 @@ async def test_c5_bootstrap_revokes_pre_existing_sessions(store, postgres):
         }
         stale = await provision(admin, spec)
         async with await psycopg.AsyncConnection.connect(
-            admin, row_factory=psycopg.rows.dict_row
+            admin,
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
         ) as conn:
             assert (await authenticate(conn, stale)).owner is False
             await bootstrap(admin, account, "owner", store["credential"])
@@ -1750,7 +1752,9 @@ async def test_c5_bootstrap_revokes_pre_existing_sessions(store, postgres):
                 await authenticate(conn, stale)
         fresh = await provision(admin, spec)
         async with await psycopg.AsyncConnection.connect(
-            admin, row_factory=psycopg.rows.dict_row
+            admin,
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
         ) as conn:
             assert (await authenticate(conn, fresh)).owner is True
     finally:
