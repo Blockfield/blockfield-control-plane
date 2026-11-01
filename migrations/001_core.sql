@@ -95,7 +95,9 @@ CREATE TABLE audit_events(
  attempt_id uuid NOT NULL, operation_id uuid REFERENCES operations, parent_id uuid,
  actor uuid REFERENCES accounts, credential_id uuid REFERENCES credentials,
  client_id text REFERENCES clients, via text NOT NULL, request_id uuid NOT NULL,
- action text NOT NULL, target text NOT NULL, outcome text NOT NULL,
+ action text NOT NULL, target text NOT NULL,
+ environment text NOT NULL DEFAULT '*', backend text NOT NULL DEFAULT '*', resource text NOT NULL DEFAULT '*',
+ outcome text NOT NULL,
  policy_version integer NOT NULL DEFAULT 2, detail jsonb NOT NULL DEFAULT '{}',
  occurred_at timestamptz NOT NULL DEFAULT clock_timestamp(), recorded_at timestamptz NOT NULL DEFAULT now()
 );

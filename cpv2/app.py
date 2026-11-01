@@ -358,6 +358,7 @@ def create_app(dsn=None):
                 conn, namespace, environment, backend, target
             )
             return {
+                "initialized": value["initialized"],
                 "revision": value["revision"],
                 "value": value["value"],
                 "hash": value["value_hash"],
@@ -475,18 +476,34 @@ def create_app(dsn=None):
             if i.allows("audit.full", environment, backend, target):
                 result = await rows(
                     conn,
-                    "SELECT * FROM audit_events WHERE sequence>%s ORDER BY sequence LIMIT 100",
-                    (after,),
+                    "SELECT * FROM audit_events WHERE sequence>%s AND (%s='*' OR environment=%s) AND (%s='*' OR backend=%s) AND (%s='*' OR resource=%s) ORDER BY sequence LIMIT 100",
+                    (after, environment, environment, backend, backend, target, target),
                 )
             else:
                 # Non-owner audit is restricted to this actor; query parameters cannot widen it.
                 result = await rows(
                     conn,
-                    "SELECT a.sequence,a.attempt_id,a.operation_id,a.action,a.target,a.outcome,a.recorded_at FROM audit_events a JOIN operations o ON o.id=a.operation_id WHERE a.sequence>%s AND a.actor=%s AND o.environment=%s AND o.backend=%s AND (%s='*' OR o.resource=%s) ORDER BY a.sequence LIMIT 100",
-                    (after, i.actor, environment, backend, target, target),
+                    "SELECT sequence,attempt_id,operation_id,action,target,outcome,recorded_at FROM audit_events WHERE sequence>%s AND actor=%s AND (%s='*' OR environment=%s) AND (%s='*' OR backend=%s) AND (%s='*' OR resource=%s) ORDER BY sequence LIMIT 100",
+                    (
+                        after,
+                        i.actor,
+                        environment,
+                        environment,
+                        backend,
+                        backend,
+                        target,
+                        target,
+                    ),
                 )
             await audit(
-                conn, uuid4(), i, "audit.read", target, "allowed", {"after": after}
+                conn,
+                uuid4(),
+                i,
+                "audit.read",
+                target,
+                "allowed",
+                {"after": after},
+                scope=(environment, backend, target),
             )
             return result
 
@@ -500,17 +517,13 @@ def create_app(dsn=None):
             raise Problem("forbidden")
         async with database.transaction() as conn:
             setting = await core.current_settings(conn, "gate", "prod", "game", "*")
-            if setting["revision"]:
-                value = {
-                    "revision": setting["revision"],
-                    **setting["value"],
-                    "since": int(setting["state_since"].timestamp() * 1000),
-                }
-            else:
-                imported = await one(conn, "SELECT value FROM legacy_gate")
-                if not imported:
-                    raise Problem("gate_not_initialized", 503)
-                value = imported["value"]
+            if not setting["initialized"]:
+                raise Problem("gate_not_initialized", 503)
+            value = {
+                "revision": setting["revision"],
+                **setting["value"],
+                "since": int(setting["state_since"].timestamp() * 1000),
+            }
             return {"schema": 1, **value, "observedAt": int(time.time() * 1000)}
 
     @app.get("/v2/events")

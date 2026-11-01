@@ -36,7 +36,7 @@ async def event(conn, op, state, detail=None):
     )
     await record(
         conn,
-        "INSERT INTO audit_events(attempt_id,operation_id,actor,credential_id,client_id,via,request_id,action,target,outcome,detail) SELECT id,id,account_id,credential_id,client_id,via,id,kind,target,%s,%s FROM operations WHERE id=%s",
+        "INSERT INTO audit_events(attempt_id,operation_id,actor,credential_id,client_id,via,request_id,action,target,environment,backend,resource,outcome,detail) SELECT id,id,account_id,credential_id,client_id,via,id,kind,target,environment,backend,resource,%s,%s FROM operations WHERE id=%s",
         (state, Jsonb(detail or {}), op),
     )
     await conn.execute("SELECT pg_notify('cp_events','')")
@@ -118,12 +118,13 @@ async def current_settings(conn, namespace, environment, backend, target):
         (namespace, environment, backend, target),
     )
     if record:
-        return record
+        return {**record, "initialized": True}
     if namespace == "gate" and (environment, backend, target) == ("prod", "game", "*"):
         legacy = await one(conn, "SELECT value FROM legacy_gate")
         if legacy:
             value = {k: legacy["value"][k] for k in ("mode", "message")}
             return {
+                "initialized": True,
                 "revision": legacy["value"]["revision"],
                 "value": value,
                 "value_hash": digest(value),
@@ -132,6 +133,7 @@ async def current_settings(conn, namespace, environment, backend, target):
                 ),
             }
     return {
+        "initialized": False,
         "revision": 0,
         "value": definition.model().model_dump(),
         "value_hash": digest(definition.model().model_dump()),
@@ -544,7 +546,7 @@ async def delegate(conn, identity, attempt, model):
 
 
 async def read_operation(conn, identity, op_id):
-    op = await one(conn, "SELECT * FROM operations WHERE id=%s", (op_id,))
+    op = await one(conn, "SELECT * FROM operations WHERE id=%s FOR UPDATE", (op_id,))
     if not op:
         raise Problem("operation_not_found", 404)
     identity.require(

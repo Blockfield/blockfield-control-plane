@@ -162,8 +162,26 @@ async def authenticate(conn, token, *, lock_credential=True):
 
 
 async def audit(
-    conn, attempt, identity, action, target, outcome, detail=None, operation=None
+    conn,
+    attempt,
+    identity,
+    action,
+    target,
+    outcome,
+    detail=None,
+    operation=None,
+    *,
+    scope=None,
 ):
+    if scope is None:
+        scope = (
+            tuple(
+                identity.credential[key]
+                for key in ("environment", "backend", "resource")
+            )
+            if identity
+            else ("*", "*", "*")
+        )
     # Lock foreign-key subjects before the commit-order history lock.
     if identity:
         if identity.actor:
@@ -175,12 +193,17 @@ async def audit(
             (identity.credential["id"],),
         )
     if operation:
-        await conn.execute(
-            "SELECT id FROM operations WHERE id=%s FOR KEY SHARE", (operation,)
+        operation_scope = await one(
+            conn,
+            "SELECT environment,backend,resource FROM operations WHERE id=%s FOR KEY SHARE",
+            (operation,),
+        )
+        scope = tuple(
+            operation_scope[key] for key in ("environment", "backend", "resource")
         )
     await record(
         conn,
-        "INSERT INTO audit_events(attempt_id,operation_id,actor,credential_id,client_id,via,request_id,action,target,outcome,detail) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "INSERT INTO audit_events(attempt_id,operation_id,actor,credential_id,client_id,via,request_id,action,target,environment,backend,resource,outcome,detail) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
             attempt,
             operation,
@@ -191,6 +214,7 @@ async def audit(
             attempt,
             action,
             target[:256],
+            *scope,
             outcome,
             Jsonb(detail or {}),
         ),

@@ -112,6 +112,7 @@ class OperationReceipt(Strict):
 
 
 class SettingsView(Strict):
+    initialized: bool
     revision: int
     value: dict
     hash: str

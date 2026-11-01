@@ -8,6 +8,7 @@ import sqlite3
 import struct
 import subprocess
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -32,10 +33,11 @@ from cpv2.auth import (
     Problem,
     authenticate,
     now,
+    verifier,
 )
 from cpv2.db import migrate, one
 from cpv2.legacy import import_u1
-from cpv2.settings import canonical
+from cpv2.settings import canonical, digest
 
 
 @pytest.fixture(scope="session")
@@ -1323,3 +1325,310 @@ async def test_client_ceiling_and_expired_grants_recheck_queued_authority(store)
         (store["accounts"]["admin"],),
     )
     assert (await request(store, "GET", "/v2/me")).json()["grants"] == []
+
+
+async def test_c3_terminal_receipt_never_skips_a_missing_sequence(store):
+    for key in ("cursor-one", "cursor-two", "cursor-three"):
+        await queued(store, key)
+    frames = await envelopes(store)
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(frames[0]), "game-agent"
+        )
+    ).status_code == 200
+    # Reconcile persisted receipts conservatively even if a restored cursor trails them.
+    await sql(
+        store,
+        "INSERT INTO consumer_acks(consumer_id,sequence,state,receipt_hash,result,actual_at) SELECT consumer_id,sequence,'received',repeat('0',64),'{}',now() FROM outbox WHERE consumer_id='game' AND sequence=3",
+    )
+    response = await request(
+        store,
+        "POST",
+        "/v2/agents/game/acks",
+        ack_body(frames[2], "rejected"),
+        "game-agent",
+    )
+    assert response.status_code == 200, response.text
+    cursor = (
+        await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'")
+    )[0]["received_cursor"]
+    assert cursor == 1, (
+        "a terminal receipt above a hole must not move the reconnect cursor"
+    )
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(frames[1]), "game-agent"
+        )
+    ).status_code == 200
+    cursor = (
+        await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'")
+    )[0]["received_cursor"]
+    assert cursor == 3
+
+
+@pytest.mark.parametrize("policy_change", ["revocation", "deadline", "new_revision"])
+async def test_c3_factual_effect_receipts_survive_later_policy_changes(
+    store, monkeypatch, policy_change
+):
+    await sql(store, "UPDATE consumers SET capabilities='{}' WHERE id='workshop'")
+    accepted = await request(store, "PATCH", "/v2/settings/gameplay/arena", patch())
+    assert accepted.status_code == 202
+    frame = (await envelopes(store))[0]
+    for state in ("received", "validated"):
+        response = await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(frame, state), "game-agent"
+        )
+        assert response.status_code == 200, response.text
+    effect_at = now()
+    if policy_change == "revocation":
+        await sql(
+            store,
+            "UPDATE credentials SET revoked_at=now() WHERE account_id=%s",
+            (store["accounts"]["admin"],),
+        )
+    elif policy_change == "deadline":
+        await sql(
+            store,
+            "UPDATE operations SET deadline=%s WHERE id=%s",
+            (effect_at + timedelta(seconds=1), UUID(accepted.json()["operationId"])),
+        )
+        monkeypatch.setattr(delivery, "now", lambda: effect_at + timedelta(seconds=2))
+    else:
+        newer = await request(
+            store,
+            "PATCH",
+            "/v2/settings/gameplay/arena",
+            patch("newer", 1, {"match": {"maxPlayers": 64}}),
+        )
+        assert newer.status_code == 202
+    for state in ("applied", "effective"):
+        body = ack_body(frame, state) | {"actualAt": effect_at.isoformat()}
+        response = await request(
+            store, "POST", "/v2/agents/game/acks", body, "game-agent"
+        )
+        assert response.status_code == 200, response.text
+    operation = (
+        await sql(
+            store,
+            "SELECT status FROM operations WHERE id=%s",
+            (UUID(accepted.json()["operationId"]),),
+        )
+    )[0]
+    assert operation["status"] == "effective"
+    assert [
+        a["state"]
+        for a in await sql(
+            store,
+            "SELECT state FROM consumer_acks WHERE consumer_id='game' AND sequence=1 ORDER BY recorded_at",
+        )
+    ] == list(delivery.STATES)
+
+
+@pytest.mark.parametrize("revision", [0, 1])
+async def test_c3_imported_gate_is_in_the_consumer_snapshot(store, tmp_path, revision):
+    path = tmp_path / "imported-gate.sqlite"
+    legacy = api.Store(str(path))
+    if revision:
+        legacy.set_gate(
+            "maintenance", "imported gate", "legacy-admin", "admin", 0, "legacy-change"
+        )
+    expected = legacy.gate()
+    legacy.db.close()
+    await import_u1(store["admin"], path)
+    response = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert response.status_code == 200
+    gates = [
+        value for value in response.json()["settings"] if value["namespace"] == "gate"
+    ]
+    assert gates == [
+        {
+            "namespace": "gate",
+            "target": "*",
+            "revision": revision,
+            "value": {key: expected[key] for key in ("mode", "message")},
+            "value_hash": digest({key: expected[key] for key in ("mode", "message")}),
+        }
+    ]
+    assert (
+        await request(store, "GET", "/v2/agents/workshop/snapshot", role="game-agent")
+    ).status_code == 403
+
+
+async def test_c3_gate_initialization_is_explicit_at_imported_revision_zero(
+    store, tmp_path
+):
+    view = await request(store, "GET", "/v2/settings/gate/*")
+    assert view.json()["initialized"] is False
+    assert (
+        await request(store, "GET", "/v1/gate", role="game-agent")
+    ).status_code == 503
+    path = tmp_path / "revision-zero.sqlite"
+    legacy = api.Store(str(path))
+    legacy.db.execute("UPDATE gate_state SET mode='maintenance'")
+    legacy.db.commit()
+    legacy.db.close()
+    await import_u1(store["admin"], path)
+    view = await request(store, "GET", "/v2/settings/gate/*")
+    assert view.json()["initialized"] is True and view.json()["revision"] == 0
+    compat = await request(store, "GET", "/v1/gate", role="game-agent")
+    assert compat.status_code == 200 and compat.json()["mode"] == "maintenance"
+    first = await request(
+        store, "PATCH", "/v2/settings/gate/*", patch("first-v2", 0, {"mode": "open"})
+    )
+    assert first.status_code == 202 and first.json()["revision"] == 1
+    compat = await request(store, "GET", "/v1/gate", role="game-agent")
+    assert (
+        compat.status_code == 200
+        and compat.json()["revision"] == 1
+        and compat.json()["mode"] == "open"
+    )
+
+
+@pytest.mark.parametrize("credential_scope", ["*", "arena"])
+async def test_c3_owner_audit_respects_requested_and_credential_scope(
+    store, credential_scope
+):
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("allowed"), "owner"
+    )
+    assert accepted.status_code == 202
+    unrelated = await request(
+        store, "PATCH", "/v2/settings/gameplay/other", patch("other"), "owner"
+    )
+    assert unrelated.status_code == 202
+    for environment, backend in (("qa", "game"), ("prod", "workshop")):
+        role = environment + "-" + backend
+        store["tokens"][role] = await provision(
+            store["admin"],
+            {
+                "accountId": str(store["accounts"]["owner"]),
+                "displayName": "owner",
+                "client": {
+                    "id": "owner",
+                    "via": "ui",
+                    "human": True,
+                    "ceiling": sorted(OWNER_SCOPES),
+                },
+                "ceiling": sorted(OWNER_SCOPES),
+                "environment": environment,
+                "backend": backend,
+                "resource": "*",
+            },
+        )
+        result = await request(
+            store,
+            "PATCH",
+            "/v2/settings/gameplay/arena",
+            patch(role) | {"environment": environment, "backend": backend},
+            role,
+        )
+        assert result.status_code == 202
+    await sql(
+        store,
+        "UPDATE credentials SET resource=%s WHERE verifier=%s",
+        (credential_scope, verifier(store["tokens"]["owner"])),
+    )
+    response = await request(
+        store,
+        "GET",
+        "/v2/audit?environment=prod&backend=game&target=arena",
+        role="owner",
+    )
+    assert response.status_code == 200
+    ids = {row["operation_id"] for row in response.json() if row["operation_id"]}
+    assert ids == {accepted.json()["operationId"]}, (
+        "owner role must not bypass resource/environment/backend filters"
+    )
+    assert all(
+        (row["environment"], row["backend"], row["resource"])
+        == ("prod", "game", "arena")
+        for row in response.json()
+    )
+    assert (
+        await request(
+            store, "GET", "/v2/audit?environment=*&backend=*&target=*", role="owner"
+        )
+    ).status_code == 403
+    if credential_scope == "*":
+        await sql(
+            store,
+            "UPDATE credentials SET environment='*',backend='*' WHERE verifier=%s",
+            (verifier(store["tokens"]["owner"]),),
+        )
+        assert (
+            await store["client"].patch(
+                "/v2/settings/gameplay/arena", json=patch("unauthenticated")
+            )
+        ).status_code == 401
+        full = await request(
+            store, "GET", "/v2/audit?environment=*&backend=*&target=*", role="owner"
+        )
+        assert full.status_code == 200
+        assert any(row["action"] == "owner.bootstrap" for row in full.json())
+        assert any(
+            row["actor"] is None and row["outcome"] == "denied" for row in full.json()
+        )
+
+
+async def test_c3_expiry_read_locks_the_operation_before_deciding(store, monkeypatch):
+    op = await queued(store)
+    frame = (await envelopes(store))[0]
+    for state in ("received", "validated"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frame, state),
+                "game-agent",
+            )
+        ).status_code == 200
+    future = now() + timedelta(seconds=120)
+    monkeypatch.setattr(core, "now", lambda: future)
+    selected, release = asyncio.Event(), asyncio.Event()
+    original, paused = core.one, False
+
+    async def pause_after_read(conn, query, args=()):
+        nonlocal paused
+        row = await original(conn, query, args)
+        if query.startswith("SELECT * FROM operations WHERE id=") and not paused:
+            paused = True
+            selected.set()
+            await asyncio.wait_for(release.wait(), 5)
+        return row
+
+    monkeypatch.setattr(core, "one", pause_after_read)
+    reader = asyncio.create_task(
+        request(store, "GET", "/v2/operations/" + op["operationId"], role="moderator")
+    )
+    try:
+        await asyncio.wait_for(selected.wait(), 5)
+        blocked = False
+        try:
+            await sql(
+                store,
+                "SELECT id FROM operations WHERE id=%s FOR UPDATE NOWAIT",
+                (UUID(op["operationId"]),),
+            )
+        except psycopg.errors.LockNotAvailable:
+            blocked = True
+        assert blocked, (
+            "a final ACK must not be able to update a row already read for expiry"
+        )
+    finally:
+        release.set()
+        await asyncio.wait_for(reader, 5)
+    for state in ("applied", "effective"):
+        response = await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(frame, state), "game-agent"
+        )
+        assert response.status_code == 200, response.text
+    assert (
+        await sql(
+            store,
+            "SELECT status FROM operations WHERE id=%s",
+            (UUID(op["operationId"]),),
+        )
+    )[0]["status"] == "effective"

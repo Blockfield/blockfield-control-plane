@@ -8,7 +8,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from cpv2.auth import Identity, Problem, audit, now
-from cpv2.core import event
+from cpv2.core import current_settings, event
 from cpv2.db import one, rows
 from cpv2.settings import canonical, digest
 
@@ -268,9 +268,10 @@ async def acknowledge(conn, identity, attempt, cid, model):
             raise Problem("receipt_order", 409)
         if model.state == "received" and model.sequence != c["received_cursor"] + 1:
             raise Problem("receipt_gap", 409)
-        if await valid_operation(conn, op):
+        # Applied/effective ACKs attest past effects, even if policy changed since validation.
+        if model.state in ("received", "validated") and await valid_operation(conn, op):
             raise Problem("operation_no_longer_authorized", 409)
-        if record["revision"]:
+        if model.state in ("received", "validated") and record["revision"]:
             payload = record["payload"]
             head = await one(
                 conn,
@@ -301,9 +302,20 @@ async def acknowledge(conn, identity, attempt, cid, model):
         ),
     )
     if model.state in ("received", "rejected", "unknown"):
+        # A factual receipt above a hole must not authorize skipping that hole on reconnect.
+        missing = await one(
+            conn,
+            "SELECT min(o.sequence) AS sequence FROM outbox o WHERE o.consumer_id=%s AND o.sequence>%s AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('received','rejected','unknown'))",
+            (cid, c["received_cursor"]),
+        )
+        cursor = (
+            missing["sequence"] - 1
+            if missing["sequence"] is not None
+            else c["next_sequence"] - 1
+        )
         await conn.execute(
-            "UPDATE consumers SET received_cursor=GREATEST(received_cursor,%s),last_heartbeat=now() WHERE id=%s",
-            (model.sequence, cid),
+            "UPDATE consumers SET received_cursor=%s,last_heartbeat=now() WHERE id=%s",
+            (cursor, cid),
         )
     targets = await rows(
         conn,
@@ -351,6 +363,21 @@ async def snapshot(conn, identity, cid):
             "SELECT r.target,r.revision,r.value,r.value_hash FROM settings_heads h JOIN settings_revisions r USING(namespace,environment,backend,target,revision) WHERE namespace=%s AND environment=%s AND backend=%s AND (%s='*' OR target=%s)",
             (namespace, c["environment"], c["backend"], c["resource"], c["resource"]),
         )
+        if (
+            namespace == "gate"
+            and (c["environment"], c["backend"], c["resource"]) == ("prod", "game", "*")
+            and not any(r["target"] == "*" for r in settings)
+        ):
+            gate = await current_settings(conn, "gate", "prod", "game", "*")
+            if gate["initialized"]:
+                settings.append(
+                    {
+                        "target": "*",
+                        "revision": gate["revision"],
+                        "value": gate["value"],
+                        "value_hash": gate["value_hash"],
+                    }
+                )
         result.extend({"namespace": namespace, **r} for r in settings)
     # A snapshot bootstraps desired state only; it never advances receipt ACKs.
     return {
