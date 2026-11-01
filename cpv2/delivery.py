@@ -13,7 +13,7 @@ from cpv2.db import one, rows
 from cpv2.settings import canonical, digest
 
 STATES = ("received", "validated", "applied", "effective")
-TERMINAL = {"rejected", "unknown", "effective"}
+TERMINAL = {"rejected", "unknown", "effective", "expired"}
 
 
 class Wakeups:

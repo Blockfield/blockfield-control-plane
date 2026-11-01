@@ -1632,3 +1632,61 @@ async def test_c3_expiry_read_locks_the_operation_before_deciding(store, monkeyp
             (UUID(op["operationId"]),),
         )
     )[0]["status"] == "effective"
+
+
+async def test_c4_garbage_bearer_flood_cannot_starve_authenticated_traffic(store):
+    assert (await request(store, "GET", "/v2/me")).status_code == 200
+    for i in range(1000):
+        await store["client"].get(
+            "/v2/me", headers={"Authorization": f"Bearer garbage-{i}"}
+        )
+    assert (await request(store, "GET", "/v2/me")).status_code == 200, (
+        "distinct unauthenticated bearer strings must not burn the shared budget"
+    )
+    assert (await store["client"].get("/health")).status_code == 200
+
+
+async def test_c4_completed_audit_failure_cannot_strand_a_delegation_token(
+    store, monkeypatch
+):
+    import cpv2.app
+
+    real_audit = cpv2.app.audit
+
+    async def fail_completed(*args, **kwargs):
+        if (args[5] if len(args) > 5 else kwargs.get("outcome")) == "completed":
+            raise psycopg.OperationalError("synthetic post-commit audit outage")
+        return await real_audit(*args, **kwargs)
+
+    monkeypatch.setattr(cpv2.app, "audit", fail_completed)
+    body = {
+        "idempotencyKey": "stranded",
+        "scopes": ["settings.read"],
+        "resource": "arena",
+    }
+    assert (await request(store, "POST", "/v2/delegations", body)).status_code == 503
+    assert not await sql(store, "SELECT * FROM credentials WHERE kind='delegation'"), (
+        "a failed completion audit must roll the delegation back, not strand it"
+    )
+    assert not await sql(
+        store, "SELECT * FROM operations WHERE kind='delegations.create'"
+    )
+    monkeypatch.undo()
+    retry = await request(store, "POST", "/v2/delegations", body)
+    assert retry.status_code == 201, retry.text
+    assert retry.json()["token"], "the retry must deliver a usable one-time token"
+
+
+async def test_c4_expired_operation_emits_one_settlement(store, monkeypatch):
+    op = await queued(store)
+    monkeypatch.setattr(delivery, "now", lambda: now() + timedelta(seconds=61))
+    first = await envelopes(store)
+    assert first[0]["reason"] == "expired" and first[0]["executable"] is False
+    second = await envelopes(store)
+    assert second[0]["reason"] == "expired"
+    events = await sql(
+        store,
+        "SELECT status FROM operation_events WHERE operation_id=%s ORDER BY sequence",
+        (UUID(op["operationId"]),),
+    )
+    assert [event["status"] for event in events] == ["accepted", "expired"]

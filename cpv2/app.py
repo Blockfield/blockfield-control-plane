@@ -18,9 +18,10 @@ from cpv2.settings import DEFINITIONS, digest
 
 
 class Limits:
-    def __init__(self):
+    def __init__(self, budget=1000):
         self.buckets = OrderedDict()
         self.window, self.total = 0, 0
+        self.budget = budget
 
     def check(self, key, *, global_count=True, limit=120):
         window = int(time.monotonic() // 60)
@@ -29,7 +30,7 @@ class Limits:
             self.buckets.clear()
         count = self.buckets.get(key, 0)
         if (
-            self.total >= 1000
+            self.total >= self.budget
             or count >= limit
             or (key not in self.buckets and len(self.buckets) >= 4096)
         ):
@@ -106,6 +107,10 @@ def create_app(dsn=None):
     )
     app.state.db, app.state.wakeups = database, wakeups
     limiter = Limits()
+    # Never-authenticated traffic draws from a separate small budget, so garbage
+    # bearer strings cannot burn the shared budget that health checks and
+    # authenticated agents rely on.
+    unauth_limiter = Limits(budget=100)
 
     @app.exception_handler(Problem)
     async def problem_handler(request, error):
@@ -133,12 +138,15 @@ def create_app(dsn=None):
             else ""
         )
         request.state.attempt = attempt
+        key = (
+            verifier(token)
+            if token
+            else (request.client.host if request.client else "unknown")
+        )
         try:
-            limiter.check(
-                verifier(token)
-                if token
-                else (request.client.host if request.client else "unknown")
-            )
+            # Per-key bound only: pre-auth traffic must not burn the shared
+            # budget, which counts authenticated requests below.
+            limiter.check(key, global_count=False)
             if not public:
                 try:
                     async with database.transaction() as conn:
@@ -153,8 +161,10 @@ def create_app(dsn=None):
                                 (verifier(token),),
                             )
                         if not legacy:
+                            unauth_limiter.check(key)
                             raise
                     else:
+                        unauth_limiter.check(key)
                         if mutation:
                             async with database.transaction() as conn:
                                 await audit(
@@ -169,8 +179,9 @@ def create_app(dsn=None):
             if identity:
                 if identity.actor:
                     limiter.check(("actor", str(identity.actor)), global_count=False)
+                # The shared budget counts authenticated requests only.
                 limiter.check(
-                    ("client", identity.client["id"]), global_count=False, limit=600
+                    ("client", identity.client["id"]), global_count=True, limit=600
                 )
                 limiter.check(
                     (
@@ -221,7 +232,11 @@ def create_app(dsn=None):
                         "denied" if response.status_code in (401, 403) else "invalid",
                         {"httpStatus": response.status_code},
                     )
-            if mutation and response.status_code < 400:
+            if (
+                mutation
+                and response.status_code < 400
+                and not getattr(request.state, "completed_audited", False)
+            ):
                 async with database.transaction() as conn:
                     await audit(
                         conn,
@@ -264,6 +279,20 @@ def create_app(dsn=None):
             request.state.operation = (
                 UUID(result["operationId"]) if "operationId" in result else None
             )
+            # The completion audit commits atomically with the mutation: a
+            # post-commit audit failure rolls the mutation back instead of
+            # discarding a one-time response such as a delegation token.
+            await audit(
+                conn,
+                request.state.attempt,
+                identity,
+                request.method,
+                request.url.path,
+                "completed",
+                None,
+                request.state.operation,
+            )
+            request.state.completed_audited = True
             return result
 
     def assertion(request):
