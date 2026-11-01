@@ -64,6 +64,19 @@ def bound(grant, environment, backend, resource):
     )
 
 
+def is_owner_session(client, credential, membership):
+    # Single owner-eligibility predicate for both the login path
+    # (authenticate) and the queued-delivery path (valid_operation): owner
+    # authority needs a human session on an interactive/recovery client.
+    return bool(
+        membership
+        and credential["kind"] == "session"
+        and not credential["parent_id"]
+        and client["human"]
+        and client["via"] in ("ui", "cli", "recovery")
+    )
+
+
 @dataclass
 class Identity:
     credential: dict
@@ -151,13 +164,7 @@ async def authenticate(conn, token, *, lock_credential=True):
             "SELECT 1 FROM owner_memberships WHERE account_id=%s",
             (account["id"],),
         )
-        owner = bool(
-            membership
-            and c["kind"] == "session"
-            and not c["parent_id"]
-            and client["human"]
-            and client["via"] in ("ui", "cli", "recovery")
-        )
+        owner = is_owner_session(client, c, membership)
     return Identity(c, client, account, grants, owner)
 
 
@@ -292,6 +299,8 @@ async def challenge(conn, identity, method, path, body):
         "SELECT id,rp_id FROM owner_credentials WHERE account_id=%s",
         (identity.actor,),
     )
+    if not credentials:
+        raise Problem("owner_approval_required")
     return {
         "challengeId": str(cid),
         "challenge": bytes_to_base64url(nonce),

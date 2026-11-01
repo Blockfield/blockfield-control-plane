@@ -7,7 +7,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.types.json import Jsonb
 
-from cpv2.auth import Identity, Problem, audit, now
+from cpv2.auth import Identity, Problem, audit, is_owner_session, now
 from cpv2.core import current_settings, event
 from cpv2.db import one, rows
 from cpv2.settings import canonical, digest
@@ -114,15 +114,14 @@ async def valid_operation(conn, op):
         "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
         (account["id"], now()),
     )
-    owner = bool(
-        c["kind"] == "session"
-        and client["human"]
-        and not c["parent_id"]
-        and await one(
+    owner = is_owner_session(
+        client,
+        c,
+        await one(
             conn,
             "SELECT 1 FROM owner_memberships WHERE account_id=%s",
             (account["id"],),
-        )
+        ),
     )
     identity = Identity(c, client, account, grants, owner)
     if not identity.allows(
@@ -174,8 +173,8 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
     for record in records:
         op = by_id[record["operation_id"]]
         reason = await valid_operation(conn, op)
-        stale_generation = record["generation"] != c["generation"]
-        if stale_generation:
+        stale = record["generation"] != c["generation"] or record["epoch"] != c["epoch"]
+        if stale:
             reason = "rejected"
         if record["revision"]:
             payload = record["payload"]
@@ -193,13 +192,13 @@ async def batch(conn, identity, cid, epoch, cursor, *, live=False):
                 # Authorization/expiry verdicts are terminal: a newer revision
                 # must not whitewash a revoked or expired issuer.
                 reason = "superseded"
-        # A stale generation is this consumer's verdict only: it must not move
+        # A stale generation/epoch is this consumer's verdict only: it must not move
         # the shared operation status while sibling consumers still execute it.
         # Nor may it demote an effect a sibling already recorded: op status
         # derives from all per-consumer receipts, never from one late verdict.
         if (
             reason in ("expired", "rejected")
-            and not stale_generation
+            and not stale
             and op["status"] not in TERMINAL
         ):
             effected = await one(

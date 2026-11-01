@@ -3082,3 +3082,119 @@ async def test_c12_randomized_delivery_walk_preserves_invariants(store):
     assert acked["received"] >= 1 and acked["applied"] >= 1
     assert acked["rejected"] + acked["unknown"] >= 1
     assert denied >= 1
+
+
+async def test_c13_epoch_only_rotation_fences_frames(store):
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gameplay/arena", patch("epoch-fence")
+    )
+    assert accepted.status_code == 202, accepted.text
+    operation_id = accepted.json()["operationId"]
+    assert (await envelopes(store))[0]["executable"] is True
+    await sql(store, "UPDATE consumers SET epoch=%s WHERE id='game'", (uuid4(),))
+    stale = (await envelopes(store))[0]
+    assert stale["operationId"] == operation_id
+    assert stale["reason"] == "rejected" and stale["executable"] is False
+    assert stale["payload"] is None
+    status = (
+        await sql(
+            store,
+            "SELECT status FROM operations WHERE id=%s",
+            (UUID(operation_id),),
+        )
+    )[0]["status"]
+    assert status == "accepted", "a stale epoch must not reject the shared operation"
+    workshop = (await envelopes(store, cid="workshop"))[0]
+    assert workshop["executable"] is True and workshop["reason"] is None
+
+
+async def test_c13_queued_owner_requires_interactive_via(store):
+    token = await provision(
+        store["admin"],
+        {
+            "accountId": str(store["accounts"]["owner"]),
+            "displayName": "owner",
+            "client": {
+                "id": "owner-discord",
+                "via": "discord",
+                "human": True,
+                "ceiling": sorted(OWNER_SCOPES),
+            },
+            "ceiling": sorted(OWNER_SCOPES),
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "grants": [
+                {
+                    "role": "admin",
+                    "environment": "prod",
+                    "backend": "game",
+                    "resource": "*",
+                    "grantor": str(store["accounts"]["admin"]),
+                }
+            ],
+        },
+    )
+    store["tokens"]["owner-discord"] = token
+    async with store["app"].state.db.transaction() as conn:
+        assert (await authenticate(conn, token)).owner is False
+    accepted = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/arena",
+        patch("discord-owner"),
+        "owner-discord",
+    )
+    assert accepted.status_code == 202, accepted.text
+    await sql(
+        store,
+        "UPDATE role_grants SET expires_at=now()-interval '1 second' WHERE account_id=%s",
+        (store["accounts"]["owner"],),
+    )
+    frame = (await envelopes(store))[0]
+    assert frame["operationId"] == accepted.json()["operationId"]
+    assert frame["reason"] == "rejected" and frame["executable"] is False
+
+
+async def test_c13_owner_challenge_without_credentials_is_4xx(store):
+    await sql(store, "DELETE FROM owner_credentials")
+    response = await request(
+        store,
+        "POST",
+        "/v2/owner/challenges",
+        {
+            "method": "PATCH",
+            "path": "/v2/settings/gameplay/arena",
+            "body": patch("no-credential"),
+        },
+        "owner",
+    )
+    assert 400 <= response.status_code < 500, (response.status_code, response.text)
+    assert response.status_code != 429
+    assert response.json()["error"] == "owner_approval_required"
+
+
+async def test_c13_surrogate_dict_key_is_invalid_without_side_effects(store):
+    async def counts():
+        ops = await sql(store, "SELECT count(*) AS n FROM operations")
+        revs = await sql(store, "SELECT count(*) AS n FROM settings_revisions")
+        return ops[0]["n"], revs[0]["n"]
+
+    before = await counts()
+    surrogate = (
+        '{"idempotencyKey":"key-surrogate","environment":"prod","backend":"game",'
+        '"expectedRevision":0,"patch":{"mode":"open","ok\\ud800tail":"x"}}'
+    ).encode()
+    response = await store["client"].request(
+        "PATCH",
+        "/v2/settings/gate/*",
+        content=surrogate,
+        headers={**headers(store), "content-type": "application/json"},
+    )
+    assert 400 <= response.status_code < 500, (response.status_code, response.text)
+    assert response.status_code != 429
+    assert await counts() == before
+    invalid = await sql(
+        store, "SELECT * FROM audit_events WHERE outcome='invalid' AND action='PATCH'"
+    )
+    assert len(invalid) >= 1

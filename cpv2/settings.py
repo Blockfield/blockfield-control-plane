@@ -28,7 +28,8 @@ class Strict(BaseModel):
                 if not -(2**63) <= value <= 2**63 - 1:
                     raise ValueError("integer outside bigint range")
             elif isinstance(value, dict):
-                for item in value.values():
+                for key, item in value.items():
+                    check(key)
                     check(item)
             elif isinstance(value, (list, tuple)):
                 for item in value:
