@@ -316,6 +316,13 @@ async def challenge(conn, identity, method, path, body):
 async def step_up(conn, identity, assertion, method, path, body):
     if not identity.owner or not assertion:
         raise Problem("owner_approval_required")
+    if (
+        not isinstance(assertion, dict)
+        or not isinstance(assertion.get("challengeId"), str)
+        or not isinstance(assertion.get("credential"), dict)
+        or not isinstance(assertion["credential"].get("id"), str)
+    ):
+        raise Problem("invalid_owner_assertion")
     try:
         cid = UUID(assertion["challengeId"])
         response = assertion["credential"]
@@ -363,5 +370,5 @@ async def step_up(conn, identity, assertion, method, path, body):
         await conn.execute(
             "UPDATE owner_challenges SET used_at=now() WHERE id=%s", (cid,)
         )
-    except (KeyError, ValueError, TypeError, WebAuthnException):
+    except (KeyError, ValueError, TypeError, AttributeError, WebAuthnException):
         raise Problem("invalid_owner_assertion") from None

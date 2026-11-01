@@ -3198,3 +3198,89 @@ async def test_c13_surrogate_dict_key_is_invalid_without_side_effects(store):
         store, "SELECT * FROM audit_events WHERE outcome='invalid' AND action='PATCH'"
     )
     assert len(invalid) >= 1
+
+
+async def test_c14_malformed_owner_assertion_is_4xx(store):
+    path = "/v2/settings/gameplay/arena"
+    body = patch("c14-malformed", value={"ai": {"hardLimit": 200}})
+    proof = json.loads(
+        (await assertion(store, "PATCH", path, body))["X-CP-Owner-Assertion"]
+    )
+    cases = [
+        {**proof, "challengeId": 12345},
+        {**proof, "challengeId": None},
+        {**proof, "credential": "not-a-dict"},
+        {**proof, "credential": {**proof["credential"], "id": ["not", "a", "string"]}},
+        ["not", "a", "dict"],
+    ]
+    credential = proof["credential"]
+    for field in ("rawId", "type", "response"):
+        cases.append({**proof, "credential": {**credential, field: 123}})
+    for field in ("clientDataJSON", "authenticatorData", "signature", "userHandle"):
+        cases.append(
+            {
+                **proof,
+                "credential": {
+                    **credential,
+                    "response": {**credential["response"], field: 123},
+                },
+            }
+        )
+    for field in ("challengeId", "credential"):
+        cases.append({key: value for key, value in proof.items() if key != field})
+    for bad in cases:
+        response = await request(
+            store,
+            "PATCH",
+            path,
+            body,
+            "owner",
+            {"X-CP-Owner-Assertion": json.dumps(bad)},
+        )
+        assert 400 <= response.status_code < 500, (
+            bad,
+            response.status_code,
+            response.text,
+        )
+        assert response.json()["error"] == "invalid_owner_assertion"
+
+
+async def test_c14_operation_outbox_lookup_uses_operation_index(store):
+    cred = await sql(
+        store, "SELECT id, client_id FROM credentials WHERE kind='service' LIMIT 1"
+    )
+    await sql(
+        store,
+        "INSERT INTO operations(id, credential_id, client_id, via, kind, target, resource,"
+        " environment, backend, request_hash, idempotency_key, required_scope, deadline, status)"
+        " SELECT gen_random_uuid(), %(cid)s, %(cli)s, 'game', 'settings.gameplay.write',"
+        " 'arena', '*', 'prod', 'game', 'seed', 'c14seed-'||g, 'settings.gameplay.write',"
+        " now()+interval '1 day', 'accepted' FROM generate_series(1, 2000) g",
+        {"cid": cred[0]["id"], "cli": cred[0]["client_id"]},
+    )
+    await sql(
+        store,
+        "INSERT INTO outbox(consumer_id, sequence, epoch, operation_id, generation, payload, payload_hash)"
+        " SELECT v.c, 1000000+o.rn, gen_random_uuid(), o.id, gen_random_uuid(), '{}'::jsonb, 'seed'"
+        " FROM (SELECT id, row_number() OVER () AS rn FROM operations"
+        " WHERE idempotency_key LIKE 'c14seed-%%') o CROSS JOIN (VALUES ('game'), ('workshop')) v(c)",
+    )
+    await sql(store, "ANALYZE outbox")
+    target = (
+        await sql(
+            store,
+            "SELECT id FROM operations WHERE idempotency_key='c14seed-1'",
+        )
+    )[0]["id"]
+    plan = await sql(
+        store,
+        "EXPLAIN SELECT o.consumer_id,COALESCE((SELECT state FROM consumer_acks a"
+        " WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence ORDER BY CASE state"
+        " WHEN 'unknown' THEN 6 WHEN 'rejected' THEN 5 WHEN 'effective' THEN 4"
+        " WHEN 'applied' THEN 3 WHEN 'validated' THEN 2 ELSE 1 END DESC LIMIT 1),"
+        "'accepted') AS state FROM outbox o WHERE operation_id=%s",
+        (target,),
+    )
+    text = "\n".join(row["QUERY PLAN"] for row in plan)
+    print(text)
+    assert "outbox_operation" in text, text

@@ -120,6 +120,7 @@ CREATE TABLE outbox(
  created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(consumer_id,sequence),
  UNIQUE(consumer_id,operation_id)
 );
+CREATE INDEX outbox_operation ON outbox(operation_id);
 CREATE TABLE consumer_acks(
  consumer_id text NOT NULL, sequence bigint NOT NULL, state text NOT NULL
  CHECK(state IN ('received','validated','applied','effective','rejected','unknown')),
