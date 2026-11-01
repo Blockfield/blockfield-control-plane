@@ -3284,3 +3284,54 @@ async def test_c14_operation_outbox_lookup_uses_operation_index(store):
     text = "\n".join(row["QUERY PLAN"] for row in plan)
     print(text)
     assert "outbox_operation" in text, text
+
+
+async def test_c16_sse_reconnect_replays_unacknowledged_frame(store):
+    from starlette.requests import Request
+
+    await queued(store, "c16-reconnect")
+    frame = (await envelopes(store))[0]
+    app = store["app"]
+    token = store["tokens"]["game-agent"]
+    async with app.state.db.transaction() as conn:
+        identity = await authenticate(conn, token)
+    endpoint = next(
+        r.endpoint for r in app.routes if r.path == "/v2/agents/{cid}/events"
+    )
+    req = Request(
+        {
+            "type": "http",
+            "headers": [
+                (b"last-event-id", f"{frame['epoch']}:{frame['sequence']}".encode())
+            ],
+        }
+    )
+    req.state.identity, req.state.token = identity, token
+    response = await endpoint("game", req, UUID(frame["epoch"]), 0)
+    try:
+        chunk = await anext(response.body_iterator)
+        assert f"id: {frame['epoch']}:{frame['sequence']}" in chunk
+    finally:
+        await response.body_iterator.aclose()
+
+
+def test_c16_health_budget_is_independent():
+    from cpv2.app import Limits
+
+    limiter = Limits(budget=1)
+    limiter.check("authenticated")
+    limiter.check("health", global_count=False)
+    with pytest.raises(Problem, match="rate_limit"):
+        limiter.check("authenticated-again")
+
+
+async def test_c16_nonfinite_patch_is_invalid(store):
+    response = await store["client"].patch(
+        "/v2/settings/gameplay/*",
+        headers={
+            "authorization": "Bearer " + store["tokens"]["admin"],
+            "content-type": "application/json",
+        },
+        content='{"idempotencyKey":"c16-nan","environment":"prod","backend":"game","expectedRevision":0,"patch":{"match":{"maxPlayers":NaN}}}',
+    )
+    assert response.status_code == 422, response.text

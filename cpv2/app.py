@@ -649,6 +649,13 @@ def create_app(dsn=None):
             except ValueError:
                 raise Problem("invalid_cursor", 422) from None
         async with database.transaction() as conn:
+            if last:
+                consumer = await delivery.consumer_for(
+                    conn, request.state.identity, cid, "agents.events"
+                )
+                # SSE IDs confirm transmission, not receipt; replay anything
+                # beyond the durable ACK cursor after a dropped connection.
+                cursor = min(cursor, consumer["received_cursor"])
             await delivery.batch(conn, request.state.identity, cid, epoch, cursor)
         waiter = wakeups.subscribe(cid)
 
