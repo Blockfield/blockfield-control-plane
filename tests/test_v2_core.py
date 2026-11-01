@@ -1741,13 +1741,21 @@ async def test_c5_bootstrap_revokes_pre_existing_sessions(store, postgres):
             "resource": "*",
         }
         stale = await provision(admin, spec)
+        # authenticate() holds FOR SHARE row locks to end of transaction, so
+        # each connection must close before bootstrap's revocation UPDATEs the
+        # same account row, or the UPDATE waits on this transaction forever.
         async with await psycopg.AsyncConnection.connect(
             admin,
             options="-c search_path=control,pg_catalog",
             row_factory=psycopg.rows.dict_row,
         ) as conn:
             assert (await authenticate(conn, stale)).owner is False
-            await bootstrap(admin, account, "owner", store["credential"])
+        await bootstrap(admin, account, "owner", store["credential"])
+        async with await psycopg.AsyncConnection.connect(
+            admin,
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
             with pytest.raises(Problem):
                 await authenticate(conn, stale)
         fresh = await provision(admin, spec)

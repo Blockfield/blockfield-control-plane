@@ -15,12 +15,15 @@ dev = [
     "ruff==0.15.5",
     "pytest==9.0.2",
     "pytest-asyncio==1.3.0",
+    "pytest-timeout==2.4.0",
     "pgserver==0.1.4",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", "test_api.py"]
+# Fail fast with a stack dump instead of hanging the CI job on a stuck test.
+timeout = 60
 
 [tool.ruff]
 target-version = "py312"
