@@ -1,0 +1,27 @@
+[project]
+name = "blockfield-control-plane"
+version = "2.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.135.1",
+  "uvicorn==0.41.0",
+  "psycopg[binary,pool]==3.3.3",
+  "webauthn==2.7.1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "ruff==0.15.5",
+    "pytest==9.0.2",
+    "pytest-asyncio==1.3.0",
+    "pgserver==0.1.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "test_api.py"]
+
+[tool.ruff]
+target-version = "py312"
+include = ["cpv2/**/*.py", "tests/test_v2*.py", "scripts/check_v2.py"]

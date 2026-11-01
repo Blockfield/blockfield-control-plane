@@ -1,8 +1,14 @@
 # blockfield-control-plane
 
-Central API for Blockfield services (U1: entry gate + maintenance mode).
-Python stdlib only (`api.py`: `http.server` + `sqlite3`), single writer,
-SQLite journal on a named volume. No Redis, no new dependencies.
+Central API for Blockfield services. V2 adds PostgreSQL authority and durable
+delivery; U1 remains the default during the staged migration. The legacy
+`api.py` uses stdlib `http.server` + `sqlite3` and a named state volume.
+
+## Control-plane v2 (migration step 2)
+
+The PostgreSQL authority, typed asynchronous API and private SSE/ACK core are
+available as `python -m cpv2`. See [the v2 contract and offline bootstrap](docs/V2.md).
+The default container command remains U1 until a separately authorized cutover.
 
 ## API
 
