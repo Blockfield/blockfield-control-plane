@@ -3536,5 +3536,42 @@ async def test_c18_protected_scope_rechecked_at_delivery(store):
             "SELECT * FROM operations WHERE id=%s",
             (response.json()["operationId"],),
         )
-        assert op["required_scope"] == "settings.protected.write", op["required_scope"]
+        assert op["required_scope"] == (
+            "settings.gameplay.write,settings.protected.write"
+        ), op["required_scope"]
+        assert await delivery.valid_operation(conn, op) == "rejected"
+
+
+async def test_c19_both_scopes_rechecked_at_delivery(store):
+    path = "/v2/settings/gameplay/arena"
+    body = patch("c19-both", value={"ai": {"hardLimit": 200}})
+    proof = await assertion(store, "PATCH", path, body)
+    response = await request(store, "PATCH", path, body, "owner", proof)
+    assert response.status_code == 202, response.text
+    # Narrow the owner client registration the other way: ordinary
+    # gameplay-write goes away while protected-write stays. No grant,
+    # epoch or credential change.
+    narrow = sorted(set(OWNER_SCOPES) - {"settings.gameplay.write"})
+    await provision(
+        store["admin"],
+        {
+            "client": {"id": "owner", "via": "ui", "human": True, "ceiling": narrow},
+            "accountId": str(store["accounts"]["owner"]),
+            "displayName": "owner",
+            "ceiling": narrow,
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    async with store["app"].state.db.transaction() as conn:
+        op = await one(
+            conn,
+            "SELECT * FROM operations WHERE id=%s",
+            (response.json()["operationId"],),
+        )
+        assert set(op["required_scope"].split(",")) == {
+            "settings.gameplay.write",
+            "settings.protected.write",
+        }, op["required_scope"]
         assert await delivery.valid_operation(conn, op) == "rejected"

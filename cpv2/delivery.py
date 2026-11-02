@@ -124,8 +124,11 @@ async def valid_operation(conn, op):
         ),
     )
     identity = Identity(c, client, account, grants, owner)
-    if not identity.allows(
-        op["required_scope"], op["environment"], op["backend"], op["resource"]
+    # required_scope lists every permission the accepted diff required
+    # (comma-joined); losing any one of them fences the frame.
+    if not all(
+        identity.allows(scope, op["environment"], op["backend"], op["resource"])
+        for scope in op["required_scope"].split(",")
     ):
         return "rejected"
     if c["parent_id"]:
