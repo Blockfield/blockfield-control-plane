@@ -101,7 +101,7 @@ async def bootstrap(dsn, account_id, name, credential):
         await invalidate(conn, account_id)
 
 
-async def provision(dsn, spec):
+async def provision(dsn, spec, bearer_sink=None):
     """Operator-only seed for accounts/clients/executors; no HTTP minting authority."""
     token, cid = "cp2_" + secrets.token_urlsafe(32), uuid4()
     async with (
@@ -111,8 +111,11 @@ async def provision(dsn, spec):
         history(conn),
     ):
         client = spec["client"]
+        # Re-provisioning the same client id updates its registration: the
+        # client ceiling caps every credential of that client, so keeping a
+        # stale row would silently ignore an operator narrowing the authority.
         await conn.execute(
-            "INSERT INTO clients(id,via,ceiling,human) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            "INSERT INTO clients(id,via,ceiling,human) VALUES(%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET via=EXCLUDED.via,ceiling=EXCLUDED.ceiling,human=EXCLUDED.human",
             (
                 client["id"],
                 client["via"],
@@ -223,6 +226,11 @@ async def provision(dsn, spec):
                 ),
             ),
         )
+        if bearer_sink is not None:
+            # The bearer reaches its file before the transaction commits, so a
+            # later write failure rolls the credential back instead of leaving
+            # a live credential nobody holds.
+            bearer_sink(token)
     return token
 
 
@@ -266,10 +274,27 @@ async def main():
         fd = os.open(
             args.token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
         )
-        with os.fdopen(fd, "w") as stream:
-            stream.write(
-                await provision(dsn, json.loads(private_file(args.spec_file))) + "\n"
+
+        def sink(token):
+            with os.fdopen(fd, "w") as stream:
+                stream.write(token + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        try:
+            await provision(
+                dsn, json.loads(private_file(args.spec_file)), bearer_sink=sink
             )
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(args.token_file)
+            except OSError:
+                pass
+            raise
     else:
         from cpv2.legacy import import_u1
 

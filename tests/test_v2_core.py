@@ -3390,3 +3390,120 @@ async def test_c17_auth_locks_parent_before_delegation(store, monkeypatch):
     async with store["app"].state.db.transaction() as conn:
         await authenticate(conn, token)
     assert locks == [child["parent_id"], child["id"]]
+
+
+async def test_c18_nan_challenge_body_is_invalid(store):
+    response = await store["client"].post(
+        "/v2/owner/challenges",
+        headers={
+            "authorization": "Bearer " + store["tokens"]["owner"],
+            "content-type": "application/json",
+        },
+        content='{"method":"PATCH","path":"/v2/settings/gameplay/arena","body":{"idempotencyKey":"c18-nan","environment":"prod","backend":"game","expectedRevision":0,"patch":{"match":{"maxPlayers":NaN}}}}',
+    )
+    assert response.status_code == 422, response.text
+
+
+async def test_c18_reprovision_updates_client_ceiling(store):
+    base = {
+        "client": {"id": "c18-re", "via": "game", "ceiling": ["gate:read"]},
+        "ceiling": ["gate:read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    first = await provision(store["admin"], base)
+    me = await store["client"].get(
+        "/v2/me", headers={"authorization": "Bearer " + first}
+    )
+    assert me.status_code == 200, me.text
+    assert me.json()["ceiling"] == ["gate:read"]
+    second = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "c18-re",
+                "via": "game",
+                "ceiling": sorted(SERVICE_SCOPES),
+            },
+            "ceiling": sorted(SERVICE_SCOPES),
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    me = await store["client"].get(
+        "/v2/me", headers={"authorization": "Bearer " + second}
+    )
+    assert me.status_code == 200, me.text
+    assert me.json()["ceiling"] == sorted(SERVICE_SCOPES), me.text
+    row = await sql(store, "SELECT ceiling FROM clients WHERE id='c18-re'")
+    assert row[0]["ceiling"] == sorted(SERVICE_SCOPES)
+
+
+async def test_c18_provision_sink_gets_bearer_before_commit(store, tmp_path):
+    import cpv2.admin as admin
+
+    path = tmp_path / "bearer"
+    seen = {}
+
+    def sink(token):
+        path.write_text(token + "\n")
+        seen["token"] = token
+
+    token = await admin.provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "c18-sink",
+                "via": "game",
+                "ceiling": sorted(SERVICE_SCOPES),
+            },
+            "ceiling": sorted(SERVICE_SCOPES),
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+        bearer_sink=sink,
+    )
+    assert token == seen["token"] == path.read_text().strip()
+    me = await store["client"].get(
+        "/v2/me", headers={"authorization": "Bearer " + token}
+    )
+    assert me.status_code == 200, me.text
+
+
+async def test_c18_provision_bearer_write_failure_rolls_back(
+    store, tmp_path, monkeypatch
+):
+    import cpv2.admin as admin
+
+    monkeypatch.setattr(admin.secrets, "token_urlsafe", lambda n: "c18sink")
+    path = tmp_path / "bearer"
+
+    def sink(token):
+        path.write_text(token + "\n")
+        raise OSError("c18 disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        await admin.provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "c18-rollback",
+                    "via": "game",
+                    "ceiling": sorted(SERVICE_SCOPES),
+                },
+                "ceiling": sorted(SERVICE_SCOPES),
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+            bearer_sink=sink,
+        )
+    assert path.read_text() == "cp2_c18sink\n"
+    assert not await sql(
+        store,
+        "SELECT 1 FROM credentials WHERE verifier=%s",
+        (verifier("cp2_c18sink"),),
+    )

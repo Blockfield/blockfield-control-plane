@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -24,6 +25,9 @@ class Strict(BaseModel):
                     raise ValueError("unpaired surrogate not representable") from None
             elif isinstance(value, bool):
                 pass
+            elif isinstance(value, float):
+                if not math.isfinite(value):
+                    raise ValueError("non-finite number not representable")
             elif isinstance(value, int):
                 if not -(2**63) <= value <= 2**63 - 1:
                     raise ValueError("integer outside bigint range")
