@@ -103,6 +103,7 @@ jobs:
     needs: [bot-gate]
     if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (needs.bot-gate.outputs.verdict == 'permit' && needs.bot-gate.outputs.sha_match == 'true'))
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -110,5 +111,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python3 -m unittest test_api -v
-      - run: python3 -m unittest discover -s tests -v
+      - run: pip install --require-hashes -r requirements-dev.txt
+      - run: python scripts/check_v2.py
