@@ -145,6 +145,49 @@ class GateTest(unittest.TestCase):
         )
         self.assertEqual(code, 400)
 
+    def test_expected_revision_bool_rejected_over_http_at_rev_zero(self):
+        # control-plane#8 exact repro: POST {expectedRevision:false} at rev 0
+        # must be 400 with no revision bump (True == 1 / False == 0 in Python).
+        import threading
+
+        store = api.Store(":memory:")
+        seeds = store.bootstrap("bool-secret")
+        server = api.ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
+        server.store = store
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+
+        def post(payload):
+            import urllib.error
+
+            r = urllib.request.Request(
+                base + "/v1/gate",
+                data=json.dumps(payload).encode(),
+                method="POST",
+                headers={"Authorization": "Bearer " + seeds["site"]},
+            )
+            try:
+                with urllib.request.urlopen(r) as res:
+                    return res.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        for bad in (False, True):
+            code = post(
+                {
+                    "expectedRevision": bad,
+                    "idempotencyKey": f"bool-{bad}",
+                    "mode": "maintenance",
+                    "actor": {"id": "owner-8", "role": "owner"},
+                }
+            )
+            self.assertEqual(code, 400)
+        self.assertEqual(store.gate()["revision"], 0)
+        self.assertEqual(
+            store.db.execute("SELECT COUNT(*) FROM gate_log").fetchone()[0], 0
+        )
+        server.shutdown()
+
     def test_every_write_is_audited(self):
         _, g = self.req("GET", "/v1/gate", token=self.seeds["proxy"])
         code, out = self.req(
@@ -160,6 +203,28 @@ class GateTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual((row[0], row[1]), ("owner-9:owner", "gate:set"))
         self.assertIn(str(out["revision"]), row[2])
+
+    def test_audit_records_authenticated_client(self):
+        # E3 (#13): the actor is a forwarded claim, so the audit must also
+        # record which authenticated token submitted the write.
+        _, g = self.req("GET", "/v1/gate", token=self.seeds["proxy"])
+        code, _ = self.req(
+            "POST",
+            "/v1/gate",
+            token=self.seeds["site"],
+            payload={
+                "expectedRevision": g["revision"],
+                "idempotencyKey": "client-k",
+                "mode": g["mode"],
+                "actor": {"id": "invented-owner", "role": "owner"},
+            },
+        )
+        self.assertEqual(code, 202)
+        row = self.store.db.execute(
+            "SELECT actor,detail FROM audit ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row[0], "invented-owner:owner")
+        self.assertEqual(json.loads(row[1])["client"], "site")
 
 
 if __name__ == "__main__":

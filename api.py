@@ -138,7 +138,7 @@ class Store:
             "observedAt": now_ms(),
         }
 
-    def set_gate(self, mode, message, actor_id, actor_role, expected, key):
+    def set_gate(self, mode, message, actor_id, actor_role, expected, key, client=None):
         if not isinstance(mode, str) or mode not in MODES:
             raise Bad("mode: open, draining или maintenance.")
         if not isinstance(message, str):
@@ -193,7 +193,11 @@ class Store:
                     t,
                     actor_id + ":" + actor_role,
                     "gate:set",
-                    json.dumps({"revision": new_rev, "mode": mode})[:500],
+                    # E3: the actor is a forwarded claim from the site backend;
+                    # always record which authenticated token submitted it.
+                    json.dumps({"revision": new_rev, "mode": mode, "client": client})[
+                        :500
+                    ],
                 ),
             )
             self.db.commit()
@@ -287,6 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 actor.get("role"),
                 body.get("expectedRevision"),
                 body.get("idempotencyKey"),
+                client=name,
             )
         except (Bad, ValueError) as e:
             return self._send(400, {"error": str(e) or "bad request"})
