@@ -236,6 +236,12 @@ async def settings_change(
             await step_up(
                 conn, identity, assertion, "POST" if rollback else "PATCH", path, data
             )
+            # The delivery-time recheck must enforce the strongest permission
+            # the accepted diff required, not just the namespace write scope.
+            await conn.execute(
+                "UPDATE operations SET required_scope='settings.protected.write' WHERE id=%s",
+                (op["id"],),
+            )
     if validate:
         await audit(
             conn,

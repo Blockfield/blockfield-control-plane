@@ -3507,3 +3507,34 @@ async def test_c18_provision_bearer_write_failure_rolls_back(
         "SELECT 1 FROM credentials WHERE verifier=%s",
         (verifier("cp2_c18sink"),),
     )
+
+
+async def test_c18_protected_scope_rechecked_at_delivery(store):
+    path = "/v2/settings/gameplay/arena"
+    body = patch("c18-protected", value={"ai": {"hardLimit": 200}})
+    proof = await assertion(store, "PATCH", path, body)
+    response = await request(store, "PATCH", path, body, "owner", proof)
+    assert response.status_code == 202, response.text
+    # Narrow the owner client registration: protected-write goes away while
+    # ordinary gameplay-write stays. No grant, epoch or credential change.
+    narrow = sorted(set(OWNER_SCOPES) - {"settings.protected.write"})
+    await provision(
+        store["admin"],
+        {
+            "client": {"id": "owner", "via": "ui", "human": True, "ceiling": narrow},
+            "accountId": str(store["accounts"]["owner"]),
+            "displayName": "owner",
+            "ceiling": narrow,
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    async with store["app"].state.db.transaction() as conn:
+        op = await one(
+            conn,
+            "SELECT * FROM operations WHERE id=%s",
+            (response.json()["operationId"],),
+        )
+        assert op["required_scope"] == "settings.protected.write", op["required_scope"]
+        assert await delivery.valid_operation(conn, op) == "rejected"
