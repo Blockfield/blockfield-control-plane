@@ -25,6 +25,7 @@ from psycopg.types.json import Jsonb
 from webauthn.helpers import bytes_to_base64url
 
 import api
+from cpv2 import app as cpv2_app
 from cpv2 import core, delivery
 from cpv2.admin import bootstrap, provision
 from cpv2.app import create_app
@@ -3575,6 +3576,21 @@ async def test_c19_both_scopes_rechecked_at_delivery(store):
             "settings.protected.write",
         }, op["required_scope"]
         assert await delivery.valid_operation(conn, op) == "rejected"
+
+
+async def test_c20_health_reports_database_outage(store, monkeypatch):
+    # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
+    response = await store["client"].get("/health")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "ok", "schema": 2}
+    await store["app"].state.db.close()
+    # Success is cached briefly so public probe floods skip the DB.
+    assert (await store["client"].get("/health")).status_code == 200
+    now = cpv2_app._health_clock()
+    monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
+    broken = await store["client"].get("/health")
+    assert broken.status_code == 503, broken.text
+    assert broken.json() == {"status": "unavailable", "schema": 2}
 
 
 def _rooms_body(key="rooms", revision=0, value=None):
