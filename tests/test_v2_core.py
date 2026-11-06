@@ -3591,3 +3591,51 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
     assert broken.json() == {"status": "unavailable", "schema": 2}
+
+
+def _rooms_body(key="rooms", revision=0, value=None):
+    return {
+        "idempotencyKey": key,
+        "environment": "prod",
+        "backend": "game",
+        "expectedRevision": revision,
+        "patch": value or {"maxRooms": 4},
+    }
+
+
+async def test_settings_rooms_cas_conflict_and_idempotent_retry(store):
+    path = "/v2/settings/rooms/arena"
+    assert (
+        await request(store, "POST", path + "/validate", _rooms_body())
+    ).status_code == 200
+    responses = await asyncio.gather(
+        request(store, "PATCH", path, _rooms_body("one")),
+        request(store, "PATCH", path, _rooms_body("two")),
+    )
+    assert sorted(r.status_code for r in responses) == [202, 409]
+    key = "one" if responses[0].status_code == 202 else "two"
+    assert (await request(store, "PATCH", path, _rooms_body(key))).status_code == 202
+    assert (
+        await request(store, "PATCH", path, _rooms_body(key, value={"maxRooms": 8}))
+    ).status_code == 409
+    assert (
+        await request(store, "PATCH", path, _rooms_body("invalid", 1, {"maxRooms": 0}))
+    ).status_code == 422
+
+
+async def test_ai_limits_budget_is_owner_only(store):
+    path = "/v2/settings/ai-limits/global"
+    account = "12345678-1234-1234-1234-1234567890ab"
+    body = {
+        "idempotencyKey": "ai-budget",
+        "environment": "prod",
+        "backend": "game",
+        "expectedRevision": 0,
+        "patch": {"sessions": {account: 1000}},
+    }
+    # A nested budget change must hit the protected path, not slip past it.
+    assert (await request(store, "PATCH", path, body)).status_code == 403
+    proof = await assertion(store, "PATCH", path, body)
+    assert (
+        await request(store, "PATCH", path, body, "owner", proof)
+    ).status_code == 202
