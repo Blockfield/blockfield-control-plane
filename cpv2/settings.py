@@ -157,6 +157,13 @@ _BALANCE_DOUBLE = {
     "base_kill_radius": (0, 1000),
 }
 _BALANCE_BOOL = ("enable_spawn_shield", "shuffle_teams_between_rounds")
+# The mod's CampaignConfig defaults: it fills a missing half of a pair with these.
+_PAIR_DEFAULTS = {
+    "min_players_per_team": 1,
+    "max_players_per_team": 16,
+    "base_warn_radius": 100.0,
+    "base_kill_radius": 80.0,
+}
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
@@ -204,17 +211,18 @@ class Campaign(Strict):
                         )
                 else:
                     raise ValueError(f"campaignBalance.{campaign}.{key}: unknown key")
-            merged = {**self.campaignBalance.get("*", {}), **values}
-            if "min_players_per_team" in merged and "max_players_per_team" in merged:
-                if merged["min_players_per_team"] > merged["max_players_per_team"]:
-                    raise ValueError(
-                        f"campaignBalance.{campaign}: min team above max team"
-                    )
-            if "base_kill_radius" in merged and "base_warn_radius" in merged:
-                if merged["base_kill_radius"] > merged["base_warn_radius"]:
-                    raise ValueError(
-                        f"campaignBalance.{campaign}: kill radius above warn radius"
-                    )
+            star = self.campaignBalance.get("*", {})
+            merged = {
+                **_PAIR_DEFAULTS,
+                **(star if isinstance(star, dict) else {}),
+                **values,
+            }
+            if merged["min_players_per_team"] > merged["max_players_per_team"]:
+                raise ValueError(f"campaignBalance.{campaign}: min team above max team")
+            if merged["base_kill_radius"] > merged["base_warn_radius"]:
+                raise ValueError(
+                    f"campaignBalance.{campaign}: kill radius above warn radius"
+                )
         return self
 
 

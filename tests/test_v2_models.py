@@ -199,3 +199,33 @@ def test_merge_delete_validates_like_any_change():
     # Nullable scalars reset to their None default when deleted.
     rooms = merge(Rooms().model_dump(mode="json"), {"maxRooms": 4})
     assert Rooms.model_validate(merge(rooms, {"maxRooms": None})).maxRooms is None
+
+
+def test_campaign_pair_checks_use_mod_defaults_for_missing_half():
+    # The mod fills a missing half from CampaignConfig defaults (warn 100, kill 80, team 1..16).
+    for values in (
+        {"base_kill_radius": 150},
+        {"base_warn_radius": 50},
+        {"min_players_per_team": 20},
+        {"max_players_per_team": 1, "min_players_per_team": 2},
+    ):
+        with pytest.raises(ValidationError):
+            Campaign.model_validate({"campaignBalance": {"c1": values}})
+    with pytest.raises(ValidationError):
+        Campaign.model_validate(
+            {
+                "campaignBalance": {
+                    "*": {"base_warn_radius": 200},
+                    "c1": {"base_kill_radius": 300},
+                }
+            }
+        )
+    Campaign.model_validate({"campaignBalance": {"c1": {"base_kill_radius": 90}}})
+    Campaign.model_validate(
+        {
+            "campaignBalance": {
+                "*": {"base_warn_radius": 200},
+                "c1": {"base_kill_radius": 150},
+            }
+        }
+    )
