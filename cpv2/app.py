@@ -16,6 +16,9 @@ from cpv2.auth import Problem, audit, authenticate, challenge, verifier
 from cpv2.db import Database, one, rows
 from cpv2.settings import DEFINITIONS, digest
 
+# Indirection so tests can expire the /health cache without patching time.
+_health_clock = time.monotonic
+
 
 class Limits:
     def __init__(self, budget=1000):
@@ -306,11 +309,18 @@ def create_app(dsn=None):
         except ValueError:
             raise Problem("invalid_owner_assertion", 422) from None
 
+    health_ok_until = 0.0
+
     @app.get("/health")
     async def health():
         # CP-H5: unauthenticated liveness + readiness. 200 only when the
         # control database answers and the owner bootstrap is present.
         # Never leak DSNs, errors or gate state here.
+        nonlocal health_ok_until
+        # Public route: cache success so probe floods cannot drain the DB pool;
+        # failures re-check, since an outage has no pool left to protect.
+        if _health_clock() < health_ok_until:
+            return {"status": "ok", "schema": 2}
         try:
             async with database.transaction() as conn:
                 bootstrapped = await one(
@@ -320,6 +330,7 @@ def create_app(dsn=None):
             return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
         if not bootstrapped or not bootstrapped["ok"]:
             return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
+        health_ok_until = _health_clock() + 5
         return {"status": "ok", "schema": 2}
 
     @app.get("/v1/openapi.json")

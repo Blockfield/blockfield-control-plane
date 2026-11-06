@@ -10,5 +10,5 @@ RUN useradd -r -u 65532 cp && mkdir -p /data && chown cp:cp /data
 USER cp
 VOLUME /data
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD-SHELL python3 -c "import os,sys,urllib.request;p=os.environ.get('CP_PORT','8080');sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+p+'/health', timeout=4).status == 200 else 1)"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python3 -c "import os,sys,urllib.request;p=os.environ.get('CP_PORT','8080');sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+p+'/health', timeout=4).status == 200 else 1)"
 CMD ["python3", "api.py"]
