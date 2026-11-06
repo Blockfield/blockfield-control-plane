@@ -157,6 +157,13 @@ _BALANCE_DOUBLE = {
     "base_kill_radius": (0, 1000),
 }
 _BALANCE_BOOL = ("enable_spawn_shield", "shuffle_teams_between_rounds")
+# The mod's CampaignConfig defaults: it fills a missing half of a pair with these.
+_PAIR_DEFAULTS = {
+    "min_players_per_team": 1,
+    "max_players_per_team": 16,
+    "base_warn_radius": 100.0,
+    "base_kill_radius": 80.0,
+}
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
@@ -204,17 +211,18 @@ class Campaign(Strict):
                         )
                 else:
                     raise ValueError(f"campaignBalance.{campaign}.{key}: unknown key")
-            merged = {**self.campaignBalance.get("*", {}), **values}
-            if "min_players_per_team" in merged and "max_players_per_team" in merged:
-                if merged["min_players_per_team"] > merged["max_players_per_team"]:
-                    raise ValueError(
-                        f"campaignBalance.{campaign}: min team above max team"
-                    )
-            if "base_kill_radius" in merged and "base_warn_radius" in merged:
-                if merged["base_kill_radius"] > merged["base_warn_radius"]:
-                    raise ValueError(
-                        f"campaignBalance.{campaign}: kill radius above warn radius"
-                    )
+            star = self.campaignBalance.get("*", {})
+            merged = {
+                **_PAIR_DEFAULTS,
+                **(star if isinstance(star, dict) else {}),
+                **values,
+            }
+            if merged["min_players_per_team"] > merged["max_players_per_team"]:
+                raise ValueError(f"campaignBalance.{campaign}: min team above max team")
+            if merged["base_kill_radius"] > merged["base_warn_radius"]:
+                raise ValueError(
+                    f"campaignBalance.{campaign}: kill radius above warn radius"
+                )
         return self
 
 
@@ -577,14 +585,28 @@ def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
-def merge(current, patch):
+# Dict fields whose entries store null as a value instead of a delete marker.
+# Kits.fixedModeKits.<mode> is "kit id or null": null clears the fixed kit
+# but keeps the explicit entry. Everywhere else a patch null deletes the key
+# (RFC 7396), then the merged result is validated as usual.
+_NULL_VALUED_PARENTS = frozenset({"fixedModeKits"})
+
+
+def merge(current, patch, _parent=None):
+    # RFC 7396 JSON Merge Patch: null deletes the key (recursively), absent
+    # keys are untouched, arrays are replaced wholesale.
     result = copy.deepcopy(current)
     for key, value in patch.items():
-        result[key] = (
-            merge(result.get(key, {}), value)
-            if isinstance(value, dict) and isinstance(result.get(key), dict)
-            else value
-        )
+        if value is None and _parent not in _NULL_VALUED_PARENTS:
+            result.pop(key, None)
+        elif isinstance(value, dict):
+            # RFC 7396: a missing or non-object target merges from {}.
+            target = result.get(key)
+            result[key] = merge(
+                target if isinstance(target, dict) else {}, value, _parent=key
+            )
+        else:
+            result[key] = value
     return result
 
 

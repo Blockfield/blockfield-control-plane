@@ -173,3 +173,75 @@ def test_ids_reject_trailing_newline_and_provider_extra_keys():
         WorkshopAi.model_validate(
             merge(workshop, {"providers": [{**entry, "apiKey": "x"}]})
         )
+
+
+def test_merge_patch_null_deletes_recursively():
+    current = {
+        "kits": {"alpha": {"name": "a"}, "beta": {"name": "b"}},
+        "fixedModeKits": {"campaign": "alpha", "tdm": None},
+    }
+    assert merge(current, {"kits": {"beta": None}}) == {
+        "kits": {"alpha": {"name": "a"}},
+        "fixedModeKits": {"campaign": "alpha", "tdm": None},
+    }
+    # Nested delete, untouched siblings, missing-key no-op, arrays wholesale.
+    assert merge({"a": {"b": 1, "c": 2}}, {"a": {"b": None}}) == {"a": {"c": 2}}
+    assert merge({"a": 1}, {"missing": None}) == {"a": 1}
+    assert merge({"a": [1, 2]}, {"a": [3]}) == {"a": [3]}
+    # Whole-dict reset empties the namespace field for fresh defaults.
+    assert merge({"campaignBalance": {"c1": {"a": 1}}}, {"campaignBalance": None}) == {}
+    # Null stays a value only under fixedModeKits ("kit id or null").
+    assert merge(
+        {"fixedModeKits": {"campaign": "alpha"}},
+        {"fixedModeKits": {"campaign": None}},
+    ) == {"fixedModeKits": {"campaign": None}}
+    # A missing or non-object target recurses from {}: nested nulls never persist.
+    assert merge(
+        {"campaignBalance": {}}, {"campaignBalance": {"c1": {"score_per_kill": None}}}
+    ) == {"campaignBalance": {"c1": {}}}
+    assert merge({"a": 1}, {"a": {"b": None, "c": 2}}) == {"a": {"c": 2}}
+    assert merge({}, {"fixedModeKits": {"tdm": None}}) == {
+        "fixedModeKits": {"tdm": None}
+    }
+
+
+def test_merge_delete_validates_like_any_change():
+    full = Gameplay().model_dump(mode="json")
+    full["ai"] = {"budget": 200, "hardLimit": 300}
+    Gameplay.model_validate(full)
+    # Deleting hardLimit revives the default 100 under budget 200: 422.
+    with pytest.raises(ValidationError):
+        Gameplay.model_validate(merge(full, {"ai": {"hardLimit": None}}))
+    # Nullable scalars reset to their None default when deleted.
+    rooms = merge(Rooms().model_dump(mode="json"), {"maxRooms": 4})
+    assert Rooms.model_validate(merge(rooms, {"maxRooms": None})).maxRooms is None
+
+
+def test_campaign_pair_checks_use_mod_defaults_for_missing_half():
+    # The mod fills a missing half from CampaignConfig defaults (warn 100, kill 80, team 1..16).
+    for values in (
+        {"base_kill_radius": 150},
+        {"base_warn_radius": 50},
+        {"min_players_per_team": 20},
+        {"max_players_per_team": 1, "min_players_per_team": 2},
+    ):
+        with pytest.raises(ValidationError):
+            Campaign.model_validate({"campaignBalance": {"c1": values}})
+    with pytest.raises(ValidationError):
+        Campaign.model_validate(
+            {
+                "campaignBalance": {
+                    "*": {"base_warn_radius": 200},
+                    "c1": {"base_kill_radius": 300},
+                }
+            }
+        )
+    Campaign.model_validate({"campaignBalance": {"c1": {"base_kill_radius": 90}}})
+    Campaign.model_validate(
+        {
+            "campaignBalance": {
+                "*": {"base_warn_radius": 200},
+                "c1": {"base_kill_radius": 150},
+            }
+        }
+    )
