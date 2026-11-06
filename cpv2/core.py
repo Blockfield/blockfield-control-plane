@@ -341,8 +341,12 @@ async def grant_change(conn, identity, attempt, model, assertion, path):
         # consumer would otherwise act as any admin whose grant covers it.
         if identity.credential["resource"] != "*":
             raise Problem("actor_forbidden")
+        # FOR SHARE like authenticate(): a concurrent revocation of this actor
+        # (FOR UPDATE + invalidate) waits for this change to commit.
         actor = await one(
-            conn, "SELECT * FROM accounts WHERE id=%s", (model.actorAccountId,)
+            conn,
+            "SELECT * FROM accounts WHERE id=%s FOR SHARE",
+            (model.actorAccountId,),
         )
         if not actor:
             raise Problem("account_not_found", 404)

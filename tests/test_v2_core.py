@@ -4191,6 +4191,31 @@ async def test_staff_service_grant_actor_peer_and_missing_actor(store):
         assert denied.json()["error"] == "service_actor_required", denied.text
 
 
+async def test_staff_service_actor_read_holds_share_lock(store, monkeypatch):
+    # Without FOR SHARE a revocation of the asserted admin could commit between
+    # this read and the grant insert, applying a change under a revoked admin.
+    await _site(store)
+    admin = store["accounts"]["admin"]
+    seen = []
+    original = core.one
+
+    async def observe(conn, query, params=()):
+        if "FROM accounts WHERE id=%s" in query and params and params[0] == admin:
+            seen.append(query)
+        return await original(conn, query, params)
+
+    monkeypatch.setattr(core, "one", observe)
+    response = await request(
+        store,
+        "POST",
+        "/v2/staff/grants",
+        _grant("svc-lock", store["accounts"]["ordinary"], "moderator", actor=admin),
+        "site",
+    )
+    assert response.status_code == 202, response.text
+    assert seen and all("FOR SHARE" in q for q in seen), seen
+
+
 async def test_staff_service_grant_actor_applies_and_audits(store):
     await _site(store)
     admin = store["accounts"]["admin"]
