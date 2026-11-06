@@ -1,4 +1,6 @@
+import re
 import secrets
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -593,3 +595,218 @@ async def read_operation(conn, identity, op_id):
     result["receipts"] = receipts
     result["deadline"] = op["deadline"]
     return result
+
+
+# Workshop operations: the CP-side producer for the op kinds the Workshop
+# subscriber applies (members/message/wake/cancel plus release.select).
+# Payloads are exactly what the Workshop apply_cp_operation/apply_cp_releases
+# consume, plus the authorized target so the consumer can check an operation
+# is addressed to itself; enqueue() stores digest(payload) as the frame
+# payload hash, the same canonical JSON the Workshop verifies (sort_keys,
+# compact separators).
+WORKSHOP_SCOPES = {
+    "members": "workshop.members",
+    "message": "workshop.message",
+    "wake": "workshop.wake",
+    "cancel": "workshop.cancel",
+    "release.select": "workshop.release.select",
+}
+WORKSHOP_NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
+WORKSHOP_ROLES = ("builder", "lead", "admin")
+WORKSHOP_RELEASE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
+# Same advisory bound the Workshop applies to snapshot release records.
+WORKSHOP_MEMBERS_LIMIT = 256
+
+
+def _workshop_identity(value):
+    # Workshop actor: draslId normalizes like the consumer member(), the name
+    # follows the same 3-16 [A-Za-z0-9_] rule. Extra keys are dropped: the
+    # consumer overrides role itself and rejects anything else.
+    if not isinstance(value, dict):
+        raise Problem("invalid_workshop_actor", 422)
+    drasl = value.get("draslId")
+    if not isinstance(drasl, str):
+        raise Problem("invalid_workshop_actor", 422)
+    normalized = drasl.replace("-", "").lower()
+    if len(normalized) != 32 or any(c not in "0123456789abcdef" for c in normalized):
+        raise Problem("invalid_workshop_actor", 422)
+    name = value.get("name")
+    if not isinstance(name, str) or WORKSHOP_NAME.fullmatch(name) is None:
+        raise Problem("invalid_workshop_actor", 422)
+    return {"draslId": normalized, "name": name}
+
+
+def _workshop_member(value):
+    if not isinstance(value, dict) or set(value) - {
+        "draslId",
+        "name",
+        "role",
+        "maps",
+    }:
+        raise Problem("invalid_workshop_members", 422)
+    entry = _workshop_identity(value)
+    role = value.get("role", "builder")
+    if role not in WORKSHOP_ROLES:
+        raise Problem("invalid_workshop_members", 422)
+    if role != "builder":
+        entry["role"] = role
+    maps = value.get("maps")
+    if maps is not None:
+        if not isinstance(maps, list) or any(
+            not isinstance(item, str) for item in maps
+        ):
+            raise Problem("invalid_workshop_members", 422)
+        entry["maps"] = list(maps)
+    return entry
+
+
+def _workshop_message(value):
+    # Same wire rule the Workshop enforces: at most 200 chars, no control
+    # characters or section signs. Empty text removes the override there.
+    if not isinstance(value, str) or len(value) > 200:
+        raise Problem("invalid_workshop_message", 422)
+    if "§" in value or any(unicodedata.category(char) == "Cc" for char in value):
+        raise Problem("invalid_workshop_message", 422)
+    return value
+
+
+async def _workshop_caller(conn, identity, actor):
+    # Caller attribution is bound, never caller-supplied. A person session
+    # must have exactly one drasl-issuer account_identities row (verified
+    # Drasl linking itself belongs to step 3); the payload actor is derived
+    # from it and a mismatched supplied actor is rejected. A service
+    # principal (site/bot acting for a human over an API-only plane) may
+    # supply the actor only with the offline-provisioned workshop.act scope.
+    if identity.account is None:
+        if actor is None:
+            raise Problem("invalid_workshop_actor", 422)
+        return _workshop_identity(actor)
+    if actor is not None:
+        _workshop_identity(actor)
+    bound = await rows(
+        conn,
+        "SELECT player_id, current_name FROM account_identities WHERE account_id=%s",
+        (identity.actor,),
+    )
+    if len(bound) != 1:
+        raise Problem("workshop_actor_unbound", 403)
+    try:
+        expected = _workshop_identity(
+            {
+                "draslId": str(bound[0]["player_id"]).replace("-", ""),
+                "name": bound[0]["current_name"],
+            }
+        )
+    except Problem:
+        raise Problem("workshop_actor_unbound", 403) from None
+    if actor is not None and _workshop_identity(actor) != expected:
+        raise Problem("forbidden")
+    return expected
+
+
+async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path=""):
+    if kind not in WORKSHOP_SCOPES:
+        raise Problem("unknown_action", 404)
+    data = model.model_dump(mode="json")
+    if identity.account is None:
+        identity.require("workshop.act", model.environment, model.backend, model.target)
+        scope = "workshop.act"
+    else:
+        identity.require(
+            WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target
+        )
+        scope = WORKSHOP_SCOPES[kind]
+    if kind == "members":
+        entries = model.members
+        if (
+            not isinstance(entries, list)
+            or not 1 <= len(entries) <= WORKSHOP_MEMBERS_LIMIT
+        ):
+            raise Problem("invalid_workshop_members", 422)
+        members = [_workshop_member(entry) for entry in entries]
+        if model.target != "*" and any(entry.get("maps") for entry in members):
+            # Map ids are outside any scoped grant: scoped issuers cannot
+            # attest them. The consumer enforces the same rule on target.
+            raise Problem("invalid_workshop_members", 422)
+        partial, key = {"members": members}, "grantor"
+    elif kind == "message":
+        partial = {"message": _workshop_message(model.message)}
+        key = "actor"
+    elif kind in ("wake", "cancel"):
+        partial, key = {}, "actor"
+    else:
+        release = model.release
+        if not isinstance(release, str) or WORKSHOP_RELEASE.fullmatch(release) is None:
+            raise Problem("invalid_workshop_release", 422)
+        record = model.record
+        if record is not None and (
+            not isinstance(record, dict) or record.get("release") != release
+        ):
+            raise Problem("invalid_workshop_record", 422)
+        partial = {"release": release}
+        if record is not None:
+            # Full provenance is verified consumer-side against its catalog.
+            partial["record"] = record
+        key = "actor"
+    caller = await _workshop_caller(conn, identity, model.actor)
+    payload = {"kind": kind, "target": model.target, key: caller, **partial}
+    op, duplicate = await operation(
+        conn,
+        identity,
+        f"workshop.{kind}",
+        model.target,
+        data,
+        scope,
+        model.expiresInSeconds,
+        model.generation,
+    )
+    if duplicate:
+        return receipt(op)
+    consumer = await one(
+        conn, "SELECT * FROM consumers WHERE id=%s FOR UPDATE", (model.consumerId,)
+    )
+    if (
+        not consumer
+        or consumer["generation"] != model.generation
+        or consumer["environment"] != model.environment
+        or consumer["backend"] != model.backend
+        or not covers(consumer["resource"], model.target)
+        or WORKSHOP_SCOPES[kind] not in consumer["capabilities"]
+    ):
+        raise Problem("consumer_generation_or_capability", 409)
+    unsettled = await one(
+        conn,
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id "
+        "WHERE o.consumer_id=%s AND p.kind IN "
+        "('workshop.members','workshop.message','workshop.wake','workshop.cancel',"
+        "'workshop.release.select') AND p.deadline>now() AND NOT EXISTS(SELECT 1 "
+        "FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND "
+        "a.sequence=o.sequence AND a.state IN "
+        "('effective','rejected','unknown'))",
+        (model.consumerId,),
+    )
+    if (
+        consumer["next_sequence"] - consumer["received_cursor"] > 128
+        or unsettled["n"] >= 128
+    ):
+        raise Problem("consumer_lag", 409)
+    if kind == "members" and any(entry.get("role") == "admin" for entry in members):
+        # Same owner step-up as grant_change: neither a non-owner admin nor
+        # a service principal can mint Workshop admins without it.
+        await step_up(conn, identity, assertion, "POST", path, data)
+    await enqueue(conn, op, [consumer], payload)
+    return await finish(
+        conn,
+        attempt,
+        identity,
+        op,
+        {
+            "payloadHash": digest(payload),
+            "workshopActor": caller,
+            "principal": {
+                "credential": str(identity.credential["id"]),
+                "account": str(identity.actor) if identity.actor else None,
+                "client": identity.client["id"],
+            },
+        },
+    )
