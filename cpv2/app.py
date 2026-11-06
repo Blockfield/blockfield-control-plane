@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from cpv2 import core, delivery, models
-from cpv2.auth import Problem, audit, authenticate, challenge, verifier
+from cpv2.auth import Identity, Problem, audit, authenticate, challenge, verifier
 from cpv2.db import Database, one, rows
 from cpv2.settings import DEFINITIONS, digest
 
@@ -286,13 +286,31 @@ def create_app(dsn=None):
             request.state.operation = (
                 UUID(result["operationId"]) if "operationId" in result else None
             )
+            audit_identity = identity
+            if request.state.operation is not None:
+                attributed = await one(
+                    conn,
+                    "SELECT account_id FROM operations WHERE id=%s",
+                    (request.state.operation,),
+                )
+                if attributed and attributed["account_id"] != identity.actor:
+                    # Service staff writes attribute the asserted actor; the
+                    # completion audit carries it while credential/client stay
+                    # on the record. Identical for every direct call.
+                    audit_identity = Identity(
+                        identity.credential,
+                        identity.client,
+                        {"id": attributed["account_id"]},
+                        identity.grants,
+                        identity.owner,
+                    )
             # The completion audit commits atomically with the mutation: a
             # post-commit audit failure rolls the mutation back instead of
             # discarding a one-time response such as a delegation token.
             await audit(
                 conn,
                 request.state.attempt,
-                identity,
+                audit_identity,
                 request.method,
                 request.url.path,
                 "completed",
@@ -465,6 +483,56 @@ def create_app(dsn=None):
             path=request.url.path,
             rollback=True,
         )
+
+    @app.get("/v2/staff/grants")
+    async def staff_grants(
+        request: Request,
+        accountId: UUID,
+        environment: str = "prod",
+        backend: str = "game",
+    ):
+        # Roster read for the provisioned site service principal: live grants
+        # plus the compare-and-set revision for the account the site uses.
+        # staff.read lives in no human role or owner scope, so only a service
+        # credential provisioned with it passes the require below.
+        i = request.state.identity
+        i.require("staff.read", environment, backend, "*")
+        async with database.transaction() as conn:
+            target = await one(
+                conn,
+                "SELECT id, authorization_epoch FROM accounts WHERE id=%s",
+                (accountId,),
+            )
+            if not target:
+                raise Problem("account_not_found", 404)
+            grants = await rows(
+                conn,
+                "SELECT role, environment, backend, resource, revision, expires_at FROM role_grants WHERE account_id=%s AND environment=%s AND backend=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now()) ORDER BY role, environment, backend, resource",
+                (accountId, environment, backend),
+            )
+            await audit(
+                conn,
+                request.state.attempt,
+                i,
+                "staff.grants.read",
+                str(accountId),
+                "accepted",
+            )
+            return {
+                "accountId": str(accountId),
+                "expectedRevision": target["authorization_epoch"],
+                "grants": [
+                    {
+                        "role": g["role"],
+                        "environment": g["environment"],
+                        "backend": g["backend"],
+                        "resource": g["resource"],
+                        "revision": g["revision"],
+                        "expires_at": g["expires_at"],
+                    }
+                    for g in grants
+                ],
+            }
 
     @app.post(
         "/v2/staff/grants", status_code=202, response_model=models.OperationReceipt

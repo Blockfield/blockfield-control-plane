@@ -44,6 +44,9 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     "audit.full",
 }
 SERVICE_SCOPES = {"agents.events", "agents.acks", "gate:read", "workshop.act"}
+# Site principal only: provisioned solely on a resource="*" service credential,
+# since a staff write asserts an acting account (see core.grant_change).
+STAFF_SCOPES = {"staff.read", "staff.lower.manage", "staff.admin.manage"}
 
 
 class Problem(Exception):
@@ -108,7 +111,13 @@ class Identity:
         ):
             return False
         if c["kind"] == "service":
-            return scope in SERVICE_SCOPES
+            if self.account is None:
+                return scope in SERVICE_SCOPES | STAFF_SCOPES
+            # Service-asserted actor (staff writes via the site principal): the
+            # service must be provisioned for the scope, and the asserted actor
+            # must hold it exactly like a direct caller.
+            if scope not in SERVICE_SCOPES | STAFF_SCOPES:
+                return False
         if self.owner:
             return scope in OWNER_SCOPES
         return any(
@@ -200,6 +209,15 @@ async def audit(
             if identity
             else ("*", "*", "*")
         )
+    if operation:
+        operation_scope = await one(
+            conn,
+            "SELECT environment,backend,resource FROM operations WHERE id=%s FOR KEY SHARE",
+            (operation,),
+        )
+        scope = tuple(
+            operation_scope[key] for key in ("environment", "backend", "resource")
+        )
     # Lock foreign-key subjects before the commit-order history lock.
     if identity:
         if identity.actor:
@@ -209,15 +227,6 @@ async def audit(
         await conn.execute(
             "SELECT id FROM credentials WHERE id=%s FOR KEY SHARE",
             (identity.credential["id"],),
-        )
-    if operation:
-        operation_scope = await one(
-            conn,
-            "SELECT environment,backend,resource FROM operations WHERE id=%s FOR KEY SHARE",
-            (operation,),
-        )
-        scope = tuple(
-            operation_scope[key] for key in ("environment", "backend", "resource")
         )
     await record(
         conn,

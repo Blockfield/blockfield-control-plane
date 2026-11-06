@@ -39,6 +39,9 @@ class GrantChange(Mutation):
     role: Literal["builder", "moderator", "admin"]
     resource: str = Field(min_length=1, max_length=128)
     revoke: bool = False
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class TestStatus(Mutation):

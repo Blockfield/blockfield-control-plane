@@ -46,6 +46,22 @@ def test_no_forged_authority_or_numeric_cas_coercion():
             SettingsChange(**dict(valid, **{key: "owner"}))
 
 
+def test_grant_change_accepts_service_actor_but_rejects_bare_actor():
+    from uuid import uuid4
+
+    base = {
+        "idempotencyKey": "t",
+        "accountId": uuid4(),
+        "expectedRevision": 1,
+        "role": "builder",
+        "resource": "*",
+    }
+    assert GrantChange(**base).actorAccountId is None
+    assert GrantChange(**{**base, "actorAccountId": uuid4()}).actorAccountId is not None
+    with pytest.raises(ValidationError):
+        GrantChange(**{**base, "actor": "owner"})
+
+
 def test_complete_object_and_nested_diff():
     value = Gameplay().model_dump()
     updated = merge(value, {"ai": {"hardLimit": 200}})
