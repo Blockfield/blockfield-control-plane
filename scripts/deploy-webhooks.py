@@ -275,7 +275,8 @@ def parse_history(text):
 
 def read_history(path):
     try:
-        return parse_history(Path(path).read_text(encoding="utf-8"))
+        # A corrupt byte must not crash a deploy: replaced chars just fail that line's JSON parse.
+        return parse_history(Path(path).read_text(encoding="utf-8", errors="replace"))
     except FileNotFoundError:
         return []
 
@@ -324,6 +325,8 @@ def build_info(service, digest):
             )
         )
     except (subprocess.SubprocessError, OSError, ValueError):
+        return {}
+    if not isinstance(build, dict):
         return {}
     return {"version": build.get("build"), "compatibility": build.get("compatibility")}
 

@@ -293,3 +293,24 @@ class DeployHistoryTest(unittest.TestCase):
             os.environ.pop("BLOCKFIELD_MINECRAFT_ROOT", None)
             deploy.deploy(SERVICE, DIGEST)
         self.assertEqual([c for c in calls if c[0] in ("pull", "run", "image")], [])
+
+
+class HostDataTolerance(unittest.TestCase):
+    """Corrupt host data never crashes a deploy before or after the swap."""
+
+    def test_non_utf8_history_reads_valid_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deploy-history.jsonl"
+            path.write_bytes(b'{"surface": "x"}\n\xff\xfe torn\n')
+            self.assertEqual(deploy.read_history(path), [{"surface": "x"}])
+
+    def test_non_object_build_json_is_ignored(self):
+        for raw in ("[]", "null", "1"):
+            with (
+                self.subTest(raw=raw),
+                patch.object(deploy, "docker", return_value=raw),
+            ):
+                self.assertEqual(
+                    deploy.build_info("blockfield-control-plane", "sha256:" + "c" * 64),
+                    {},
+                )
