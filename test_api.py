@@ -227,5 +227,32 @@ class GateTest(unittest.TestCase):
         self.assertEqual(json.loads(row[1])["client"], "site")
 
 
+    def test_health_public_ok(self):
+        # CP-H5: unauthenticated liveness for deploy gates/Dokploy.
+        code, doc = self.req("GET", "/health")
+        self.assertEqual(code, 200)
+        self.assertEqual(doc, {"status": "ok", "schema": 1})
+
+    def test_health_reports_store_outage(self):
+        import threading
+
+        broken = api.Store(os.path.join(tempfile.mkdtemp(), "cp-broken.sqlite"))
+        broken.db.close()
+        server = api.ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
+        server.store = broken
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/health")
+            self.assertEqual(cm.exception.code, 503)
+            self.assertEqual(
+                json.loads(cm.exception.read().decode()),
+                {"status": "unavailable", "schema": 1},
+            )
+        finally:
+            server.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()
