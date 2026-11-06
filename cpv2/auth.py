@@ -43,7 +43,7 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     "settings.protected.write",
     "audit.full",
 }
-SERVICE_SCOPES = {"agents.events", "agents.acks", "gate:read"}
+SERVICE_SCOPES = {"agents.events", "agents.acks", "gate:read", "workshop.act"}
 
 
 class Problem(Exception):
@@ -274,6 +274,15 @@ def normalized_action(method, path, body):
         and path.endswith("/test-status")
     ):
         model = models.TestStatus
+    elif method == "POST" and path.startswith("/v2/workshop/"):
+        kind = path[len("/v2/workshop/") :]
+        kinds = {
+            scope.removeprefix("workshop.")
+            for scope in WORKSHOP_WRITE_SCOPES | WORKSHOP_ADMIN_SCOPES
+        }
+        if kind not in kinds:
+            raise Problem("invalid_owner_action", 422)
+        model = models.WorkshopAction
     else:
         raise Problem("invalid_owner_action", 422)
     try:

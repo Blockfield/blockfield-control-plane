@@ -136,9 +136,9 @@ async def store(postgres):
                 "client": {
                     "id": consumer,
                     "via": "game",
-                    "ceiling": sorted(SERVICE_SCOPES),
+                    "ceiling": ["agents.acks", "agents.events", "gate:read"],
                 },
-                "ceiling": sorted(SERVICE_SCOPES),
+                "ceiling": ["agents.acks", "agents.events", "gate:read"],
                 "environment": "prod",
                 "backend": "game",
                 "resource": "*",
@@ -3614,14 +3614,32 @@ async def workshop_outbox(store, operation_id):
     )
 
 
+async def bind(
+    store, role, drasl=WORKSHOP_ACTOR["draslId"], name=WORKSHOP_ACTOR["name"]
+):
+    player = str(UUID(hex=drasl))
+    await sql(
+        store,
+        "INSERT INTO account_identities(account_id, issuer, subject, player_id,"
+        " current_name, generation) VALUES(%s, 'drasl', %s, %s, %s, 1)",
+        (store["accounts"][role], str(store["accounts"][role]), player, name),
+    )
+
+
 async def test_workshop_message_producer_round_trip(store):
+    await bind(store, "moderator")
     body = workshop_body(store, message="hi")
     response = await request(store, "POST", "/v2/workshop/message", body, "moderator")
     assert response.status_code == 202, response.text
     rows = await workshop_outbox(store, response.json()["operationId"])
     assert len(rows) == 1
     payload = rows[0]["payload"]
-    assert payload == {"kind": "message", "actor": WORKSHOP_ACTOR, "message": "hi"}
+    assert payload == {
+        "kind": "message",
+        "target": "*",
+        "actor": WORKSHOP_ACTOR,
+        "message": "hi",
+    }
     # Same canonical JSON the Workshop cp_client verifies its frames with.
     expected = hashlib.sha256(
         json.dumps(
@@ -3635,28 +3653,47 @@ async def test_workshop_message_producer_round_trip(store):
 
 
 async def test_workshop_kinds_produce_exact_consumer_payloads(store):
-    admin_entries = [
-        dict(WORKSHOP_ACTOR, role="admin"),
+    await bind(store, "admin")
+    member_entries = [
         {"draslId": "f" * 32, "name": "Stranger", "role": "lead"},
     ]
     cases = [
         (
             "members",
-            {"members": admin_entries},
-            {"kind": "members", "grantor": WORKSHOP_ACTOR, "members": admin_entries},
+            {"members": member_entries},
+            {
+                "kind": "members",
+                "target": "*",
+                "grantor": WORKSHOP_ACTOR,
+                "members": member_entries,
+            },
         ),
         (
             "message",
             {"message": "hello"},
-            {"kind": "message", "actor": WORKSHOP_ACTOR, "message": "hello"},
+            {
+                "kind": "message",
+                "target": "*",
+                "actor": WORKSHOP_ACTOR,
+                "message": "hello",
+            },
         ),
-        ("wake", {}, {"kind": "wake", "actor": WORKSHOP_ACTOR}),
-        ("cancel", {}, {"kind": "cancel", "actor": WORKSHOP_ACTOR}),
+        (
+            "wake",
+            {},
+            {"kind": "wake", "target": "*", "actor": WORKSHOP_ACTOR},
+        ),
+        (
+            "cancel",
+            {},
+            {"kind": "cancel", "target": "*", "actor": WORKSHOP_ACTOR},
+        ),
         (
             "release.select",
             {"release": "v9.0.0", "record": {"release": "v9.0.0"}},
             {
                 "kind": "release.select",
+                "target": "*",
                 "actor": WORKSHOP_ACTOR,
                 "release": "v9.0.0",
                 "record": {"release": "v9.0.0"},
@@ -3723,6 +3760,8 @@ async def test_workshop_unknown_kind_rejected(store):
 
 async def test_workshop_rbac_mirrors_moderation_split(store):
     # Builders cannot issue; moderators handle member-level ops only.
+    await bind(store, "moderator")
+    await bind(store, "admin", "f" * 32, "Stranger")
     assert (
         await request(
             store,
@@ -3758,21 +3797,23 @@ async def test_workshop_rbac_mirrors_moderation_split(store):
             "moderator",
         )
         assert response.status_code == 202, (kind, response.text)
+    admin_actor = {"draslId": "f" * 32, "name": "Stranger"}
     for kind, fields in (
-        ("members", {"members": [dict(WORKSHOP_ACTOR, role="admin")]}),
+        ("members", {"members": [{"draslId": "a" * 32, "name": "Helper"}]}),
         ("release.select", {"release": "v9.0.0"}),
     ):
         response = await request(
             store,
             "POST",
             f"/v2/workshop/{kind}",
-            workshop_body(store, **fields),
+            workshop_body(store, actor=admin_actor, **fields),
             "admin",
         )
         assert response.status_code == 202, (kind, response.text)
 
 
 async def test_workshop_consumer_capability_and_generation_fenced(store):
+    await bind(store, "moderator")
     body = workshop_body(store, message="hi", consumerId="game")
     response = await request(store, "POST", "/v2/workshop/message", body, "moderator")
     assert response.status_code == 409, response.text
@@ -3782,6 +3823,7 @@ async def test_workshop_consumer_capability_and_generation_fenced(store):
 
 
 async def test_workshop_idempotent_retry_returns_same_operation(store):
+    await bind(store, "moderator")
     body = workshop_body(store, message="hi")
     first = await request(store, "POST", "/v2/workshop/message", body, "moderator")
     assert first.status_code == 202, first.text
@@ -3790,3 +3832,114 @@ async def test_workshop_idempotent_retry_returns_same_operation(store):
     assert second.json()["operationId"] == first.json()["operationId"]
     rows = await workshop_outbox(store, first.json()["operationId"])
     assert len(rows) == 1
+
+
+async def test_workshop_target_is_carried_and_maps_need_wildcard(store):
+    await bind(store, "moderator")
+    await bind(store, "admin", "b" * 32, "Helper")
+    helper = {"draslId": "b" * 32, "name": "Helper"}
+    scoped = workshop_body(store, message="hi", target="arena")
+    response = await request(store, "POST", "/v2/workshop/message", scoped, "moderator")
+    assert response.status_code == 202, response.text
+    rows = await workshop_outbox(store, response.json()["operationId"])
+    assert rows[0]["payload"]["target"] == "arena"
+    maps = [{"draslId": "f" * 32, "name": "Stranger", "maps": ["arena"]}]
+    wide = workshop_body(store, members=maps, actor=helper)
+    response = await request(store, "POST", "/v2/workshop/members", wide, "admin")
+    assert response.status_code == 202, response.text
+    rows = await workshop_outbox(store, response.json()["operationId"])
+    assert rows[0]["payload"]["target"] == "*"
+    narrow = workshop_body(store, members=maps, target="arena", actor=helper)
+    response = await request(store, "POST", "/v2/workshop/members", narrow, "admin")
+    assert response.status_code == 422, response.text
+
+
+async def test_workshop_person_actor_must_be_bound(store):
+    body = workshop_body(store, message="hi")
+    response = await request(store, "POST", "/v2/workshop/message", body, "moderator")
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "workshop_actor_unbound"
+    await bind(store, "moderator")
+    forged = workshop_body(
+        store, message="hi", actor={"draslId": "f" * 32, "name": "Stranger"}
+    )
+    response = await request(store, "POST", "/v2/workshop/message", forged, "moderator")
+    assert response.status_code == 403, response.text
+    derived = workshop_body(store, message="hi", actor=None)
+    response = await request(
+        store, "POST", "/v2/workshop/message", derived, "moderator"
+    )
+    assert response.status_code == 202, response.text
+    rows = await workshop_outbox(store, response.json()["operationId"])
+    assert rows[0]["payload"]["actor"] == WORKSHOP_ACTOR
+
+
+async def test_workshop_service_act_scope(store):
+    site = await provision(
+        store["admin"],
+        {
+            "client": {"id": "site", "via": "game", "ceiling": ["workshop.act"]},
+            "ceiling": ["workshop.act"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    store["tokens"]["site"] = site
+    body = workshop_body(store, message="hi")
+    response = await request(store, "POST", "/v2/workshop/message", body, "site")
+    assert response.status_code == 202, response.text
+    rows = await sql(
+        store,
+        "SELECT detail FROM audit_events WHERE action=%s ORDER BY sequence DESC LIMIT 1",
+        ("workshop.message",),
+    )
+    assert rows[0]["detail"]["workshopActor"] == WORKSHOP_ACTOR
+    assert rows[0]["detail"]["principal"]["client"] == "site"
+    assert rows[0]["detail"]["principal"]["account"] is None
+    agent = workshop_body(store, message="hi")
+    response = await request(store, "POST", "/v2/workshop/message", agent, "game-agent")
+    assert response.status_code == 403, response.text
+    anonymous = workshop_body(store, message="hi", actor=None)
+    response = await request(store, "POST", "/v2/workshop/message", anonymous, "site")
+    assert response.status_code == 422, response.text
+
+
+async def test_workshop_admin_members_need_owner_step_up(store):
+    await bind(store, "admin")
+    await bind(store, "owner", "b" * 32, "Helper")
+    admins = [dict(WORKSHOP_ACTOR, role="admin")]
+    denied = workshop_body(store, members=admins)
+    response = await request(store, "POST", "/v2/workshop/members", denied, "admin")
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "owner_approval_required"
+    builders = workshop_body(store, members=[{"draslId": "f" * 32, "name": "Stranger"}])
+    response = await request(store, "POST", "/v2/workshop/members", builders, "admin")
+    assert response.status_code == 202, response.text
+    body = workshop_body(
+        store, members=admins, actor={"draslId": "b" * 32, "name": "Helper"}
+    )
+    proof = await assertion(store, "POST", "/v2/workshop/members", body)
+    response = await request(
+        store, "POST", "/v2/workshop/members", body, "owner", proof
+    )
+    assert response.status_code == 202, response.text
+    rows = await workshop_outbox(store, response.json()["operationId"])
+    assert rows[0]["payload"]["members"] == admins
+    site = await provision(
+        store["admin"],
+        {
+            "client": {"id": "site-stepup", "via": "game", "ceiling": ["workshop.act"]},
+            "ceiling": ["workshop.act"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    store["tokens"]["site-stepup"] = site
+    service = workshop_body(store, members=admins)
+    response = await request(
+        store, "POST", "/v2/workshop/members", service, "site-stepup"
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "owner_approval_required"

@@ -478,7 +478,14 @@ def create_app(dsn=None):
         response_model=models.OperationReceipt,
     )
     async def workshop(kind: str, body: models.WorkshopAction, request: Request):
-        return await write(request, core.workshop_op, kind, body)
+        return await write(
+            request,
+            core.workshop_op,
+            kind,
+            body,
+            assertion(request),
+            request.url.path,
+        )
 
     @app.post("/v2/delegations", status_code=201)
     async def delegation(body: models.Delegation, request: Request):

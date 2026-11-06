@@ -61,7 +61,7 @@ class WorkshopAction(Mutation):
     consumerId: str = Field(min_length=1, max_length=128)
     generation: ID
     target: str = Field(default="*", min_length=1, max_length=128)
-    actor: dict
+    actor: dict | None = None
     members: list | None = None
     message: str | None = None
     release: str | None = None

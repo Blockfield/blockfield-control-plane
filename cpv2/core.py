@@ -593,8 +593,10 @@ async def read_operation(conn, identity, op_id):
 # Workshop operations: the CP-side producer for the op kinds the Workshop
 # subscriber applies (members/message/wake/cancel plus release.select).
 # Payloads are exactly what the Workshop apply_cp_operation/apply_cp_releases
-# consume; enqueue() stores digest(payload) as the frame payload hash, the
-# same canonical JSON the Workshop verifies (sort_keys, compact separators).
+# consume, plus the authorized target so the consumer can check an operation
+# is addressed to itself; enqueue() stores digest(payload) as the frame
+# payload hash, the same canonical JSON the Workshop verifies (sort_keys,
+# compact separators).
 WORKSHOP_SCOPES = {
     "members": "workshop.members",
     "message": "workshop.message",
@@ -661,11 +663,52 @@ def _workshop_message(value):
     return value
 
 
-async def workshop_op(conn, identity, attempt, kind, model):
+async def _workshop_caller(conn, identity, actor):
+    # Caller attribution is bound, never caller-supplied. A person session
+    # must have exactly one drasl-issuer account_identities row (verified
+    # Drasl linking itself belongs to step 3); the payload actor is derived
+    # from it and a mismatched supplied actor is rejected. A service
+    # principal (site/bot acting for a human over an API-only plane) may
+    # supply the actor only with the offline-provisioned workshop.act scope.
+    if identity.account is None:
+        if actor is None:
+            raise Problem("invalid_workshop_actor", 422)
+        return _workshop_identity(actor)
+    if actor is not None:
+        _workshop_identity(actor)
+    bound = await rows(
+        conn,
+        "SELECT player_id, current_name FROM account_identities WHERE account_id=%s",
+        (identity.actor,),
+    )
+    if len(bound) != 1:
+        raise Problem("workshop_actor_unbound", 403)
+    try:
+        expected = _workshop_identity(
+            {
+                "draslId": str(bound[0]["player_id"]).replace("-", ""),
+                "name": bound[0]["current_name"],
+            }
+        )
+    except Problem:
+        raise Problem("workshop_actor_unbound", 403) from None
+    if actor is not None and _workshop_identity(actor) != expected:
+        raise Problem("forbidden")
+    return expected
+
+
+async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path=""):
     if kind not in WORKSHOP_SCOPES:
         raise Problem("unknown_action", 404)
-    scope = WORKSHOP_SCOPES[kind]
-    identity.require(scope, model.environment, model.backend, model.target)
+    data = model.model_dump(mode="json")
+    if identity.account is None:
+        identity.require("workshop.act", model.environment, model.backend, model.target)
+        scope = "workshop.act"
+    else:
+        identity.require(
+            WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target
+        )
+        scope = WORKSHOP_SCOPES[kind]
     if kind == "members":
         entries = model.members
         if (
@@ -673,19 +716,17 @@ async def workshop_op(conn, identity, attempt, kind, model):
             or not 1 <= len(entries) <= WORKSHOP_MEMBERS_LIMIT
         ):
             raise Problem("invalid_workshop_members", 422)
-        payload = {
-            "kind": "members",
-            "grantor": _workshop_identity(model.actor),
-            "members": [_workshop_member(entry) for entry in entries],
-        }
+        members = [_workshop_member(entry) for entry in entries]
+        if model.target != "*" and any(entry.get("maps") for entry in members):
+            # Map ids are outside any scoped grant: scoped issuers cannot
+            # attest them. The consumer enforces the same rule on target.
+            raise Problem("invalid_workshop_members", 422)
+        partial, key = {"members": members}, "grantor"
     elif kind == "message":
-        payload = {
-            "kind": "message",
-            "actor": _workshop_identity(model.actor),
-            "message": _workshop_message(model.message),
-        }
+        partial = {"message": _workshop_message(model.message)}
+        key = "actor"
     elif kind in ("wake", "cancel"):
-        payload = {"kind": kind, "actor": _workshop_identity(model.actor)}
+        partial, key = {}, "actor"
     else:
         release = model.release
         if not isinstance(release, str) or WORKSHOP_RELEASE.fullmatch(release) is None:
@@ -695,20 +736,19 @@ async def workshop_op(conn, identity, attempt, kind, model):
             not isinstance(record, dict) or record.get("release") != release
         ):
             raise Problem("invalid_workshop_record", 422)
-        payload = {
-            "kind": "release.select",
-            "actor": _workshop_identity(model.actor),
-            "release": release,
-        }
+        partial = {"release": release}
         if record is not None:
             # Full provenance is verified consumer-side against its catalog.
-            payload["record"] = record
+            partial["record"] = record
+        key = "actor"
+    caller = await _workshop_caller(conn, identity, model.actor)
+    payload = {"kind": kind, "target": model.target, key: caller, **partial}
     op, duplicate = await operation(
         conn,
         identity,
         f"workshop.{kind}",
         model.target,
-        model.model_dump(mode="json"),
+        data,
         scope,
         model.expiresInSeconds,
         model.generation,
@@ -724,7 +764,7 @@ async def workshop_op(conn, identity, attempt, kind, model):
         or consumer["environment"] != model.environment
         or consumer["backend"] != model.backend
         or not covers(consumer["resource"], model.target)
-        or scope not in consumer["capabilities"]
+        or WORKSHOP_SCOPES[kind] not in consumer["capabilities"]
     ):
         raise Problem("consumer_generation_or_capability", 409)
     unsettled = await one(
@@ -743,5 +783,23 @@ async def workshop_op(conn, identity, attempt, kind, model):
         or unsettled["n"] >= 128
     ):
         raise Problem("consumer_lag", 409)
+    if kind == "members" and any(entry.get("role") == "admin" for entry in members):
+        # Same owner step-up as grant_change: neither a non-owner admin nor
+        # a service principal can mint Workshop admins without it.
+        await step_up(conn, identity, assertion, "POST", path, data)
     await enqueue(conn, op, [consumer], payload)
-    return await finish(conn, attempt, identity, op, {"payloadHash": digest(payload)})
+    return await finish(
+        conn,
+        attempt,
+        identity,
+        op,
+        {
+            "payloadHash": digest(payload),
+            "workshopActor": caller,
+            "principal": {
+                "credential": str(identity.credential["id"]),
+                "account": str(identity.actor) if identity.actor else None,
+                "client": identity.client["id"],
+            },
+        },
+    )
