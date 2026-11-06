@@ -3639,3 +3639,229 @@ async def test_ai_limits_budget_is_owner_only(store):
     assert (
         await request(store, "PATCH", path, body, "owner", proof)
     ).status_code == 202
+
+
+STAFF_SERVICE_SCOPES = ("staff.read", "staff.lower.manage", "staff.admin.manage")
+
+
+async def _site(store):
+    if "site" not in store["tokens"]:
+        store["tokens"]["site"] = await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "site",
+                    "via": "cli",
+                    "ceiling": sorted(STAFF_SERVICE_SCOPES),
+                },
+                "ceiling": sorted(STAFF_SERVICE_SCOPES),
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+    return store["tokens"]["site"]
+
+
+async def _second_staff_admin(store):
+    second = uuid4()
+    store["accounts"]["second-admin"] = second
+    store["tokens"]["second-admin"] = await provision(
+        store["admin"],
+        {
+            "accountId": str(second),
+            "displayName": "second",
+            "client": {
+                "id": "second-admin",
+                "via": "cli",
+                "human": True,
+                "ceiling": sorted(OWNER_SCOPES),
+            },
+            "ceiling": sorted(OWNER_SCOPES),
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "grants": [
+                {
+                    "role": "admin",
+                    "environment": "prod",
+                    "backend": "game",
+                    "resource": "*",
+                    "grantor": str(store["accounts"]["owner"]),
+                }
+            ],
+        },
+    )
+    return second
+
+
+def _grant(key, account, role, actor=None, revoke=False):
+    body = {
+        "idempotencyKey": key,
+        "expectedRevision": 1,
+        "accountId": str(account),
+        "role": role,
+        "resource": "*",
+        "revoke": revoke,
+    }
+    if actor is not None:
+        body["actorAccountId"] = str(actor)
+    return body
+
+
+async def test_staff_service_roster_read_ok(store):
+    await _site(store)
+    target = store["accounts"]["admin"]
+    response = await request(
+        store, "GET", f"/v2/staff/grants?accountId={target}", None, "site"
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["accountId"] == str(target)
+    epoch = (
+        await sql(
+            store,
+            "SELECT authorization_epoch AS e FROM accounts WHERE id=%s",
+            (target,),
+        )
+    )[0]["e"]
+    assert data["expectedRevision"] == epoch
+    assert all(
+        {"role", "environment", "backend", "resource", "revision"} <= set(g)
+        for g in data["grants"]
+    ), data["grants"]
+    assert any(
+        g["role"] == "admin"
+        and g["environment"] == "prod"
+        and g["backend"] == "game"
+        and g["resource"] == "*"
+        for g in data["grants"]
+    ), data["grants"]
+    missing = await request(
+        store, "GET", f"/v2/staff/grants?accountId={uuid4()}", None, "site"
+    )
+    assert missing.status_code == 404
+    assert missing.json()["error"] == "account_not_found"
+
+
+async def test_staff_service_roster_read_forbidden_for_non_service(store):
+    await _site(store)
+    narrow = await provision(
+        store["admin"],
+        {
+            "client": {"id": "narrow", "via": "game", "ceiling": ["gate:read"]},
+            "ceiling": ["gate:read"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    store["tokens"]["narrow"] = narrow
+    # Fixture consumer agents hold every service scope by construction, so the
+    # negative service case uses a narrowly provisioned credential instead.
+    path = f"/v2/staff/grants?accountId={store['accounts']['admin']}"
+    for role in ("admin", "ordinary", "narrow"):
+        response = await request(store, "GET", path, None, role)
+        assert response.status_code == 403, (role, response.text)
+
+
+async def test_staff_service_grant_actor_peer_and_missing_actor(store):
+    await _site(store)
+    second = await _second_staff_admin(store)
+    admin = store["accounts"]["admin"]
+    peer = await request(
+        store,
+        "POST",
+        "/v2/staff/grants",
+        # Lower-role change on an admin target: the peer rule fires for the
+        # asserted actor exactly like a direct non-owner admin call.
+        _grant("peer", second, "builder", actor=admin, revoke=True),
+        "site",
+    )
+    assert peer.status_code == 403 and peer.json()["error"] == "peer_role_edit", (
+        peer.text
+    )
+    for key, role, revoke in (
+        ("no-actor-grant", "admin", False),
+        ("no-actor-revoke", "admin", True),
+        ("no-actor-lower", "builder", False),
+    ):
+        denied = await request(
+            store,
+            "POST",
+            "/v2/staff/grants",
+            _grant(
+                key,
+                second if role == "admin" else store["accounts"]["ordinary"],
+                role,
+                revoke=revoke,
+            ),
+            "site",
+        )
+        assert denied.status_code == 403
+        assert denied.json()["error"] == "service_actor_required", denied.text
+
+
+async def test_staff_service_grant_actor_applies_and_audits(store):
+    await _site(store)
+    admin = store["accounts"]["admin"]
+    ordinary, other = store["accounts"]["ordinary"], store["accounts"]["other"]
+    response = await request(
+        store,
+        "POST",
+        "/v2/staff/grants",
+        _grant("svc-grant", ordinary, "moderator", actor=admin),
+        "site",
+    )
+    assert response.status_code == 202, response.text
+    receipt = response.json()
+    assert receipt["result"]["authorizationEpoch"] == 2
+    operation = (
+        await sql(
+            store,
+            "SELECT account_id FROM operations WHERE id=%s",
+            (receipt["operationId"],),
+        )
+    )[0]
+    assert operation["account_id"] == admin
+    live = await sql(
+        store,
+        "SELECT grantor, role FROM role_grants WHERE account_id=%s AND revoked_at IS NULL",
+        (ordinary,),
+    )
+    assert any(g["grantor"] == admin and g["role"] == "moderator" for g in live)
+    audits = await sql(
+        store,
+        "SELECT actor FROM audit_events WHERE operation_id=%s",
+        (receipt["operationId"],),
+    )
+    assert audits and all(a["actor"] == admin for a in audits), audits
+    # An actor without staff authority cannot grant through the service.
+    powerless = await request(
+        store,
+        "POST",
+        "/v2/staff/grants",
+        _grant("svc-powerless", other, "builder", actor=ordinary),
+        "site",
+    )
+    assert powerless.status_code == 403, powerless.text
+    # The service cannot assert the target as its own actor.
+    selfish = await request(
+        store,
+        "POST",
+        "/v2/staff/grants",
+        _grant("svc-self", admin, "builder", actor=admin),
+        "site",
+    )
+    assert selfish.status_code == 403
+    assert selfish.json()["error"] == "self_role_edit", selfish.text
+    # Direct callers never supply the actor: it is authenticated, not asserted.
+    forged = await request(
+        store,
+        "POST",
+        "/v2/staff/grants",
+        _grant("human-actor", other, "builder", actor=admin),
+        "admin",
+    )
+    assert forged.status_code == 403
+    assert forged.json()["error"] == "actor_forbidden", forged.text

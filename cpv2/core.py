@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from cpv2.auth import (
     ROLE_SCOPES,
+    Identity,
     Problem,
     audit,
     covers,
@@ -328,6 +329,39 @@ async def grant_change(conn, identity, attempt, model, assertion, path):
     env, backend, target = data["environment"], data["backend"], data["resource"]
     scope = "staff.admin.manage" if data["role"] == "admin" else "staff.lower.manage"
     identity.require(scope, env, backend, target)
+    if identity.credential["kind"] == "service":
+        # The site principal asserts the logged-in human; the same peer and
+        # owner step-up rules below then evaluate that actor like a direct
+        # call. role_grants.grantor is NOT NULL, so an actor is always required.
+        if model.actorAccountId is None:
+            raise Problem("service_actor_required")
+        actor = await one(
+            conn, "SELECT * FROM accounts WHERE id=%s", (model.actorAccountId,)
+        )
+        if not actor:
+            raise Problem("account_not_found", 404)
+        if actor["is_test"] or actor["status"] != "active":
+            raise Problem("ineligible_account")
+        identity = Identity(
+            identity.credential,
+            identity.client,
+            actor,
+            await rows(
+                conn,
+                "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+                (actor["id"], now()),
+            ),
+            bool(
+                await one(
+                    conn,
+                    "SELECT 1 FROM owner_memberships WHERE account_id=%s",
+                    (actor["id"],),
+                )
+            ),
+        )
+        identity.require(scope, env, backend, target)
+    elif model.actorAccountId is not None:
+        raise Problem("actor_forbidden")
     if identity.actor == model.accountId:
         raise Problem("self_role_edit")
     op, duplicate = await operation(
