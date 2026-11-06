@@ -337,6 +337,10 @@ async def grant_change(conn, identity, attempt, model, assertion, path):
         # call. role_grants.grantor is NOT NULL, so an actor is always required.
         if model.actorAccountId is None:
             raise Problem("service_actor_required")
+        # Only the unbound site principal may assert an actor; a scoped
+        # consumer would otherwise act as any admin whose grant covers it.
+        if identity.credential["resource"] != "*":
+            raise Problem("actor_forbidden")
         actor = await one(
             conn, "SELECT * FROM accounts WHERE id=%s", (model.actorAccountId,)
         )

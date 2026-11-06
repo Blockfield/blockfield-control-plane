@@ -4031,6 +4031,27 @@ async def _site(store):
     return store["tokens"]["site"]
 
 
+async def test_staff_scopes_only_on_unbound_site_credential(store):
+    # A resource-bound consumer holding staff scopes could assert any admin
+    # whose grant covers its resource as the acting account.
+    assert not set(STAFF_SERVICE_SCOPES) & SERVICE_SCOPES
+    with pytest.raises(ValueError, match="unbound site credential"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "arena-staff",
+                    "via": "game",
+                    "ceiling": ["staff.lower.manage"],
+                },
+                "ceiling": ["staff.lower.manage"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "arena",
+            },
+        )
+
+
 async def _second_staff_admin(store):
     second = uuid4()
     store["accounts"]["second-admin"] = second

@@ -21,6 +21,7 @@ from cpv2.auth import (
     OWNER_SCOPES,
     ROLE_SCOPES,
     SERVICE_SCOPES,
+    STAFF_SCOPES,
     invalidate,
     now,
     verifier,
@@ -170,9 +171,15 @@ async def provision(dsn, spec, bearer_sink=None):
                 )
         else:
             epoch = None
-            if set(spec["ceiling"]) - SERVICE_SCOPES or client.get("human"):
+            if set(spec["ceiling"]) - (SERVICE_SCOPES | STAFF_SCOPES) or client.get(
+                "human"
+            ):
                 raise ValueError("service credential ceiling")
-        if set(spec["ceiling"]) - (OWNER_SCOPES if account_id else SERVICE_SCOPES):
+            if STAFF_SCOPES & set(spec["ceiling"]) and spec["resource"] != "*":
+                raise ValueError("staff scopes need an unbound site credential")
+        if set(spec["ceiling"]) - (
+            OWNER_SCOPES if account_id else SERVICE_SCOPES | STAFF_SCOPES
+        ):
             raise ValueError("unknown scope")
         ttl = spec.get("expiresInSeconds", 3600)
         if type(ttl) is not int or not 1 <= ttl <= 86400:
