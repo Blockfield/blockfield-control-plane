@@ -3639,3 +3639,78 @@ async def test_ai_limits_budget_is_owner_only(store):
     assert (
         await request(store, "PATCH", path, body, "owner", proof)
     ).status_code == 202
+
+
+async def test_settings_patch_null_deletes_rollback_restores_and_replays(store):
+    path = "/v2/settings/kits/arena"
+    seed = patch(
+        "seed",
+        0,
+        {
+            "kits": {"alpha": {"name": "a"}, "beta": {"name": "b"}},
+            "fixedModeKits": {"campaign": "alpha"},
+        },
+    )
+    assert (await request(store, "PATCH", path, seed)).status_code == 202
+    delete = patch("del-beta", 1, {"kits": {"beta": None}})
+    response = await request(store, "PATCH", path, delete)
+    assert response.status_code == 202, response.text
+    value = (await request(store, "GET", path)).json()
+    assert value["revision"] == 2
+    assert set(value["value"]["kits"]) == {"alpha"}
+    # Idempotent replay returns the same receipt without a new revision.
+    replay = await request(store, "PATCH", path, delete)
+    assert replay.status_code == 202
+    assert replay.json() == response.json()
+    assert (await request(store, "GET", path)).json()["revision"] == 2
+    # Null stays a value under fixedModeKits ("kit id or null").
+    clear = patch("clear-fixed", 2, {"fixedModeKits": {"campaign": None}})
+    assert (await request(store, "PATCH", path, clear)).status_code == 202
+    value = (await request(store, "GET", path)).json()
+    assert value["value"]["fixedModeKits"] == {"campaign": None}
+    # Rollback to revision 1 restores the deleted kit.
+    rollback = {"idempotencyKey": "rollback", "expectedRevision": 3, "revision": 1}
+    response = await request(store, "POST", path + "/rollback", rollback)
+    assert response.status_code == 202, response.text
+    value = (await request(store, "GET", path)).json()
+    assert set(value["value"]["kits"]) == {"alpha", "beta"}
+
+
+async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
+    path = "/v2/settings/campaign/arena"
+    seed = patch(
+        "camp-seed",
+        0,
+        {
+            "campaignBalance": {
+                "c1": {"max_tickets": 100, "score_per_kill": 5},
+                "gone": {"max_tickets": 10},
+            }
+        },
+    )
+    assert (await request(store, "PATCH", path, seed)).status_code == 202
+    # Nested delete removes one key inside a campaign entry.
+    nested = patch(
+        "camp-nested", 1, {"campaignBalance": {"c1": {"score_per_kill": None}}}
+    )
+    assert (await request(store, "PATCH", path, nested)).status_code == 202
+    value = (await request(store, "GET", path)).json()["value"]
+    assert value["campaignBalance"] == {
+        "c1": {"max_tickets": 100},
+        "gone": {"max_tickets": 10},
+    }
+    # Whole-dict reset empties the namespace.
+    reset = patch("camp-reset", 2, {"campaignBalance": None})
+    assert (await request(store, "PATCH", path, reset)).status_code == 202
+    assert (await request(store, "GET", path)).json()["value"] == {
+        "campaignBalance": {}
+    }
+    # Delete that breaks an invariant is rejected: budget above a deleted hardLimit.
+    gpath = "/v2/settings/gameplay/arena"
+    first = patch("g-seed", 0, {"ai": {"budget": 200, "hardLimit": 300}})
+    proof = await assertion(store, "PATCH", gpath, first)
+    assert (
+        await request(store, "PATCH", gpath, first, "owner", proof)
+    ).status_code == 202
+    bad = patch("g-bad", 1, {"ai": {"hardLimit": None}})
+    assert (await request(store, "PATCH", gpath, bad, "owner")).status_code == 422
