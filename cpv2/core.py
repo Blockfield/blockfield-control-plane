@@ -1,4 +1,6 @@
+import re
 import secrets
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -586,3 +588,160 @@ async def read_operation(conn, identity, op_id):
     result["receipts"] = receipts
     result["deadline"] = op["deadline"]
     return result
+
+
+# Workshop operations: the CP-side producer for the op kinds the Workshop
+# subscriber applies (members/message/wake/cancel plus release.select).
+# Payloads are exactly what the Workshop apply_cp_operation/apply_cp_releases
+# consume; enqueue() stores digest(payload) as the frame payload hash, the
+# same canonical JSON the Workshop verifies (sort_keys, compact separators).
+WORKSHOP_SCOPES = {
+    "members": "workshop.members",
+    "message": "workshop.message",
+    "wake": "workshop.wake",
+    "cancel": "workshop.cancel",
+    "release.select": "workshop.release.select",
+}
+WORKSHOP_NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
+WORKSHOP_ROLES = ("builder", "lead", "admin")
+WORKSHOP_RELEASE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
+# Same advisory bound the Workshop applies to snapshot release records.
+WORKSHOP_MEMBERS_LIMIT = 256
+
+
+def _workshop_identity(value):
+    # Workshop actor: draslId normalizes like the consumer member(), the name
+    # follows the same 3-16 [A-Za-z0-9_] rule. Extra keys are dropped: the
+    # consumer overrides role itself and rejects anything else.
+    if not isinstance(value, dict):
+        raise Problem("invalid_workshop_actor", 422)
+    drasl = value.get("draslId")
+    if not isinstance(drasl, str):
+        raise Problem("invalid_workshop_actor", 422)
+    normalized = drasl.replace("-", "").lower()
+    if len(normalized) != 32 or any(c not in "0123456789abcdef" for c in normalized):
+        raise Problem("invalid_workshop_actor", 422)
+    name = value.get("name")
+    if not isinstance(name, str) or WORKSHOP_NAME.fullmatch(name) is None:
+        raise Problem("invalid_workshop_actor", 422)
+    return {"draslId": normalized, "name": name}
+
+
+def _workshop_member(value):
+    if not isinstance(value, dict) or set(value) - {
+        "draslId",
+        "name",
+        "role",
+        "maps",
+    }:
+        raise Problem("invalid_workshop_members", 422)
+    entry = _workshop_identity(value)
+    role = value.get("role", "builder")
+    if role not in WORKSHOP_ROLES:
+        raise Problem("invalid_workshop_members", 422)
+    if role != "builder":
+        entry["role"] = role
+    maps = value.get("maps")
+    if maps is not None:
+        if not isinstance(maps, list) or any(
+            not isinstance(item, str) for item in maps
+        ):
+            raise Problem("invalid_workshop_members", 422)
+        entry["maps"] = list(maps)
+    return entry
+
+
+def _workshop_message(value):
+    # Same wire rule the Workshop enforces: at most 200 chars, no control
+    # characters or section signs. Empty text removes the override there.
+    if not isinstance(value, str) or len(value) > 200:
+        raise Problem("invalid_workshop_message", 422)
+    if "§" in value or any(unicodedata.category(char) == "Cc" for char in value):
+        raise Problem("invalid_workshop_message", 422)
+    return value
+
+
+async def workshop_op(conn, identity, attempt, kind, model):
+    if kind not in WORKSHOP_SCOPES:
+        raise Problem("unknown_action", 404)
+    scope = WORKSHOP_SCOPES[kind]
+    identity.require(scope, model.environment, model.backend, model.target)
+    if kind == "members":
+        entries = model.members
+        if (
+            not isinstance(entries, list)
+            or not 1 <= len(entries) <= WORKSHOP_MEMBERS_LIMIT
+        ):
+            raise Problem("invalid_workshop_members", 422)
+        payload = {
+            "kind": "members",
+            "grantor": _workshop_identity(model.actor),
+            "members": [_workshop_member(entry) for entry in entries],
+        }
+    elif kind == "message":
+        payload = {
+            "kind": "message",
+            "actor": _workshop_identity(model.actor),
+            "message": _workshop_message(model.message),
+        }
+    elif kind in ("wake", "cancel"):
+        payload = {"kind": kind, "actor": _workshop_identity(model.actor)}
+    else:
+        release = model.release
+        if not isinstance(release, str) or WORKSHOP_RELEASE.fullmatch(release) is None:
+            raise Problem("invalid_workshop_release", 422)
+        record = model.record
+        if record is not None and (
+            not isinstance(record, dict) or record.get("release") != release
+        ):
+            raise Problem("invalid_workshop_record", 422)
+        payload = {
+            "kind": "release.select",
+            "actor": _workshop_identity(model.actor),
+            "release": release,
+        }
+        if record is not None:
+            # Full provenance is verified consumer-side against its catalog.
+            payload["record"] = record
+    op, duplicate = await operation(
+        conn,
+        identity,
+        f"workshop.{kind}",
+        model.target,
+        model.model_dump(mode="json"),
+        scope,
+        model.expiresInSeconds,
+        model.generation,
+    )
+    if duplicate:
+        return receipt(op)
+    consumer = await one(
+        conn, "SELECT * FROM consumers WHERE id=%s FOR UPDATE", (model.consumerId,)
+    )
+    if (
+        not consumer
+        or consumer["generation"] != model.generation
+        or consumer["environment"] != model.environment
+        or consumer["backend"] != model.backend
+        or not covers(consumer["resource"], model.target)
+        or scope not in consumer["capabilities"]
+    ):
+        raise Problem("consumer_generation_or_capability", 409)
+    unsettled = await one(
+        conn,
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id "
+        "WHERE o.consumer_id=%s AND p.kind IN "
+        "('workshop.members','workshop.message','workshop.wake','workshop.cancel',"
+        "'workshop.release.select') AND p.deadline>now() AND NOT EXISTS(SELECT 1 "
+        "FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND "
+        "a.sequence=o.sequence AND a.state IN "
+        "('effective','rejected','unknown'))",
+        (model.consumerId,),
+    )
+    if (
+        consumer["next_sequence"] - consumer["received_cursor"] > 128
+        or unsettled["n"] >= 128
+    ):
+        raise Problem("consumer_lag", 409)
+    await enqueue(conn, op, [consumer], payload)
+    return await finish(conn, attempt, identity, op, {"payloadHash": digest(payload)})

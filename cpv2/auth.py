@@ -13,9 +13,17 @@ from cpv2.db import one, record, rows
 from cpv2.settings import digest
 
 AUDIENCE = "blockfield-control-v2"
+WORKSHOP_WRITE_SCOPES = {"workshop.message", "workshop.wake", "workshop.cancel"}
+WORKSHOP_ADMIN_SCOPES = {"workshop.members", "workshop.release.select"}
 ROLE_SCOPES = {
     "builder": {"settings.read", "operations.read", "maps.edit"},
-    "moderator": {"settings.read", "operations.read", "maps.edit", "moderation.kick"},
+    "moderator": {
+        "settings.read",
+        "operations.read",
+        "maps.edit",
+        "moderation.kick",
+        *WORKSHOP_WRITE_SCOPES,
+    },
     "admin": {
         "settings.read",
         "operations.read",
@@ -25,6 +33,8 @@ ROLE_SCOPES = {
         "settings.gameplay.write",
         "staff.lower.manage",
         "audit.read",
+        *WORKSHOP_WRITE_SCOPES,
+        *WORKSHOP_ADMIN_SCOPES,
     },
 }
 OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {

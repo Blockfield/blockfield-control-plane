@@ -150,7 +150,18 @@ async def store(postgres):
                         "settings.gate",
                         "moderation.kick",
                         "moderation.ban",
-                    ],
+                    ]
+                    + (
+                        [
+                            "workshop.members",
+                            "workshop.message",
+                            "workshop.wake",
+                            "workshop.cancel",
+                            "workshop.release.select",
+                        ]
+                        if consumer == "workshop"
+                        else []
+                    ),
                 },
             },
         )
@@ -3575,3 +3586,207 @@ async def test_c19_both_scopes_rechecked_at_delivery(store):
             "settings.protected.write",
         }, op["required_scope"]
         assert await delivery.valid_operation(conn, op) == "rejected"
+
+
+WORKSHOP_ACTOR = {"draslId": "e10438e4797b49718cfecec6a8fa171b", "name": "Nether"}
+
+
+def workshop_body(store, **overrides):
+    body = {
+        "idempotencyKey": "ws-" + uuid4().hex,
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "workshop",
+        "generation": str(store["generation"]),
+        "target": "*",
+        "actor": dict(WORKSHOP_ACTOR),
+        "expiresInSeconds": 60,
+    }
+    body.update(overrides)
+    return body
+
+
+async def workshop_outbox(store, operation_id):
+    return await sql(
+        store,
+        "SELECT payload, payload_hash FROM outbox WHERE operation_id=%s",
+        (operation_id,),
+    )
+
+
+async def test_workshop_message_producer_round_trip(store):
+    body = workshop_body(store, message="hi")
+    response = await request(store, "POST", "/v2/workshop/message", body, "moderator")
+    assert response.status_code == 202, response.text
+    rows = await workshop_outbox(store, response.json()["operationId"])
+    assert len(rows) == 1
+    payload = rows[0]["payload"]
+    assert payload == {"kind": "message", "actor": WORKSHOP_ACTOR, "message": "hi"}
+    # Same canonical JSON the Workshop cp_client verifies its frames with.
+    expected = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    assert rows[0]["payload_hash"] == expected
+    frames = await envelopes(store, cid="workshop")
+    assert frames[-1]["payloadHash"] == expected
+    assert frames[-1]["payload"] == payload
+
+
+async def test_workshop_kinds_produce_exact_consumer_payloads(store):
+    admin_entries = [
+        dict(WORKSHOP_ACTOR, role="admin"),
+        {"draslId": "f" * 32, "name": "Stranger", "role": "lead"},
+    ]
+    cases = [
+        (
+            "members",
+            {"members": admin_entries},
+            {"kind": "members", "grantor": WORKSHOP_ACTOR, "members": admin_entries},
+        ),
+        (
+            "message",
+            {"message": "hello"},
+            {"kind": "message", "actor": WORKSHOP_ACTOR, "message": "hello"},
+        ),
+        ("wake", {}, {"kind": "wake", "actor": WORKSHOP_ACTOR}),
+        ("cancel", {}, {"kind": "cancel", "actor": WORKSHOP_ACTOR}),
+        (
+            "release.select",
+            {"release": "v9.0.0", "record": {"release": "v9.0.0"}},
+            {
+                "kind": "release.select",
+                "actor": WORKSHOP_ACTOR,
+                "release": "v9.0.0",
+                "record": {"release": "v9.0.0"},
+            },
+        ),
+    ]
+    for kind, fields, payload in cases:
+        response = await request(
+            store,
+            "POST",
+            f"/v2/workshop/{kind}",
+            workshop_body(store, **fields),
+            "admin",
+        )
+        assert response.status_code == 202, (kind, response.text)
+        rows = await workshop_outbox(store, response.json()["operationId"])
+        assert len(rows) == 1, kind
+        assert rows[0]["payload"] == payload, kind
+
+
+async def test_workshop_invalid_operations_rejected(store):
+    cases = [
+        ("message", {"actor": {"draslId": "zz", "name": "Nether"}}, "moderator"),
+        (
+            "message",
+            {"actor": {"draslId": WORKSHOP_ACTOR["draslId"], "name": "x"}},
+            "moderator",
+        ),
+        ("message", {"message": "x" * 201}, "moderator"),
+        ("message", {"message": "hi §4there"}, "moderator"),
+        ("message", {"message": None}, "moderator"),
+        ("members", {"members": "nope"}, "admin"),
+        ("members", {"members": []}, "admin"),
+        (
+            "members",
+            {"members": [{"draslId": "f" * 32, "name": "S", "role": "x"}]},
+            "admin",
+        ),
+        (
+            "members",
+            {"members": [{"draslId": "f" * 32, "name": "Stranger", "extra": 1}]},
+            "admin",
+        ),
+        ("wake", {"actor": {"draslId": WORKSHOP_ACTOR["draslId"]}}, "moderator"),
+        ("release.select", {"release": "9.0.0"}, "admin"),
+        (
+            "release.select",
+            {"release": "v9.0.0", "record": {"release": "v9.0.1"}},
+            "admin",
+        ),
+    ]
+    for kind, fields, role in cases:
+        body = workshop_body(store, **fields)
+        response = await request(store, "POST", f"/v2/workshop/{kind}", body, role)
+        assert response.status_code == 422, (kind, fields, response.text)
+
+
+async def test_workshop_unknown_kind_rejected(store):
+    response = await request(
+        store, "POST", "/v2/workshop/map-create", workshop_body(store), "admin"
+    )
+    assert response.status_code == 404
+
+
+async def test_workshop_rbac_mirrors_moderation_split(store):
+    # Builders cannot issue; moderators handle member-level ops only.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/workshop/message",
+            workshop_body(store, message="hi"),
+            "builder",
+        )
+    ).status_code == 403
+    for kind, fields in (
+        ("members", {"members": [dict(WORKSHOP_ACTOR, role="admin")]}),
+        ("release.select", {"release": "v9.0.0"}),
+    ):
+        assert (
+            await request(
+                store,
+                "POST",
+                f"/v2/workshop/{kind}",
+                workshop_body(store, **fields),
+                "moderator",
+            )
+        ).status_code == 403
+    for kind, fields in (
+        ("message", {"message": "hi"}),
+        ("wake", {}),
+        ("cancel", {}),
+    ):
+        response = await request(
+            store,
+            "POST",
+            f"/v2/workshop/{kind}",
+            workshop_body(store, **fields),
+            "moderator",
+        )
+        assert response.status_code == 202, (kind, response.text)
+    for kind, fields in (
+        ("members", {"members": [dict(WORKSHOP_ACTOR, role="admin")]}),
+        ("release.select", {"release": "v9.0.0"}),
+    ):
+        response = await request(
+            store,
+            "POST",
+            f"/v2/workshop/{kind}",
+            workshop_body(store, **fields),
+            "admin",
+        )
+        assert response.status_code == 202, (kind, response.text)
+
+
+async def test_workshop_consumer_capability_and_generation_fenced(store):
+    body = workshop_body(store, message="hi", consumerId="game")
+    response = await request(store, "POST", "/v2/workshop/message", body, "moderator")
+    assert response.status_code == 409, response.text
+    body = workshop_body(store, message="hi", generation=str(uuid4()))
+    response = await request(store, "POST", "/v2/workshop/message", body, "moderator")
+    assert response.status_code == 409, response.text
+
+
+async def test_workshop_idempotent_retry_returns_same_operation(store):
+    body = workshop_body(store, message="hi")
+    first = await request(store, "POST", "/v2/workshop/message", body, "moderator")
+    assert first.status_code == 202, first.text
+    second = await request(store, "POST", "/v2/workshop/message", body, "moderator")
+    assert second.status_code == 202, second.text
+    assert second.json()["operationId"] == first.json()["operationId"]
+    rows = await workshop_outbox(store, first.json()["operationId"])
+    assert len(rows) == 1
