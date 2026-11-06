@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
@@ -61,7 +62,9 @@ class ProdChannelTest(unittest.TestCase):
             ),
             patch.object(deploy, "swarm_update", return_value=swarm),
             patch.object(urllib.request, "urlopen", side_effect=capture),
-            patch.dict(os.environ, {"DOKPLOY_CP_WEBHOOK": "https://dokploy.invalid/hook"}),
+            patch.dict(
+                os.environ, {"DOKPLOY_CP_WEBHOOK": "https://dokploy.invalid/hook"}
+            ),
         ):
             deploy.deploy(SERVICE, digest)
         return creates, webhooks, registry_digest
@@ -106,3 +109,112 @@ class ProdChannelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeployHistoryTest(unittest.TestCase):
+    """A finished rollout appends to the host deploy history and warms the previous digest."""
+
+    def run_finished_deploy(self, digest, previous, root):
+        pulled = []
+
+        def fake_docker(*args):
+            if args[:3] == ("buildx", "imagetools", "create"):
+                return ""
+            if args[:2] == ("pull", "--quiet"):
+                pulled.append(args[-1])
+                return ""
+            if args[:2] == ("image", "ls"):
+                return ""
+            raise AssertionError(f"unexpected docker call: {args}")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        with (
+            patch.object(deploy, "docker", side_effect=fake_docker),
+            patch.object(deploy, "registry_digest", return_value=digest),
+            patch.object(deploy, "current", return_value=previous),
+            patch.object(deploy, "runs", side_effect=[False, True, True]),
+            patch.object(
+                deploy,
+                "dokploy_log",
+                return_value=("p", "✅ pulled\nDigest: " + digest),
+            ),
+            patch.object(deploy, "swarm_update", return_value="completed"),
+            patch.object(
+                urllib.request,
+                "urlopen",
+                side_effect=lambda request, timeout=30: FakeResponse(),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DOKPLOY_CP_WEBHOOK": "https://dokploy.invalid/hook",
+                    "BLOCKFIELD_MINECRAFT_ROOT": str(root),
+                },
+            ),
+        ):
+            deploy.deploy(SERVICE, digest)
+        return pulled
+
+    def test_finished_rollout_records_history_and_warms_previous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pulled = self.run_finished_deploy(DIGEST, PREVIOUS, root)
+            entries = deploy.read_history(root / "deploy-history.jsonl")
+            self.assertEqual(len(entries), 1)
+            entry = entries[0]
+            self.assertEqual(entry["surface"], "control-plane")
+            self.assertEqual(
+                (entry["digest"], entry["previous_digest"]), (DIGEST, PREVIOUS)
+            )
+            self.assertEqual(pulled, [f"{IMAGE}@{PREVIOUS}"])
+
+    def test_without_host_root_nothing_recorded_or_pulled(self):
+        calls = []
+
+        def fake_docker(*args):
+            calls.append(args)
+            if args[:3] == ("buildx", "imagetools", "create"):
+                return ""
+            raise AssertionError(f"unexpected docker call: {args}")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        with (
+            patch.object(deploy, "docker", side_effect=fake_docker),
+            patch.object(deploy, "registry_digest", return_value=DIGEST),
+            patch.object(deploy, "runs", side_effect=[False, True, True]),
+            patch.object(
+                deploy,
+                "dokploy_log",
+                return_value=("p", "✅ pulled\nDigest: " + DIGEST),
+            ),
+            patch.object(deploy, "swarm_update", return_value="completed"),
+            patch.object(
+                urllib.request,
+                "urlopen",
+                side_effect=lambda request, timeout=30: FakeResponse(),
+            ),
+            patch.dict(
+                os.environ, {"DOKPLOY_CP_WEBHOOK": "https://dokploy.invalid/hook"}
+            ),
+        ):
+            os.environ.pop("BLOCKFIELD_MINECRAFT_ROOT", None)
+            deploy.deploy(SERVICE, DIGEST)
+        self.assertEqual([c for c in calls if c[0] in ("pull", "run", "image")], [])
