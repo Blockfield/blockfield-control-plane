@@ -179,6 +179,14 @@ def test_merge_patch_null_deletes_recursively():
         {"fixedModeKits": {"campaign": "alpha"}},
         {"fixedModeKits": {"campaign": None}},
     ) == {"fixedModeKits": {"campaign": None}}
+    # A missing or non-object target recurses from {}: nested nulls never persist.
+    assert merge(
+        {"campaignBalance": {}}, {"campaignBalance": {"c1": {"score_per_kill": None}}}
+    ) == {"campaignBalance": {"c1": {}}}
+    assert merge({"a": 1}, {"a": {"b": None, "c": 2}}) == {"a": {"c": 2}}
+    assert merge({}, {"fixedModeKits": {"tdm": None}}) == {
+        "fixedModeKits": {"tdm": None}
+    }
 
 
 def test_merge_delete_validates_like_any_change():

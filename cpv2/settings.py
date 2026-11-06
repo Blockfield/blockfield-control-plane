@@ -591,8 +591,12 @@ def merge(current, patch, _parent=None):
     for key, value in patch.items():
         if value is None and _parent not in _NULL_VALUED_PARENTS:
             result.pop(key, None)
-        elif isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = merge(result[key], value, _parent=key)
+        elif isinstance(value, dict):
+            # RFC 7396: a missing or non-object target merges from {}.
+            target = result.get(key)
+            result[key] = merge(
+                target if isinstance(target, dict) else {}, value, _parent=key
+            )
         else:
             result[key] = value
     return result
