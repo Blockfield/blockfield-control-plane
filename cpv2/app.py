@@ -507,8 +507,8 @@ def create_app(dsn=None):
                 raise Problem("account_not_found", 404)
             grants = await rows(
                 conn,
-                "SELECT role, environment, backend, resource, revision, expires_at FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now()) ORDER BY role, environment, backend, resource",
-                (accountId,),
+                "SELECT role, environment, backend, resource, revision, expires_at FROM role_grants WHERE account_id=%s AND environment=%s AND backend=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now()) ORDER BY role, environment, backend, resource",
+                (accountId, environment, backend),
             )
             await audit(
                 conn,

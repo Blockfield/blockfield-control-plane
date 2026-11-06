@@ -4133,6 +4133,50 @@ async def test_staff_service_roster_read_ok(store):
     assert missing.json()["error"] == "account_not_found"
 
 
+async def test_staff_service_roster_read_stays_in_its_scope(store):
+    # The access check covers prod/game only, so grants elsewhere stay hidden.
+    await _site(store)
+    target = uuid4()
+    await provision(
+        store["admin"],
+        {
+            "accountId": str(target),
+            "displayName": "qa-mod",
+            "client": {
+                "id": "qa-mod",
+                "via": "cli",
+                "human": True,
+                "ceiling": sorted(OWNER_SCOPES),
+            },
+            "ceiling": sorted(OWNER_SCOPES),
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "grants": [
+                {
+                    "role": "moderator",
+                    "environment": env,
+                    "backend": backend,
+                    "resource": "*",
+                    "grantor": str(store["accounts"]["owner"]),
+                }
+                for env, backend in (
+                    ("qa", "game"),
+                    ("prod", "workshop"),
+                    ("prod", "game"),
+                )
+            ],
+        },
+    )
+    response = await request(
+        store, "GET", f"/v2/staff/grants?accountId={target}", None, "site"
+    )
+    assert response.status_code == 200, response.text
+    assert {(g["environment"], g["backend"]) for g in response.json()["grants"]} == {
+        ("prod", "game")
+    }
+
+
 async def test_staff_service_roster_read_forbidden_for_non_service(store):
     await _site(store)
     narrow = await provision(
