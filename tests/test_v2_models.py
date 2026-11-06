@@ -144,3 +144,16 @@ def test_site_settings_namespaces_validate(namespace):
         model.model_validate(
             merge(model().model_dump(mode="json"), {"unknownField": True})
         )
+
+
+def test_ids_reject_trailing_newline_and_provider_extra_keys():
+    limits = AiLimits().model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        AiLimits.model_validate(merge(limits, {"sessions": {UUID + "\n": 1}}))
+    workshop = WorkshopAi().model_dump(mode="json")
+    entry = {"id": "my-llm", "label": "Mine", "baseUrl": "https://llm.example.com/v1"}
+    WorkshopAi.model_validate(merge(workshop, {"providers": [entry]}))
+    with pytest.raises(ValidationError):
+        WorkshopAi.model_validate(
+            merge(workshop, {"providers": [{**entry, "apiKey": "x"}]})
+        )

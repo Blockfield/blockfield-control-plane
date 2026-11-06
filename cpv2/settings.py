@@ -114,7 +114,7 @@ class ClassLocks(Strict):
             self.classLocks
         ):
             raise ValueError("classLocks: at most 64 distinct ids")
-        if any(not _CLASS_ID.match(entry) for entry in self.classLocks):
+        if any(not _CLASS_ID.fullmatch(entry) for entry in self.classLocks):
             raise ValueError("classLocks: invalid class id")
         if any(key not in _CLASS_COST_IDS for key in self.classCosts):
             raise ValueError("classCosts: known kit price only")
@@ -168,7 +168,7 @@ class Campaign(Strict):
         if len(self.campaignBalance) > 64:
             raise ValueError("campaignBalance: at most 64 campaigns")
         for campaign, values in self.campaignBalance.items():
-            if campaign != "*" and not _CAMPAIGN_ID.match(campaign):
+            if campaign != "*" and not _CAMPAIGN_ID.fullmatch(campaign):
                 raise ValueError(f"campaignBalance: invalid campaign {campaign!r}")
             if not isinstance(values, dict):
                 raise ValueError(f"campaignBalance.{campaign}: expected object")
@@ -294,7 +294,7 @@ class GunBalance(Strict):
             if (
                 not isinstance(gun_id, str)
                 or len(gun_id) > 256
-                or not _GUN_ID.match(gun_id)
+                or not _GUN_ID.fullmatch(gun_id)
             ):
                 raise ValueError(f"gunBalance: invalid gun id {gun_id!r}")
             if not isinstance(override, dict):
@@ -317,7 +317,7 @@ class Kits(Strict):
     @model_validator(mode="after")
     def kit_changes(self):
         for kit_id, kit in self.kits.items():
-            if not isinstance(kit_id, str) or not _CLASS_ID.match(kit_id):
+            if not isinstance(kit_id, str) or not _CLASS_ID.fullmatch(kit_id):
                 raise ValueError(f"kits: invalid kit id {kit_id!r}")
             if not isinstance(kit, dict):
                 raise ValueError(f"kits.{kit_id}: expected object")
@@ -325,7 +325,7 @@ class Kits(Strict):
             if mode not in _KIT_MODES:
                 raise ValueError(f"fixedModeKits: invalid mode {mode!r}")
             if target is not None and (
-                not isinstance(target, str) or not _CLASS_ID.match(target)
+                not isinstance(target, str) or not _CLASS_ID.fullmatch(target)
             ):
                 raise ValueError(f"fixedModeKits.{mode}: expected kit id or null")
         size = len(
@@ -348,7 +348,7 @@ class DisabledMapIds(Strict):
             raise ValueError("disabledMapIds: at most 4096 ids")
         if len(set(self.disabledMapIds)) != len(self.disabledMapIds):
             raise ValueError("disabledMapIds: expected distinct ids")
-        if any(not _MAP_ID.match(entry) for entry in self.disabledMapIds):
+        if any(not _MAP_ID.fullmatch(entry) for entry in self.disabledMapIds):
             raise ValueError("disabledMapIds: invalid map id")
         return self
 
@@ -372,7 +372,7 @@ class AiLimits(Strict):
             if len(scope) > 256:
                 raise ValueError("ai-limits: at most 256 accounts")
             for account, amount in scope.items():
-                if not _BUDGET_UUID.match(account):
+                if not _BUDGET_UUID.fullmatch(account):
                     raise ValueError("ai-limits: expected UUID accounts")
                 if (
                     isinstance(amount, bool)
@@ -424,12 +424,12 @@ class WorkshopAi(Strict):
             raise ValueError("providers: at most 8 entries")
         seen = set()
         for entry in self.providers:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or set(entry) != {"id", "label", "baseUrl"}:
                 raise ValueError("providers: expected id, label and https baseUrl")
             pid, label, base = entry.get("id"), entry.get("label"), entry.get("baseUrl")
             if (
                 not isinstance(pid, str)
-                or not _WORKSHOP_PROVIDER_ID.match(pid)
+                or not _WORKSHOP_PROVIDER_ID.fullmatch(pid)
                 or pid in _WORKSHOP_PROVIDERS
                 or pid in _WORKSHOP_RESERVED_IDS
                 or pid in seen
@@ -457,15 +457,16 @@ class WorkshopAi(Strict):
             (self.transcriptionModel, self.transcriptionProvider),
         ):
             if provider in custom:
-                if not _WORKSHOP_MODEL.match(
+                if not _WORKSHOP_MODEL.fullmatch(
                     field
-                ) and not _WORKSHOP_NATIVE_MODEL.match(field):
+                ) and not _WORKSHOP_NATIVE_MODEL.fullmatch(field):
                     raise ValueError("workshop-ai: invalid model")
-            elif not _WORKSHOP_MODEL.match(field):
+            elif not _WORKSHOP_MODEL.fullmatch(field):
                 raise ValueError("workshop-ai: expected vendor/model")
-        if self.cleanupModel != "" and not _WORKSHOP_MODEL.match(self.cleanupModel):
-            if self.cleanupProvider not in custom or not _WORKSHOP_NATIVE_MODEL.match(
-                self.cleanupModel
+        if self.cleanupModel != "" and not _WORKSHOP_MODEL.fullmatch(self.cleanupModel):
+            if (
+                self.cleanupProvider not in custom
+                or not _WORKSHOP_NATIVE_MODEL.fullmatch(self.cleanupModel)
             ):
                 raise ValueError("workshop-ai: invalid cleanup model")
         for field in (
