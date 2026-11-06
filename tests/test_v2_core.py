@@ -3575,3 +3575,14 @@ async def test_c19_both_scopes_rechecked_at_delivery(store):
             "settings.protected.write",
         }, op["required_scope"]
         assert await delivery.valid_operation(conn, op) == "rejected"
+
+
+async def test_c20_health_reports_database_outage(store):
+    # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
+    response = await store["client"].get("/health")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "ok", "schema": 2}
+    await store["app"].state.db.close()
+    broken = await store["client"].get("/health")
+    assert broken.status_code == 503, broken.text
+    assert broken.json() == {"status": "unavailable", "schema": 2}

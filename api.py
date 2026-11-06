@@ -124,6 +124,15 @@ class Store:
                     return None
             return None
 
+    def ping(self):
+        # CP-H5: read-only store check for GET /health (no auth, no writes).
+        try:
+            with self.lock:
+                self.db.execute("SELECT COUNT(*) FROM gate_state").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
     def gate(self):
         with self.lock:
             rev, mode, message, since, _ = self.db.execute(
@@ -230,6 +239,15 @@ OPENAPI = {
                 },
             },
         },
+        "/health": {
+            "get": {
+                "summary": "Liveness: 200 when the store answers, 503 when not.",
+                "responses": {
+                    "200": {"description": "ok"},
+                    "503": {"description": "unavailable"},
+                },
+            }
+        },
         "/v1/openapi.json": {
             "get": {
                 "summary": "This document.",
@@ -262,6 +280,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/v1/openapi.json":
             return self._send(200, OPENAPI)
+        if path == "/health":
+            # CP-H5: unauthenticated liveness for deploy gates and Dokploy.
+            # 200 only when the store answers; never expose gate state here.
+            if self.server.store.ping():
+                return self._send(200, {"status": "ok", "schema": SCHEMA})
+            return self._send(503, {"status": "unavailable", "schema": SCHEMA})
         if path != "/v1/gate":
             return self._send(404, {"error": "not found"})
         name = self.server.store.check(self._bearer(), READ_SCOPE)

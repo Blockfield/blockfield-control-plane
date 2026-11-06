@@ -39,3 +39,19 @@ API-ключа Dokploy в Actions нет: деплой идёт через webho
 и сервера. Переключение приложения `blockfield-control-plane-xwcxgx` с `:latest`
 на `:prod` делает координатор через Dokploy (порядок: сначала запушить `:prod`,
 потом переключить `dockerImage`).
+
+## Health probe and lease policy (CP-H5, issue #5)
+
+Probe: unauthenticated `GET /health` on the CP port. U1 and v2 share the
+contract - `200 status-ok` when the store answers (v2 also requires the owner
+bootstrap), `503` when not, plus the `schema` marker. It never returns gate
+state, errors or credentials, and the image carries a `HEALTHCHECK` on it.
+Suggested Dokploy check: `GET /health` expecting 200 (the owner wires it in
+Dokploy; no unit touches prod).
+
+Lease policy (unchanged): the proxy keeps the last verified gate answer for
+60 s and then closes entry, so a CP stop closes entry fail-closed. The
+redundancy decision (second CP / longer lease / keep as-is) is explicitly
+deferred until post-SLO measurements; the owner records it on issue #5,
+which stays open until then plus a stand re-verification of entry behavior
+on CP stop.

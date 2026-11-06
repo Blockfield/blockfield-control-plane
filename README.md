@@ -21,6 +21,7 @@ The default container command remains U1 until a separately authorized cutover.
   the current revision; same key + same body → same operation; same key +
   changed body → 409. Only `actor.role` `owner`/`admin` may toggle; every
   write is audited with the actor.
+- `GET /health` -> 200 status-ok when the store answers, 503 otherwise. No auth, no gate state, no bearer logging. U1 reports schema 1, v2 schema 2 (v2 also requires the owner bootstrap). For deploy gates and Dokploy healthchecks; entry still fails closed on the proxy 60 s lease.
 - `GET /v1/openapi.json` — schema (public).
 
 Proxy polls `GET /v1/gate` every 5 s and fails closed when the answer is

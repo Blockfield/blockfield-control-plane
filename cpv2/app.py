@@ -308,7 +308,19 @@ def create_app(dsn=None):
 
     @app.get("/health")
     async def health():
-        return {"schema": 2}
+        # CP-H5: unauthenticated liveness + readiness. 200 only when the
+        # control database answers and the owner bootstrap is present.
+        # Never leak DSNs, errors or gate state here.
+        try:
+            async with database.transaction() as conn:
+                bootstrapped = await one(
+                    conn, "SELECT EXISTS(SELECT 1 FROM owner_memberships) AS ok"
+                )
+        except Exception:
+            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
+        if not bootstrapped or not bootstrapped["ok"]:
+            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
+        return {"status": "ok", "schema": 2}
 
     @app.get("/v1/openapi.json")
     async def openapi():
