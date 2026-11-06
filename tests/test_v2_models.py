@@ -4,7 +4,22 @@ import pytest
 from pydantic import ValidationError
 
 from cpv2.models import GrantChange, SettingsChange
-from cpv2.settings import Gameplay, changed, merge
+from cpv2.settings import (
+    DEFINITIONS,
+    AiLimits,
+    Campaign,
+    ClassLocks,
+    Deathmatch,
+    DisabledMapIds,
+    Gameplay,
+    GunBalance,
+    Kits,
+    Parcool,
+    Rooms,
+    WorkshopAi,
+    changed,
+    merge,
+)
 
 
 def test_owner_is_never_an_ordinary_grant():
@@ -68,3 +83,77 @@ def test_c8_shared_budget_ignores_uncounted_checks():
     limiter.check("health", global_count=False)
     with pytest.raises(Problem):
         limiter.check("one-more")
+
+
+UUID = "12345678-1234-1234-1234-1234567890ab"
+_VALID = {
+    "rooms": (
+        Rooms,
+        {"maxRooms": 4, "idleCloseSeconds": 120, "abandonCloseSeconds": 45},
+    ),
+    "deathmatch": (Deathmatch, {"minPlayers": 2}),
+    "classLocks": (
+        ClassLocks,
+        {"classLocks": ["tech"], "classCosts": {"tech": 600, "sniper": 800}},
+    ),
+    "campaign": (
+        Campaign,
+        {"campaignBalance": {"*": {"max_tickets": 100, "enable_spawn_shield": True}}},
+    ),
+    "parcool": (Parcool, {"allowedActions": ["FastRun", "Crawl"]}),
+    "gunBalance": (
+        GunBalance,
+        {"overrides": {"tacz:modern_kinetic_gun": {"damage": 5}}},
+    ),
+    "kits": (
+        Kits,
+        {"kits": {"assault": {"name": "x"}}, "fixedModeKits": {"campaign": None}},
+    ),
+    "disabledMapIds": (DisabledMapIds, {"disabledMapIds": ["arena1"]}),
+    "ai-limits": (
+        AiLimits,
+        {"mode": "builder", "sessions": {UUID: 1000}, "builders": {}},
+    ),
+    "workshop-ai": (WorkshopAi, {"enabled": True, "maxBlocks": 100}),
+}
+_INVALID = {
+    "rooms": {"maxRooms": 0},
+    "deathmatch": {"minPlayers": 25},
+    "classLocks": {"classLocks": ["Tech!"]},
+    "campaign": {"campaignBalance": {"*": {"max_tickets": 0}}},
+    "parcool": {"allowedActions": ["Fly"]},
+    "gunBalance": {"overrides": {"no-colon": {}}},
+    "kits": {"fixedModeKits": {"nope": "assault"}},
+    "disabledMapIds": {"disabledMapIds": ["Arena!"]},
+    "ai-limits": {"sessions": {"not-a-uuid": 1}},
+    "workshop-ai": {"maxBlocks": 0},
+}
+
+
+@pytest.mark.parametrize("namespace", sorted(_VALID))
+def test_site_settings_namespaces_validate(namespace):
+    model, values = _VALID[namespace]
+    assert DEFINITIONS[namespace].model is model
+    merged = merge(model().model_dump(mode="json"), values)
+    model.model_validate(merged)
+    with pytest.raises(ValidationError):
+        model.model_validate(
+            merge(model().model_dump(mode="json"), _INVALID[namespace])
+        )
+    with pytest.raises(ValidationError):
+        model.model_validate(
+            merge(model().model_dump(mode="json"), {"unknownField": True})
+        )
+
+
+def test_ids_reject_trailing_newline_and_provider_extra_keys():
+    limits = AiLimits().model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        AiLimits.model_validate(merge(limits, {"sessions": {UUID + "\n": 1}}))
+    workshop = WorkshopAi().model_dump(mode="json")
+    entry = {"id": "my-llm", "label": "Mine", "baseUrl": "https://llm.example.com/v1"}
+    WorkshopAi.model_validate(merge(workshop, {"providers": [entry]}))
+    with pytest.raises(ValidationError):
+        WorkshopAi.model_validate(
+            merge(workshop, {"providers": [{**entry, "apiKey": "x"}]})
+        )

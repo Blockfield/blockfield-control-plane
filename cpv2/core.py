@@ -231,7 +231,14 @@ async def settings_change(
     except ValidationError:
         raise Problem("invalid_settings", 422) from None
     diff = changed(before["value"], after)
-    protected = any(field in definition.owner_paths for field in diff)
+    # Paths nest under dict fields (sessions.<uuid>), so a protected subtree
+    # matches by prefix; exact gameplay behavior is unchanged (ai.hardLimit is
+    # a leaf, ai.budget still matches nothing).
+    protected = any(
+        field == path or field.startswith(path + ".")
+        for field in diff
+        for path in definition.owner_paths
+    )
     if protected:
         identity.require("settings.protected.write", env, backend, target)
         if not validate:
