@@ -177,6 +177,81 @@ class DeployHistoryTest(unittest.TestCase):
             )
             self.assertEqual(pulled, [f"{IMAGE}@{PREVIOUS}"])
 
+    def test_redeploy_of_the_running_digest_keeps_the_older_release(self):
+        # X runs but is unhealthy, so runs() is False and the deploy re-runs X.
+        # The finished rollout must record W (not X) as previous, and keep_warm
+        # must pull W and drop digests outside the window while keeping W.
+        evicted = "sha256:" + "c" * 64
+        removed, pulled = [], []
+
+        def fake_docker(*args):
+            if args[:3] == ("buildx", "imagetools", "create"):
+                return ""
+            if args[:2] == ("pull", "--quiet"):
+                pulled.append(args[-1])
+                return ""
+            if args[:2] == ("image", "ls"):
+                return f"{evicted}\n{PREVIOUS}"
+            if args[:2] == ("image", "rm"):
+                removed.append(args[-1])
+                return ""
+            raise AssertionError(f"unexpected docker call: {args}")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "deploy-history.jsonl").write_text(
+                json.dumps(
+                    {
+                        "surface": "control-plane",
+                        "digest": PREVIOUS,
+                        "previous_digest": evicted,
+                    }
+                )
+                + "\n"
+            )
+            with (
+                patch.object(deploy, "docker", side_effect=fake_docker),
+                patch.object(deploy, "registry_digest", return_value=DIGEST),
+                patch.object(deploy, "current", return_value=DIGEST),
+                patch.object(deploy, "runs", side_effect=[False, True, True]),
+                patch.object(
+                    deploy,
+                    "dokploy_log",
+                    return_value=("p", "✅ pulled\nDigest: " + DIGEST),
+                ),
+                patch.object(deploy, "swarm_update", return_value="completed"),
+                patch.object(
+                    urllib.request,
+                    "urlopen",
+                    side_effect=lambda request, timeout=30: FakeResponse(),
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "DOKPLOY_CP_WEBHOOK": "https://dokploy.invalid/hook",
+                        "BLOCKFIELD_MINECRAFT_ROOT": str(root),
+                    },
+                ),
+            ):
+                deploy.deploy(SERVICE, DIGEST)
+            entries = deploy.read_history(root / "deploy-history.jsonl")
+            entry = entries[-1]
+            self.assertEqual(
+                (entry["digest"], entry["previous_digest"]), (DIGEST, PREVIOUS)
+            )
+            self.assertEqual(pulled, [f"{IMAGE}@{PREVIOUS}"])
+            self.assertEqual(removed, [f"{IMAGE}@{evicted}"])
+
     def test_without_host_root_nothing_recorded_or_pulled(self):
         calls = []
 

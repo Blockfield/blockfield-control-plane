@@ -369,6 +369,35 @@ def remember(service, digest, previous):
     keep_warm(service, previous)
 
 
+def previous_release(service, digest):
+    """Rollback target for deploying digest: what runs now, unless that is digest itself.
+
+    A re-run of the running release (unhealthy X redeployed) must not record X as its own
+    previous: fall back to the newest same-surface history entry for another digest, or None.
+    keep_warm pulls and keeps exactly this digest, so the window still holds the last good release.
+    """
+    try:
+        previous = current(service)
+    except (ValueError, subprocess.SubprocessError):
+        return None
+    if previous != digest:
+        return previous
+    try:
+        records = read_history(history_path())
+    except OSError:
+        return None
+    surface = service.removeprefix("blockfield-")
+    # No started-row filtering here: this copy never writes status rows, so every entry is a release.
+    for entry in reversed(records):
+        if (
+            entry.get("surface", surface) == surface
+            and isinstance(entry.get("digest"), str)
+            and entry["digest"] != digest
+        ):
+            return entry["digest"]
+    return None
+
+
 def wait(condition, seconds, message):
     deadline = time.monotonic() + seconds
     while not condition():
@@ -431,8 +460,7 @@ def deploy(service, digest):
         previous = None
         if history_path() is not None:
             # The history's previous_digest: what ran before this rollout (none when it is not one digest).
-            with contextlib.suppress(ValueError, subprocess.SubprocessError):
-                previous = current(service)
+            previous = previous_release(service, digest)
         note = f"{os.environ.get('GITHUB_REPOSITORY', 'local')} run {os.environ.get('GITHUB_RUN_ID', '-')} {digest}"
         sent, resent, seen = time.time() - 1, False, set()
         call(service, note)
