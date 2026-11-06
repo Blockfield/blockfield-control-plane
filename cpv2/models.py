@@ -60,6 +60,18 @@ class Action(Mutation):
     expiresInSeconds: int = Field(default=30, ge=1, le=60)
 
 
+class WorkshopAction(Mutation):
+    consumerId: str = Field(min_length=1, max_length=128)
+    generation: ID
+    target: str = Field(default="*", min_length=1, max_length=128)
+    actor: dict | None = None
+    members: list | None = None
+    message: str | None = None
+    release: str | None = None
+    record: dict | None = None
+    expiresInSeconds: int = Field(default=30, ge=1, le=60)
+
+
 class Ack(Strict):
     epoch: ID
     sequence: int = Field(ge=1)
