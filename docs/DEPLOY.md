@@ -12,9 +12,10 @@ registry). Канал `:main` (его двигает `publish.yml` на кажд
 `Deploy control plane` (ручной dispatch, runner `blockfield-deploy` на homeserver):
 
 1. Digest из input workflow (или текущий `:main` — его только что собрал `publish.yml`).
-2. `scripts/deploy-webhooks.py` переставляет `:prod` на этот digest
-   (`docker buildx imagetools create`), дёргает webhook Dokploy и ждёт: лог деплоя
-   показывает pull этого digest, все задачи служат его, окно мониторинга swarm закрыто.
+2. Закреплённый canonical action `Blockfield/blockfield-server/.github/actions/deploy-app`
+   переставляет `:prod` на этот digest (`docker buildx imagetools create`),
+   дёргает webhook Dokploy и ждёт: лог деплоя показывает pull этого digest,
+   все задачи служат его, окно мониторинга swarm закрыто.
    Несоответствие running digest релизному валит job.
 3. Проверка после деплоя: та же, что внутри скрипта, плюс `GET /v1/gate` из приватной
    сети отвечает со state, который был до деплоя (SQLite на volume `bf-control-state`
@@ -22,7 +23,7 @@ registry). Канал `:main` (его двигает `publish.yml` на кажд
 
 ## Откат
 
-Откат — повторный Deploy control plane с прежним digest: скрипт двигает `:prod`
+Откат — повторный Deploy control plane с прежним digest: action двигает `:prod`
 обратно и дёргает webhook (workflow делает это автоматически при ошибке деплоя).
 Предыдущий digest виден в логе прошлого run. Publish отката не требует: образ уже
 в registry. После отката проверить `/v1/openapi.json` из приватной сети.

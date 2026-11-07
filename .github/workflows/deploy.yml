@@ -17,7 +17,9 @@ jobs:
     env:
       # Redeploys only the control plane's release-only :prod channel; no Dokploy API key in Actions.
       DOKPLOY_CP_WEBHOOK: ${{ secrets.DOKPLOY_CP_WEBHOOK }}
-    # Rollout and its rollback at the deploy-webhooks.py limits.
+      # The canonical script reads the Dokploy app name from the environment.
+      DOKPLOY_CP_APP: blockfield-control-plane-xwcxgx
+    # Rollout and its rollback at the canonical deploy limits.
     timeout-minutes: 60
     steps:
       - run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
@@ -29,33 +31,89 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Deploy the digest, roll back to the running digest on failure
+      - name: Resolve the deploy digest
+        id: release
         env:
           DIGEST: ${{ inputs.digest }}
         run: |
+          set -euo pipefail
+          digest="${DIGEST:-}"
+          if [ -z "$digest" ]; then
+            digest="$(docker buildx imagetools inspect 'ghcr.io/blockfield/blockfield-control-plane:main' \
+              --format '{{json .Manifest}}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')"
+          fi
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Expected an immutable image digest, got '$digest'" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Read the running digest for rollback
+        id: previous
+        # Fail closed: without a known-good running digest there is no rollback target.
+        run: |
           python3 - <<'PYCODE'
-          import os, subprocess, sys
-          sys.path.insert(0, 'scripts')
-          hooks = __import__('deploy-webhooks')
-          entry = [sys.executable, 'scripts/entry_liveness.py',
-                   '--gate-file', '/srv/minecraft/workshop/gate/gate.json']
-          image = 'ghcr.io/blockfield/blockfield-control-plane'
-          digest = os.environ['DIGEST'] or hooks.registry_digest(f'{image}:main')
-          if not hooks.DIGEST.fullmatch(digest):
-              raise SystemExit(f'expected an immutable image digest, got {digest!r}')
-          # Fail closed: without a known-good running digest there is no rollback target.
-          previous = hooks.current('blockfield-control-plane')
-          try:
-              hooks.deploy('blockfield-control-plane', digest)
-              # Synthetic post-deploy gate: a stale CP lease fails the proxy
-              # closed, so entry must be re-proved after every CP deploy.
-              probe = subprocess.run(entry, capture_output=True, text=True, timeout=300)
-              if probe.returncode != 0:
-                  raise SystemExit('entry dead after CP deploy:\n' + probe.stdout + probe.stderr)
-          except BaseException:
-              hooks.deploy('blockfield-control-plane', previous)
-              recheck = subprocess.run(entry, capture_output=True, text=True, timeout=300)
-              if recheck.returncode != 0:
-                  raise SystemExit('entry still dead after CP rollback:\n' + recheck.stdout + recheck.stderr)
-              raise
+          import json, os, subprocess, sys
+          service = os.environ["DOKPLOY_CP_APP"]
+          repository = "ghcr.io/blockfield/blockfield-control-plane"
+          def docker(*args):
+              try:
+                  return subprocess.run(["docker", *args], text=True, capture_output=True,
+                                        check=True, timeout=300).stdout.strip()
+              except subprocess.CalledProcessError as error:
+                  print(f"docker {' '.join(args[:4])}: {error.stderr.strip()[-400:]}",
+                        file=sys.stderr, flush=True)
+                  raise
+          ids = docker("ps", "--no-trunc", "--filter",
+                       "label=com.docker.swarm.service.name=" + service,
+                       "--format", "{{.ID}}").split()
+          tasks = []
+          for cid in ids:
+              container = json.loads(docker("inspect", cid))[0]
+              imaged = json.loads(docker("image", "inspect", container["Image"]))[0]
+              own = {d.split("@", 1)[1] for d in imaged.get("RepoDigests") or []
+                     if d.startswith(repository + "@")}
+              tasks.append(own)
+          previous, error = None, None
+          if len(tasks) != 1 or not tasks[0]:
+              error = ("blockfield-control-plane: the running image is not one "
+                       "ghcr.io/blockfield digest; no automatic rollback")
+          else:
+              for digest in sorted(tasks[0]):
+                  try:
+                      manifest = json.loads(docker("buildx", "imagetools", "inspect",
+                                                   f"{repository}@{digest}",
+                                                   "--format", "{{json .Manifest}}"))
+                  except subprocess.CalledProcessError:
+                      continue
+                  if manifest["digest"] == digest:
+                      previous = digest
+                      break
+              if previous is None:
+                  error = ("blockfield-control-plane: the running image is gone "
+                           "from the registry; no automatic rollback")
+          if error is not None:
+              raise SystemExit(f"{error}; refusing to deploy without a rollback target")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"previous={previous or ''}\n")
           PYCODE
+      - name: Deploy the exact digest
+        uses: Blockfield/blockfield-server/.github/actions/deploy-app@6cc2f1f4ac1091cefeb96371c3b76824eb5c194c
+        with:
+          app: control-plane
+          digest: ${{ steps.release.outputs.digest }}
+          webhook_url: ${{ secrets.DOKPLOY_CP_WEBHOOK }}
+      - name: Check entry after deploy
+        # Synthetic post-deploy gate: a stale CP lease fails the proxy
+        # closed, so entry must be re-proved after every CP deploy.
+        run: timeout 300 python3 scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
+      - name: Roll back to the running digest
+        if: (failure() || cancelled()) && steps.previous.outputs.previous != ''
+        uses: Blockfield/blockfield-server/.github/actions/deploy-app@6cc2f1f4ac1091cefeb96371c3b76824eb5c194c
+        with:
+          app: control-plane
+          digest: ${{ steps.previous.outputs.previous }}
+          webhook_url: ${{ secrets.DOKPLOY_CP_WEBHOOK }}
+      - name: Check entry after rollback
+        if: (failure() || cancelled()) && steps.previous.outputs.previous != ''
+        run: timeout 300 python3 scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
