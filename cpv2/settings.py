@@ -93,6 +93,60 @@ class Rooms(Strict):
 
 class Deathmatch(Strict):
     minPlayers: int | None = Field(default=None, ge=1, le=24)
+    streakRewards: list | None = None
+
+    @model_validator(mode="after")
+    def streak_table(self):
+        # Mirrors blockfield-server AdminSettings.streakTable (PR #346): the
+        # table is atomic server-side, so CP rejects a bad table the same way
+        # instead of forwarding it. Registry membership (minus air) stays
+        # server-side; CP checks the id shape only.
+        if self.streakRewards is None:
+            return self
+        if len(self.streakRewards) > 64:
+            raise ValueError("deathmatch.streakRewards: at most 64 entries")
+        for index, entry in enumerate(self.streakRewards):
+            _streak_entry(entry, index)
+        return self
+
+
+_THROWABLE_ITEM = "lrtactical:throwable"
+_STREAK_ITEM_ID = re.compile(r"^[a-z0-9_.-]+:[a-z0-9/._-]+$")
+_MAX_JAVA_INT = 2**31 - 1
+
+
+def _streak_entry(entry, index):
+    path = f"deathmatch.streakRewards[{index}]"
+    if not isinstance(entry, dict):
+        raise ValueError(f"{path}: expected object")
+    kills = entry.get("kills")
+    if (
+        isinstance(kills, bool)
+        or not isinstance(kills, int)
+        or not 1 <= kills <= _MAX_JAVA_INT
+    ):
+        raise ValueError(f"{path}.kills: expected integer >= 1")
+    item_id = entry.get("id")
+    if not isinstance(item_id, str) or not _STREAK_ITEM_ID.fullmatch(item_id.strip()):
+        raise ValueError(f"{path}.id: expected item id")
+    count = entry.get("count", 1)
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 1 <= count <= _MAX_JAVA_INT
+    ):
+        raise ValueError(f"{path}.count: expected integer >= 1")
+    if "scale" not in entry or not isinstance(entry["scale"], bool):
+        raise ValueError(f"{path}.scale: expected boolean")
+    throwable_id = entry.get("throwable_id")
+    if item_id.strip() == _THROWABLE_ITEM:
+        if not isinstance(throwable_id, str) or not throwable_id.strip():
+            raise ValueError(f"{path}.throwable_id: required for throwable")
+    elif throwable_id is not None:
+        raise ValueError(f"{path}.throwable_id: only the throwable item takes one")
+    message = entry.get("message", "")
+    if not isinstance(message, str):
+        raise ValueError(f"{path}.message: expected string")
 
 
 _CLASS_ID = re.compile(r"^[a-z0-9_]{1,32}$")

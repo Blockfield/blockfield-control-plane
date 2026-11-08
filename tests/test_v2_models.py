@@ -217,8 +217,7 @@ def test_merge_delete_validates_like_any_change():
     assert Rooms.model_validate(merge(rooms, {"maxRooms": None})).maxRooms is None
 
 
-def test_campaign_pair_checks_use_mod_defaults_for_missing_half():
-    # The mod fills a missing half from CampaignConfig defaults (warn 100, kill 80, team 1..16).
+def test_campaign_pair_checks_use_mod_defaults_for_missing_half():  # The mod fills a missing half from CampaignConfig defaults (warn 100, kill 80, team 1..16).
     for values in (
         {"base_kill_radius": 150},
         {"base_warn_radius": 50},
@@ -245,3 +244,78 @@ def test_campaign_pair_checks_use_mod_defaults_for_missing_half():
             }
         }
     )
+
+
+def _streak_doc(rewards):
+    return {"minPlayers": 2, "streakRewards": rewards}
+
+
+def _streak_entry(kills, item_id, count=1, scale=True):
+    return {"kills": kills, "id": item_id, "count": count, "scale": scale}
+
+
+def test_deathmatch_streak_rewards_mirror_server():
+    # Default-shaped table (blockfield-server KillStreakRewards.defaults) validates,
+    # and so does an empty table (disables rewards) and entries with server defaults.
+    Deathmatch.model_validate(
+        _streak_doc(
+            [
+                {
+                    "kills": 2,
+                    "id": "superbwarfare:medical_kit",
+                    "count": 1,
+                    "scale": True,
+                    "message": "${name} — ${streak} подряд!",
+                },
+                {"kills": 3, "id": "superbwarfare:armor_plate", "scale": True},
+                {
+                    "kills": 5,
+                    "id": "lrtactical:throwable",
+                    "count": 1,
+                    "scale": False,
+                    "throwable_id": "lrtactical:m67",
+                },
+            ]
+        )
+    )
+    assert Deathmatch.model_validate({"streakRewards": []}).streakRewards == []
+    assert Deathmatch().streakRewards is None
+    # Well-formed but registry-unknown ids pass CP: membership stays server-side.
+    Deathmatch.model_validate(
+        _streak_doc([{"kills": 2, "id": "nope:missing", "scale": True}])
+    )
+    bad_tables = [
+        "x",
+        [42],
+        [_streak_entry(0, "minecraft:stick")],
+        [_streak_entry(2, "")],
+        [_streak_entry(2, "not an id!!!")],
+        [_streak_entry(2, "minecraft:stick", "0")],
+        [{"kills": 2, "id": "minecraft:stick", "count": 1}],
+        [{"kills": 2, "id": "minecraft:stick", "count": 1, "scale": "yes"}],
+        [{"kills": 2, "id": "lrtactical:throwable", "count": 1, "scale": False}],
+        [
+            {
+                "kills": 2,
+                "id": "minecraft:stick",
+                "count": 1,
+                "scale": True,
+                "throwable_id": "lrtactical:m67",
+            }
+        ],
+        [
+            {
+                "kills": 2,
+                "id": "minecraft:stick",
+                "count": 1,
+                "scale": True,
+                "message": 5,
+            }
+        ],
+        [_streak_entry(2, "minecraft:stick")]
+        + [_streak_entry(True, "minecraft:stick")],
+        [_streak_entry(2, "minecraft:stick")] * 65,
+    ]
+    for bad in bad_tables:
+        with pytest.raises(ValidationError):
+            Deathmatch.model_validate(_streak_doc(bad))
