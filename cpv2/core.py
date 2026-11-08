@@ -18,6 +18,7 @@ from cpv2.auth import (
     step_up,
     verifier,
 )
+from cpv2 import models
 from cpv2.db import one, record, rows
 from cpv2.settings import DEFINITIONS, WorkshopGate, changed, digest, merge
 
@@ -500,39 +501,132 @@ async def test_status(conn, identity, attempt, account_id, model, assertion, pat
     return await finish(conn, attempt, identity, op, {"isTest": True}, effective=True)
 
 
-async def action(conn, identity, attempt, kind, model):
-    if kind not in ("moderation.kick", "moderation.ban"):
+# Site RCON replacements (admin.ts rconCommand): typed moderation commands the
+# mod applies from its SSE stream. Scopes equal kinds; site `moderate`
+# maps to the moderator role, site `ban` (pardon) to admin.
+MODERATION_COMMANDS = (
+    "moderation.say",
+    "moderation.list",
+    "moderation.pardon",
+    "moderation.team-kick",
+    "moderation.class-lock",
+    "moderation.class-unlock",
+    "moderation.range",
+    "moderation.stop-room",
+)
+MODERATION_PLAYER = re.compile(r"[A-Za-z0-9_]{3,16}")
+MODERATION_CLASS = re.compile(r"[a-z0-9_]{1,32}")
+MODERATION_ROOM = re.compile(r"[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}")
+MODERATION_RANGE_OPS = ("open", "close", "reset")
+MODERATION_OUTCOMES = ("none", "draw", "RED", "BLUE")
+
+
+def _moderation_text(value, *, required=True, problem="invalid_moderation_text"):
+    # Same wire rule as the site text(): control characters and § become
+    # spaces, runs collapse, and the result is 1-120 chars not starting
+    # with `/` (so it can never become a different server command).
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str):
+        raise Problem(problem, 422)
+    clean = re.sub(
+        r" {2,}",
+        " ",
+        "".join(
+            " " if c == "§" or unicodedata.category(c) == "Cc" else c for c in value
+        ),
+    ).strip()
+    if (not clean and required) or len(clean) > 120 or clean.startswith("/"):
+        raise Problem(problem, 422)
+    return clean
+
+
+def _moderation_payload(kind, data):
+    base = {"kind": kind, "target": data["target"]}
+    name = kind[len("moderation.") :]
+    if name == "say":
+        return base | {"text": _moderation_text(data["text"])}
+    if name == "list":
+        return base
+    if name in ("pardon", "team-kick"):
+        player = data["player"]
+        if not isinstance(player, str) or MODERATION_PLAYER.fullmatch(player) is None:
+            raise Problem("invalid_moderation_player", 422)
+        return base | {"player": player}
+    if name in ("class-lock", "class-unlock"):
+        class_id = data["classId"]
+        if (
+            not isinstance(class_id, str)
+            or MODERATION_CLASS.fullmatch(class_id) is None
+        ):
+            raise Problem("invalid_moderation_class", 422)
+        return base | {"classId": class_id}
+    if name == "range":
+        if data["op"] not in MODERATION_RANGE_OPS:
+            raise Problem("invalid_moderation_range", 422)
+        return base | {"op": data["op"]}
+    room = data["roomId"]
+    if not isinstance(room, str) or MODERATION_ROOM.fullmatch(room) is None:
+        raise Problem("invalid_moderation_room", 422)
+    if data["outcome"] not in MODERATION_OUTCOMES:
+        raise Problem("invalid_moderation_outcome", 422)
+    reason = _moderation_text(data["reason"], required=False)
+    if data["outcome"] == "none" and re.match(r"^(win|draw)\b", reason):
+        raise Problem("invalid_moderation_reason", 422)
+    payload = base | {"roomId": room, "outcome": data["outcome"]}
+    return payload | {"reason": reason} if reason else payload
+
+
+async def action(conn, identity, attempt, kind, body):
+    if kind in ("moderation.kick", "moderation.ban"):
+        try:
+            data = models.Action.model_validate(body).model_dump(mode="json")
+        except ValidationError:
+            raise Problem("invalid_action", 422) from None
+        payload = {
+            "kind": kind,
+            "target": data["target"],
+            "playerId": data["playerId"],
+            "reason": data["reason"],
+        }
+    elif kind in MODERATION_COMMANDS:
+        try:
+            data = models.ModerationAction.model_validate(body).model_dump(mode="json")
+        except ValidationError:
+            raise Problem("invalid_action", 422) from None
+        payload = _moderation_payload(kind, data)
+    else:
         raise Problem("unknown_action", 404)
-    data = model.model_dump(mode="json")
-    identity.require(kind, model.environment, model.backend, model.target)
+    data_target = payload["target"]
+    identity.require(kind, data["environment"], data["backend"], data_target)
     op, duplicate = await operation(
         conn,
         identity,
         kind,
-        model.target,
+        data_target,
         data,
         kind,
-        model.expiresInSeconds,
-        model.generation,
+        data["expiresInSeconds"],
+        data["generation"],
     )
     if duplicate:
         return receipt(op)
     consumer = await one(
-        conn, "SELECT * FROM consumers WHERE id=%s FOR UPDATE", (model.consumerId,)
+        conn, "SELECT * FROM consumers WHERE id=%s FOR UPDATE", (data["consumerId"],)
     )
     if (
         not consumer
-        or consumer["generation"] != model.generation
-        or consumer["environment"] != model.environment
-        or consumer["backend"] != model.backend
-        or not covers(consumer["resource"], model.target)
+        or str(consumer["generation"]) != str(data["generation"])
+        or consumer["environment"] != data["environment"]
+        or consumer["backend"] != data["backend"]
+        or not covers(consumer["resource"], data_target)
         or kind not in consumer["capabilities"]
     ):
         raise Problem("consumer_generation_or_capability", 409)
     unsettled = await one(
         conn,
-        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND p.kind IN ('moderation.kick','moderation.ban') AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
-        (model.consumerId,),
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND p.kind LIKE 'moderation.%%' AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
+        (data["consumerId"],),
     )
     if (
         consumer["next_sequence"] - consumer["received_cursor"] > 128
@@ -543,12 +637,7 @@ async def action(conn, identity, attempt, kind, model):
         conn,
         op,
         [consumer],
-        {
-            "kind": kind,
-            "target": model.target,
-            "playerId": data["playerId"],
-            "reason": model.reason,
-        },
+        payload,
     )
     return await finish(
         conn,
@@ -556,14 +645,7 @@ async def action(conn, identity, attempt, kind, model):
         identity,
         op,
         {
-            "payloadHash": digest(
-                {
-                    "kind": kind,
-                    "target": model.target,
-                    "playerId": data["playerId"],
-                    "reason": model.reason,
-                }
-            )
+            "payloadHash": digest(payload),
         },
     )
 

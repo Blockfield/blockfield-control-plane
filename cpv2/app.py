@@ -560,7 +560,9 @@ def create_app(dsn=None):
     @app.post(
         "/v2/actions/{kind}", status_code=202, response_model=models.OperationReceipt
     )
-    async def action(kind: str, body: models.Action, request: Request):
+    async def action(kind: str, body: dict, request: Request):
+        # Raw dict: core.action picks the per-kind model (kick/ban keep
+        # models.Action, the say/list/... replacements use ModerationAction).
         return await write(request, core.action, kind, body)
 
     @app.post(
