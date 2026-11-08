@@ -93,13 +93,21 @@ async def valid_operation(conn, op):
     c = await one(conn, "SELECT * FROM credentials WHERE id=%s", (op["credential_id"],))
     if not c or c["revoked_at"] or c["expires_at"] <= now():
         return "rejected"
-    # Service-issued operation (e.g. the workshop gate leg): no human
-    # account exists, so delivery rechecks the provisioned scope exactly
-    # like the accept-time check. A narrowed or revoked credential, or a
-    # narrowed client ceiling, fences the frame; nothing here mints
-    # human authority.
+    # Service-issued operation: only the workshop gate leg may be
+    # service-issued (settings.gate.patch at target "workshop" with the
+    # service-holdable workshop.gate scope). Every other NULL-account kind
+    # stays rejected, as before this branch existed: then SELECT * FROM
+    # accounts WHERE id=NULL returned no row and the function fenced them.
+    # Delivery rechecks the provisioned scope exactly like the accept-time
+    # check. A narrowed or revoked credential, or a narrowed client ceiling,
+    # fences the frame; nothing here mints human authority.
     if op["account_id"] is None:
-        if c["kind"] != "service":
+        if (
+            c["kind"] != "service"
+            or op["kind"] != "settings.gate.patch"
+            or op["target"] != "workshop"
+            or op["required_scope"] != "workshop.gate"
+        ):
             return "rejected"
         c = await one(
             conn,

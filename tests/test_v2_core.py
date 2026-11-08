@@ -3991,8 +3991,12 @@ async def test_workshop_service_act_scope(store):
     site = await provision(
         store["admin"],
         {
-            "client": {"id": "site", "via": "game", "ceiling": ["workshop.act"]},
-            "ceiling": ["workshop.act"],
+            "client": {
+                "id": "site",
+                "via": "game",
+                "ceiling": ["workshop.act", "workshop.message"],
+            },
+            "ceiling": ["workshop.act", "workshop.message"],
             "environment": "prod",
             "backend": "game",
             "resource": "*",
@@ -4054,8 +4058,10 @@ async def test_workshop_admin_members_need_owner_step_up(store):
     response = await request(
         store, "POST", "/v2/workshop/members", service, "site-stepup"
     )
+    # Members needs the admin-only workshop.members scope, which no service
+    # credential may hold: rejected before any owner step-up is evaluated.
     assert response.status_code == 403, response.text
-    assert response.json()["error"] == "owner_approval_required"
+    assert response.json()["error"] == "forbidden"
 
 
 async def test_c20_health_reports_database_outage(store, monkeypatch):
@@ -4725,3 +4731,56 @@ async def test_cpp3_service_reports_workshop_leg_with_service_actor(store):
     assert (
         await request(store, "PATCH", "/v2/settings/gate/*", other, "reporter")
     ).status_code == 403
+
+
+async def test_cpp1r2_service_act_alone_cannot_post_members(store):
+    # A service holding only workshop.act must not change the workshop member
+    # ACL: members needs the admin-only workshop.members scope, which no
+    # service credential may hold.
+    store["tokens"]["act-only"] = await provision(
+        store["admin"],
+        {
+            "client": {"id": "act-only", "via": "game", "ceiling": ["workshop.act"]},
+            "ceiling": ["workshop.act"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    body = workshop_body(store, members=[{"draslId": "f" * 32, "name": "Stranger"}])
+    response = await request(store, "POST", "/v2/workshop/members", body, "act-only")
+    assert response.status_code == 403, response.text
+
+
+async def test_cpp1r2_service_workshop_op_fenced_at_delivery(store):
+    # Accept-time per-kind scopes are not enough on their own: a NULL-account
+    # (service-issued) operation that is not the workshop gate leg must stay
+    # rejected at delivery, so its frame is never executable.
+    store["tokens"]["messenger"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "messenger",
+                "via": "game",
+                "ceiling": ["workshop.act", "workshop.message"],
+            },
+            "ceiling": ["workshop.act", "workshop.message"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    body = workshop_body(store, message="hi")
+    response = await request(store, "POST", "/v2/workshop/message", body, "messenger")
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["operationId"]
+    rows = await sql(
+        store,
+        "SELECT account_id FROM operations WHERE id=%s",
+        (operation_id,),
+    )
+    assert rows[0]["account_id"] is None
+    frames = await envelopes(store, cid="workshop")
+    frame = next(item for item in frames if item["operationId"] == operation_id)
+    assert not frame["executable"]
+    assert frame["payload"] is None

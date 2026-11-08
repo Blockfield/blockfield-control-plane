@@ -68,6 +68,11 @@ SERVICE_SCOPES = {
     "workshop.act",
     # Service-holdable so the workshop controller can report its own gate leg.
     "workshop.gate",
+    # Service-holdable per-kind workshop scopes: a service may post these
+    # kinds only when also provisioned for the kind (workshop.act alone never
+    # authorizes a kind). The admin-only kinds (members, release.select) stay
+    # out, so no service credential can ever mint them.
+    *WORKSHOP_WRITE_SCOPES,
 }
 # Site principal only: provisioned solely on a resource="*" service credential,
 # since a staff write asserts an acting account (see core.grant_change).

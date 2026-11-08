@@ -887,8 +887,15 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
         raise Problem("unknown_action", 404)
     data = model.model_dump(mode="json")
     if identity.account is None:
+        # A service may only supply the actor (workshop.act) for a kind it is
+        # also provisioned for: workshop.act alone never authorizes a kind.
+        # The admin-only kinds are not service-holdable (see SERVICE_SCOPES),
+        # so no service credential can mint them.
         identity.require("workshop.act", model.environment, model.backend, model.target)
-        scope = "workshop.act"
+        identity.require(
+            WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target
+        )
+        scope = "workshop.act," + WORKSHOP_SCOPES[kind]
     else:
         identity.require(
             WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target

@@ -158,7 +158,7 @@ END $$;
 CREATE TRIGGER owner_protected BEFORE INSERT OR UPDATE ON owner_memberships FOR EACH ROW EXECUTE FUNCTION protect_owner();
 GRANT SELECT ON ALL TABLES IN SCHEMA control TO cp_runtime;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA control TO cp_runtime;
-GRANT INSERT ON audit_events,operation_events,settings_revisions,outbox,consumer_acks TO cp_runtime;
+GRANT INSERT ON accounts,audit_events,operation_events,settings_revisions,outbox,consumer_acks TO cp_runtime;
 GRANT INSERT,UPDATE ON role_grants,credentials,owner_challenges,owner_assertions,operations,settings_heads TO cp_runtime;
 GRANT UPDATE ON accounts,consumers TO cp_runtime;
 REVOKE ALL ON schema_migrations,legacy_records,legacy_imports FROM cp_runtime;
