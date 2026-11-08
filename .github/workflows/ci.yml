@@ -31,6 +31,7 @@ on:
 permissions:
   contents: read
   pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
+  actions: read # same-tree lookup reads earlier runs and their artifacts
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
   # A review must never cancel the run it gates.
@@ -112,8 +113,50 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'pull_request_review' && needs.bot-gate.outputs.sha || github.sha }}
+      # Main pushes usually merge a tree a green review run already tested;
+      # the verify steps below are skipped only then. The image publish
+      # (publish.yml) stays unconditional.
+      - name: Check for green run of the same tree
+        id: same
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tree=$(git rev-parse "HEAD^{tree}")
+          tested=false
+          for sha in $(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?status=success&per_page=30" --jq '.workflow_runs[] | select(.event == "push") | .head_sha'); do
+            t=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${sha}" --jq '.tree.sha')
+            if [ "$t" = "$tree" ]; then tested=true; break; fi
+          done
+          if [ "$tested" != true ]; then
+            for id in $(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=pull_request_review&branch=next&status=success&per_page=20" --jq '.workflow_runs[].id' || true); do
+              if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/artifacts?per_page=100" --jq '.artifacts[].name' 2>/dev/null | grep -qx "tested-tree-${tree}"; then tested=true; break; fi
+            done
+          fi
+          echo "Same tree $tree already tested: $tested."
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
+        if: steps.same.outputs.tested != 'true'
         with:
           python-version: '3.12'
-      - run: pip install --require-hashes -r requirements-dev.txt
-      - run: python scripts/check_v2.py
+      - if: steps.same.outputs.tested != 'true'
+        run: pip install --require-hashes -r requirements-dev.txt
+      - if: steps.same.outputs.tested != 'true'
+        run: python scripts/check_v2.py
+      # Records the exact tree this green run tested, so a main push that
+      # merges an already-tested tree can skip the verify steps above.
+      - name: Record tested tree
+        id: tree
+        if: github.event_name == 'pull_request_review' || github.event_name == 'workflow_dispatch'
+        run: |
+          tree=$(git rev-parse "HEAD^{tree}")
+          echo "$tree" > tested-tree.txt
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+      - name: Upload tested tree
+        if: github.event_name == 'pull_request_review' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-tree-${{ steps.tree.outputs.tree }}
+          path: tested-tree.txt
+          retention-days: 7
+          if-no-files-found: error
