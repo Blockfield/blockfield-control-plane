@@ -31,6 +31,7 @@ on:
 permissions:
   contents: read
   pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
+  actions: read # same-tree lookup reads earlier runs and their artifacts
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
   # A review must never cancel the run it gates.
