@@ -37,6 +37,8 @@ jobs:
           DIGEST: ${{ inputs.digest }}
         run: |
           set -euo pipefail
+          # Low priority on the shared self-hosted runner (server#351).
+          renice -n 19 -p $$ >/dev/null; ionice -c3 -p $$ >/dev/null 2>&1 || true
           digest="${DIGEST:-}"
           if [ -z "$digest" ]; then
             digest="$(docker buildx imagetools inspect 'ghcr.io/blockfield/blockfield-control-plane:main' \
@@ -52,6 +54,8 @@ jobs:
         id: previous
         # Fail closed: without a known-good running digest there is no rollback target.
         run: |
+          # Low priority on the shared self-hosted runner (server#351).
+          renice -n 19 -p $$ >/dev/null; ionice -c3 -p $$ >/dev/null 2>&1 || true
           python3 - <<'PYCODE'
           import json, os, subprocess, sys
           service = os.environ["DOKPLOY_CP_APP"]
@@ -106,7 +110,7 @@ jobs:
       - name: Check entry after deploy
         # Synthetic post-deploy gate: a stale CP lease fails the proxy
         # closed, so entry must be re-proved after every CP deploy.
-        run: timeout 300 python3 scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
+        run: timeout 300 nice -n 19 ionice -c3 python3 scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
       - name: Roll back to the running digest
         if: (failure() || cancelled()) && steps.previous.outputs.previous != ''
         uses: Blockfield/blockfield-server/.github/actions/deploy-app@3a6c1ff83488631644092e20359a8c3c67f1a326
@@ -116,4 +120,4 @@ jobs:
           webhook_url: ${{ secrets.DOKPLOY_CP_WEBHOOK }}
       - name: Check entry after rollback
         if: (failure() || cancelled()) && steps.previous.outputs.previous != ''
-        run: timeout 300 python3 scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
+        run: timeout 300 nice -n 19 ionice -c3 python3 scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
