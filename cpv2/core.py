@@ -41,20 +41,22 @@ SERVICE_PRINCIPAL_NAMESPACE = uuid5(
 )
 
 
-async def service_principal(conn, identity):
-    """Stable accounts row attributing a service-credential write.
+def service_principal_id(client_id):
+    name = f"service:{client_id}"[:128]
+    return uuid5(SERVICE_PRINCIPAL_NAMESPACE, name), name
 
-    settings_revisions.actor is NOT NULL REFERENCES accounts. The display
+
+async def service_principal(conn, identity):
+    """Stable id attributing a service-credential write.
+
+    settings_revisions.actor is NOT NULL REFERENCES accounts. The row is
+    created offline by provision(), which runs privileged; the runtime
+    (cp_runtime, no INSERT on accounts) only resolves the id. The display
     name ("service:<client id>") marks the row as a service principal; no
     credential ever points at it (credentials stay account-less by CHECK),
     so it can never authenticate or hold grants.
     """
-    name = f"service:{identity.client['id']}"[:128]
-    principal = uuid5(SERVICE_PRINCIPAL_NAMESPACE, name)
-    await conn.execute(
-        "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
-        (principal, name),
-    )
+    principal, _ = service_principal_id(identity.client["id"])
     return principal
 
 

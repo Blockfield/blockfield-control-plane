@@ -26,6 +26,7 @@ from cpv2.auth import (
     now,
     verifier,
 )
+from cpv2.core import service_principal_id
 from cpv2.db import history, migrate, one, record
 
 
@@ -177,6 +178,13 @@ async def provision(dsn, spec, bearer_sink=None):
                 raise ValueError("service credential ceiling")
             if STAFF_SCOPES & set(spec["ceiling"]) and spec["resource"] != "*":
                 raise ValueError("staff scopes need an unbound site credential")
+            # The service principal row lives here, not at runtime: this path
+            # runs privileged while the service (cp_runtime) cannot INSERT accounts.
+            principal, name = service_principal_id(client["id"])
+            await conn.execute(
+                "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (principal, name),
+            )
         if set(spec["ceiling"]) - (
             OWNER_SCOPES if account_id else SERVICE_SCOPES | STAFF_SCOPES
         ):

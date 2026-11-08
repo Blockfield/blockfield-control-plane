@@ -1088,6 +1088,75 @@ async def test_uninitialized_service_and_migration_checksums_fail_closed(
             pass
 
 
+async def test_v1_database_with_original_checksum_migrates_cleanly(postgres):
+    # Applied migrations are immutable: an existing v1 database carrying the
+    # original 001 checksum must re-migrate without a mismatch.
+    name = "cp_" + uuid4().hex
+    async with await psycopg.AsyncConnection.connect(postgres, autocommit=True) as conn:
+        await conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        admin = make_conninfo(postgres, dbname=name)
+        await migrate(admin, name)
+        original = hashlib.sha256(
+            Path("migrations/001_core.sql").read_bytes()
+        ).hexdigest()
+        async with await psycopg.AsyncConnection.connect(admin) as conn:
+            recorded = await (
+                await conn.execute(
+                    "SELECT checksum FROM control.schema_migrations WHERE version=1"
+                )
+            ).fetchone()
+        assert recorded[0] == original
+        await migrate(admin, name)
+        async with await psycopg.AsyncConnection.connect(admin) as conn:
+            again = await (
+                await conn.execute(
+                    "SELECT checksum FROM control.schema_migrations WHERE version=1"
+                )
+            ).fetchone()
+        assert again[0] == original
+    finally:
+        async with await psycopg.AsyncConnection.connect(
+            postgres, autocommit=True
+        ) as conn:
+            await conn.execute(f'DROP DATABASE "{name}"')
+
+
+async def test_service_principal_row_provisioned_offline_needs_no_runtime_insert(
+    store,
+):
+    # provision() runs privileged and creates the service principal row, so
+    # the runtime (cp_runtime, no INSERT on accounts) only resolves its id.
+    await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "offline-principal",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    assert await sql(
+        store,
+        "SELECT display_name FROM accounts WHERE display_name=%s",
+        ("service:offline-principal",),
+    ) == [{"display_name": "service:offline-principal"}]
+    async with await psycopg.AsyncConnection.connect(
+        store["runtime"], options="-c search_path=control,pg_catalog"
+    ) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO accounts(id,display_name) VALUES(%s,%s)",
+                    (uuid4(), "runtime-probe"),
+                )
+
+
 async def test_actual_sse_frames_disconnect_and_socket_flush_is_not_execution(store):
     op = await queued(store)
     epoch = (await sql(store, "SELECT epoch FROM consumers WHERE id='game'"))[0][
