@@ -35,6 +35,9 @@ ROLE_SCOPES = {
         "audit.read",
         *WORKSHOP_WRITE_SCOPES,
         *WORKSHOP_ADMIN_SCOPES,
+        # The workshop controller reports its own gate leg (gate settings at
+        # target "workshop"); admins keep manual PATCH access to the same leg.
+        "workshop.gate",
     },
 }
 OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
@@ -43,7 +46,14 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     "settings.protected.write",
     "audit.full",
 }
-SERVICE_SCOPES = {"agents.events", "agents.acks", "gate:read", "workshop.act"}
+SERVICE_SCOPES = {
+    "agents.events",
+    "agents.acks",
+    "gate:read",
+    "workshop.act",
+    # Service-holdable so the workshop controller can report its own gate leg.
+    "workshop.gate",
+}
 # Site principal only: provisioned solely on a resource="*" service credential,
 # since a staff write asserts an acting account (see core.grant_change).
 STAFF_SCOPES = {"staff.read", "staff.lower.manage", "staff.admin.manage"}

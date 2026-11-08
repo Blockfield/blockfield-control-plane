@@ -4398,3 +4398,104 @@ async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
     ).status_code == 202
     bad = patch("g-bad", 1, {"ai": {"hardLimit": None}})
     assert (await request(store, "PATCH", gpath, bad, "owner")).status_code == 422
+
+
+async def test_cpp1_workshop_leg_reaches_proxy_snapshot_and_frames(store):
+    # Writer contract: whoever holds workshop.gate reports the leg (admin here;
+    # the autonomous workshop reporter needs the authorship follow-up noted in
+    # .dev/cpp1/map.md). Serving is identical whoever writes: the proxy
+    # consumer (settings.gate, resource *) gets the leg in its snapshot and
+    # frames with the same lease semantics as the game leg.
+    leg = patch(
+        "workshop-leg-1",
+        0,
+        {
+            "state": "builders",
+            "message": "night build",
+            "allowed": [
+                {
+                    "draslId": "abababababababababababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    accepted = await request(store, "PATCH", "/v2/settings/gate/workshop", leg)
+    assert accepted.status_code == 202
+    value = leg["patch"]
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == [
+        {
+            "namespace": "gate",
+            "target": "workshop",
+            "revision": 1,
+            "value": value,
+            "value_hash": digest(value),
+        }
+    ]
+    frames = await envelopes(store, cid="game")
+    assert {
+        "kind": "settings",
+        "namespace": "gate",
+        "target": "workshop",
+        "value": value,
+        "timing": "live",
+    } in [frame["payload"] for frame in frames if frame["executable"]]
+
+
+async def test_cpp1_workshop_leg_fail_closed_and_validated(store):
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == []
+    view = await request(store, "GET", "/v2/settings/gate/workshop")
+    assert view.json()["initialized"] is False
+    assert view.json()["value"]["state"] == "closed"
+    game_leg = patch("g-bad", 0, {"state": "builders"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/*", game_leg)
+    ).status_code == 422
+    bad_mode = patch("w-bad", 0, {"mode": "open"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", bad_mode)
+    ).status_code == 422
+    bad_state = patch("w-bad-state", 0, {"state": "open"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", bad_state)
+    ).status_code == 422
+    starting = patch(
+        "w-starting",
+        0,
+        {
+            "state": "STARTING",
+            "allowed": [
+                {
+                    "draslId": "abab-abababababab-abababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", starting)
+    ).status_code == 202
+    view = await request(store, "GET", "/v2/settings/gate/workshop")
+    assert view.json()["value"] == {
+        "state": "starting",
+        "message": "",
+        "allowed": [
+            {"draslId": "abababababababababababababababab", "name": "Builder1"}
+        ],
+    }

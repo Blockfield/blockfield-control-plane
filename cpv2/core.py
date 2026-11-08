@@ -19,7 +19,17 @@ from cpv2.auth import (
     verifier,
 )
 from cpv2.db import one, record, rows
-from cpv2.settings import DEFINITIONS, changed, digest, merge
+from cpv2.settings import DEFINITIONS, WorkshopGate, changed, digest, merge
+
+
+def gate_model(namespace, target, definition):
+    # The workshop leg lives in the gate namespace at target "workshop" so
+    # the proxy consumer (settings.gate, resource *) receives it in the same
+    # snapshot/frames as the game leg; its value shape is the controller
+    # states the file gate carried, not the game modes.
+    if namespace == "gate" and target == "workshop":
+        return WorkshopGate
+    return definition.model
 
 
 async def event(conn, op, state, detail=None):
@@ -135,11 +145,12 @@ async def current_settings(conn, namespace, environment, backend, target):
                     legacy["value"]["since"] / 1000, timezone.utc
                 ),
             }
+    default = gate_model(namespace, target, definition)()
     return {
         "initialized": False,
         "revision": 0,
-        "value": definition.model().model_dump(),
-        "value_hash": digest(definition.model().model_dump()),
+        "value": default.model_dump(),
+        "value_hash": digest(default.model_dump()),
     }
 
 
@@ -184,7 +195,14 @@ async def settings_change(
         raise Problem("unknown_namespace", 404)
     data = model.model_dump(mode="json")
     env, backend = data["environment"], data["backend"]
-    identity.require(definition.write, env, backend, target)
+    # The workshop leg is reported by the workshop service, not toggled by
+    # game-entry admins: it carries its own service-holdable write scope.
+    scope = (
+        "workshop.gate"
+        if (namespace, target) == ("gate", "workshop")
+        else definition.write
+    )
+    identity.require(scope, env, backend, target)
     op, duplicate = (
         (None, False)
         if validate
@@ -194,7 +212,7 @@ async def settings_change(
             f"settings.{namespace}.{'rollback' if rollback else 'patch'}",
             target,
             data,
-            definition.write,
+            scope,
             seconds=86400,
         )
     )
@@ -228,7 +246,11 @@ async def settings_change(
     else:
         candidate = merge(before["value"], data["patch"])
     try:
-        after = definition.model.model_validate(candidate).model_dump()
+        after = (
+            gate_model(namespace, target, definition)
+            .model_validate(candidate)
+            .model_dump()
+        )
     except ValidationError:
         raise Problem("invalid_settings", 422) from None
     diff = changed(before["value"], after)
@@ -283,7 +305,9 @@ async def settings_change(
             identity.actor,
             data["revision"] if rollback else None,
             before.get("state_since", now())
-            if namespace == "gate" and before["value"]["mode"] == after["mode"]
+            if namespace == "gate"
+            and before["value"].get("mode", before["value"].get("state"))
+            == after.get("mode", after.get("state"))
             else now(),
         ),
     )
