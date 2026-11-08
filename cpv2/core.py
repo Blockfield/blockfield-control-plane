@@ -2,7 +2,7 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
 from pydantic import ValidationError
@@ -20,7 +20,44 @@ from cpv2.auth import (
 )
 from cpv2 import models
 from cpv2.db import one, record, rows
-from cpv2.settings import DEFINITIONS, changed, digest, merge
+from cpv2.settings import DEFINITIONS, WorkshopGate, changed, digest, merge
+
+
+def gate_model(namespace, target, definition):
+    # The workshop leg lives in the gate namespace at target "workshop" so
+    # the proxy consumer (settings.gate, resource *) receives it in the same
+    # snapshot/frames as the game leg; its value shape is the controller
+    # states the file gate carried, not the game modes.
+    if namespace == "gate" and target == "workshop":
+        return WorkshopGate
+    return definition.model
+
+
+# Deterministic namespace for service-principal account ids: a service
+# credential has no account, so its writes attribute a stable per-client
+# principal instead of NULL, never a human account.
+SERVICE_PRINCIPAL_NAMESPACE = uuid5(
+    NAMESPACE_URL, "https://blockfield/control-plane/service-principal"
+)
+
+
+def service_principal_id(client_id):
+    name = f"service:{client_id}"[:128]
+    return uuid5(SERVICE_PRINCIPAL_NAMESPACE, name), name
+
+
+async def service_principal(conn, identity):
+    """Stable id attributing a service-credential write.
+
+    settings_revisions.actor is NOT NULL REFERENCES accounts. The row is
+    created offline by provision(), which runs privileged; the runtime
+    (cp_runtime, no INSERT on accounts) only resolves the id. The display
+    name ("service:<client id>") marks the row as a service principal; no
+    credential ever points at it (credentials stay account-less by CHECK),
+    so it can never authenticate or hold grants.
+    """
+    principal, _ = service_principal_id(identity.client["id"])
+    return principal
 
 
 async def event(conn, op, state, detail=None):
@@ -136,11 +173,12 @@ async def current_settings(conn, namespace, environment, backend, target):
                     legacy["value"]["since"] / 1000, timezone.utc
                 ),
             }
+    default = gate_model(namespace, target, definition)()
     return {
         "initialized": False,
         "revision": 0,
-        "value": definition.model().model_dump(),
-        "value_hash": digest(definition.model().model_dump()),
+        "value": default.model_dump(),
+        "value_hash": digest(default.model_dump()),
     }
 
 
@@ -185,7 +223,14 @@ async def settings_change(
         raise Problem("unknown_namespace", 404)
     data = model.model_dump(mode="json")
     env, backend = data["environment"], data["backend"]
-    identity.require(definition.write, env, backend, target)
+    # The workshop leg is reported by the workshop service, not toggled by
+    # game-entry admins: it carries its own service-holdable write scope.
+    scope = (
+        "workshop.gate"
+        if (namespace, target) == ("gate", "workshop")
+        else definition.write
+    )
+    identity.require(scope, env, backend, target)
     op, duplicate = (
         (None, False)
         if validate
@@ -195,7 +240,7 @@ async def settings_change(
             f"settings.{namespace}.{'rollback' if rollback else 'patch'}",
             target,
             data,
-            definition.write,
+            scope,
             seconds=86400,
         )
     )
@@ -229,7 +274,11 @@ async def settings_change(
     else:
         candidate = merge(before["value"], data["patch"])
     try:
-        after = definition.model.model_validate(candidate).model_dump()
+        after = (
+            gate_model(namespace, target, definition)
+            .model_validate(candidate)
+            .model_dump()
+        )
     except ValidationError:
         raise Problem("invalid_settings", 422) from None
     diff = changed(before["value"], after)
@@ -268,6 +317,11 @@ async def settings_change(
     revision = head["revision"] + 1
     if revision > 9223372036854775807:
         raise Problem("revision_exhausted", 409)
+    actor = identity.actor
+    if actor is None:
+        # Service-credential write (the workshop gate leg): attribute the
+        # stable service principal instead of failing the NOT NULL actor.
+        actor = await service_principal(conn, identity)
     await conn.execute(
         "INSERT INTO settings_revisions(namespace,environment,backend,target,revision,base_revision,value,diff,value_hash,operation_id,actor,rollback_of,state_since) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
@@ -281,10 +335,12 @@ async def settings_change(
             Jsonb(diff),
             digest(after),
             op["id"],
-            identity.actor,
+            actor,
             data["revision"] if rollback else None,
             before.get("state_since", now())
-            if namespace == "gate" and before["value"]["mode"] == after["mode"]
+            if namespace == "gate"
+            and before["value"].get("mode", before["value"].get("state"))
+            == after.get("mode", after.get("state"))
             else now(),
         ),
     )
@@ -833,8 +889,15 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
         raise Problem("unknown_action", 404)
     data = model.model_dump(mode="json")
     if identity.account is None:
+        # A service may only supply the actor (workshop.act) for a kind it is
+        # also provisioned for: workshop.act alone never authorizes a kind.
+        # The admin-only kinds are not service-holdable (see SERVICE_SCOPES),
+        # so no service credential can mint them.
         identity.require("workshop.act", model.environment, model.backend, model.target)
-        scope = "workshop.act"
+        identity.require(
+            WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target
+        )
+        scope = "workshop.act," + WORKSHOP_SCOPES[kind]
     else:
         identity.require(
             WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target

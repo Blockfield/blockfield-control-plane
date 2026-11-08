@@ -1088,6 +1088,75 @@ async def test_uninitialized_service_and_migration_checksums_fail_closed(
             pass
 
 
+async def test_v1_database_with_original_checksum_migrates_cleanly(postgres):
+    # Applied migrations are immutable: an existing v1 database carrying the
+    # original 001 checksum must re-migrate without a mismatch.
+    name = "cp_" + uuid4().hex
+    async with await psycopg.AsyncConnection.connect(postgres, autocommit=True) as conn:
+        await conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        admin = make_conninfo(postgres, dbname=name)
+        await migrate(admin, name)
+        original = hashlib.sha256(
+            Path("migrations/001_core.sql").read_bytes()
+        ).hexdigest()
+        async with await psycopg.AsyncConnection.connect(admin) as conn:
+            recorded = await (
+                await conn.execute(
+                    "SELECT checksum FROM control.schema_migrations WHERE version=1"
+                )
+            ).fetchone()
+        assert recorded[0] == original
+        await migrate(admin, name)
+        async with await psycopg.AsyncConnection.connect(admin) as conn:
+            again = await (
+                await conn.execute(
+                    "SELECT checksum FROM control.schema_migrations WHERE version=1"
+                )
+            ).fetchone()
+        assert again[0] == original
+    finally:
+        async with await psycopg.AsyncConnection.connect(
+            postgres, autocommit=True
+        ) as conn:
+            await conn.execute(f'DROP DATABASE "{name}"')
+
+
+async def test_service_principal_row_provisioned_offline_needs_no_runtime_insert(
+    store,
+):
+    # provision() runs privileged and creates the service principal row, so
+    # the runtime (cp_runtime, no INSERT on accounts) only resolves its id.
+    await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "offline-principal",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    assert await sql(
+        store,
+        "SELECT display_name FROM accounts WHERE display_name=%s",
+        ("service:offline-principal",),
+    ) == [{"display_name": "service:offline-principal"}]
+    async with await psycopg.AsyncConnection.connect(
+        store["runtime"], options="-c search_path=control,pg_catalog"
+    ) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO accounts(id,display_name) VALUES(%s,%s)",
+                    (uuid4(), "runtime-probe"),
+                )
+
+
 async def test_actual_sse_frames_disconnect_and_socket_flush_is_not_execution(store):
     op = await queued(store)
     epoch = (await sql(store, "SELECT epoch FROM consumers WHERE id='game'"))[0][
@@ -3991,8 +4060,12 @@ async def test_workshop_service_act_scope(store):
     site = await provision(
         store["admin"],
         {
-            "client": {"id": "site", "via": "game", "ceiling": ["workshop.act"]},
-            "ceiling": ["workshop.act"],
+            "client": {
+                "id": "site",
+                "via": "game",
+                "ceiling": ["workshop.act", "workshop.message"],
+            },
+            "ceiling": ["workshop.act", "workshop.message"],
             "environment": "prod",
             "backend": "game",
             "resource": "*",
@@ -4054,8 +4127,10 @@ async def test_workshop_admin_members_need_owner_step_up(store):
     response = await request(
         store, "POST", "/v2/workshop/members", service, "site-stepup"
     )
+    # Members needs the admin-only workshop.members scope, which no service
+    # credential may hold: rejected before any owner step-up is evaluated.
     assert response.status_code == 403, response.text
-    assert response.json()["error"] == "owner_approval_required"
+    assert response.json()["error"] == "forbidden"
 
 
 async def test_c20_health_reports_database_outage(store, monkeypatch):
@@ -4510,3 +4585,271 @@ async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
     ).status_code == 202
     bad = patch("g-bad", 1, {"ai": {"hardLimit": None}})
     assert (await request(store, "PATCH", gpath, bad, "owner")).status_code == 422
+
+
+async def test_cpp1_workshop_leg_reaches_proxy_snapshot_and_frames(store):
+    # Writer contract: whoever holds workshop.gate reports the leg (admin here;
+    # the autonomous workshop reporter needs the authorship follow-up noted in
+    # .dev/cpp1/map.md). Serving is identical whoever writes: the proxy
+    # consumer (settings.gate, resource *) gets the leg in its snapshot and
+    # frames with the same lease semantics as the game leg.
+    leg = patch(
+        "workshop-leg-1",
+        0,
+        {
+            "state": "builders",
+            "message": "night build",
+            "allowed": [
+                {
+                    "draslId": "abababababababababababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    accepted = await request(store, "PATCH", "/v2/settings/gate/workshop", leg)
+    assert accepted.status_code == 202
+    value = leg["patch"]
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == [
+        {
+            "namespace": "gate",
+            "target": "workshop",
+            "revision": 1,
+            "value": value,
+            "value_hash": digest(value),
+        }
+    ]
+    frames = await envelopes(store, cid="game")
+    assert {
+        "kind": "settings",
+        "namespace": "gate",
+        "target": "workshop",
+        "value": value,
+        "timing": "live",
+    } in [frame["payload"] for frame in frames if frame["executable"]]
+
+
+async def test_cpp1_workshop_leg_fail_closed_and_validated(store):
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == []
+    view = await request(store, "GET", "/v2/settings/gate/workshop")
+    assert view.json()["initialized"] is False
+    assert view.json()["value"]["state"] == "closed"
+    game_leg = patch("g-bad", 0, {"state": "builders"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/*", game_leg)
+    ).status_code == 422
+    bad_mode = patch("w-bad", 0, {"mode": "open"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", bad_mode)
+    ).status_code == 422
+    bad_state = patch("w-bad-state", 0, {"state": "open"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", bad_state)
+    ).status_code == 422
+    starting = patch(
+        "w-starting",
+        0,
+        {
+            "state": "STARTING",
+            "allowed": [
+                {
+                    "draslId": "abab-abababababab-abababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", starting)
+    ).status_code == 202
+    view = await request(store, "GET", "/v2/settings/gate/workshop")
+    assert view.json()["value"] == {
+        "state": "starting",
+        "message": "",
+        "allowed": [
+            {"draslId": "abababababababababababababababab", "name": "Builder1"}
+        ],
+    }
+
+
+async def test_cpp3_service_reports_workshop_leg_with_service_actor(store):
+    # CPP3: the workshop controller reports its gate leg with a
+    # workshop.gate service credential. Before the fix the PATCH failed 503
+    # (settings_revisions.actor NOT NULL, service has no account) and, even
+    # accepted, the frame stayed non-executable at delivery.
+    store["tokens"]["reporter"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "workshop-reporter",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    # The reporter reads the leg back with the write scope alone (no global
+    # settings.read) to report idempotently; other namespaces stay denied.
+    view = await request(store, "GET", "/v2/settings/gate/workshop", role="reporter")
+    assert view.status_code == 200, view.text
+    assert view.json()["initialized"] is False
+    assert view.json()["value"]["state"] == "closed"
+    denied = await request(store, "GET", "/v2/settings/gameplay/arena", role="reporter")
+    assert denied.status_code == 403, denied.text
+    leg = patch(
+        "reporter-leg-1",
+        0,
+        {
+            "state": "builders",
+            "message": "night build",
+            "allowed": [
+                {
+                    "draslId": "abababababababababababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gate/workshop", leg, "reporter"
+    )
+    assert accepted.status_code == 202, accepted.text
+    operation = accepted.json()["operationId"]
+    rows = await sql(
+        store,
+        "SELECT account_id, credential_id FROM operations WHERE id=%s",
+        (operation,),
+    )
+    assert rows[0]["account_id"] is None
+    revisions = await sql(
+        store,
+        "SELECT actor FROM settings_revisions WHERE operation_id=%s",
+        (operation,),
+    )
+    names = await sql(
+        store, "SELECT display_name FROM accounts WHERE id=%s", (revisions[0]["actor"],)
+    )
+    assert names == [{"display_name": "service:workshop-reporter"}]
+    # The proxy consumer receives the leg in snapshot and executable frames.
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == [
+        {
+            "namespace": "gate",
+            "target": "workshop",
+            "revision": 1,
+            "value": leg["patch"],
+            "value_hash": digest(leg["patch"]),
+        }
+    ]
+    frames = await envelopes(store, cid="game")
+    assert {
+        "kind": "settings",
+        "namespace": "gate",
+        "target": "workshop",
+        "value": leg["patch"],
+        "timing": "live",
+    } in [frame["payload"] for frame in frames if frame["executable"]]
+    # A changed report revises the same leg under the same service actor; a
+    # stale revision still conflicts.
+    update = patch("reporter-leg-2", 1, {"message": "morning build"})
+    updated = await request(
+        store, "PATCH", "/v2/settings/gate/workshop", update, "reporter"
+    )
+    assert updated.status_code == 202, updated.text
+    again = await sql(
+        store,
+        "SELECT actor FROM settings_revisions WHERE operation_id=%s",
+        (updated.json()["operationId"],),
+    )
+    assert again == revisions
+    stale = patch("reporter-leg-3", 1, {"message": "stale"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", stale, "reporter")
+    ).status_code == 409
+    # The reporter scope reaches nothing else.
+    other = patch("reporter-other", 0, {"lobby": {"pvpEnabled": True}})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gameplay/arena", other, "reporter")
+    ).status_code == 403
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/*", other, "reporter")
+    ).status_code == 403
+
+
+async def test_cpp1r2_service_act_alone_cannot_post_members(store):
+    # A service holding only workshop.act must not change the workshop member
+    # ACL: members needs the admin-only workshop.members scope, which no
+    # service credential may hold.
+    store["tokens"]["act-only"] = await provision(
+        store["admin"],
+        {
+            "client": {"id": "act-only", "via": "game", "ceiling": ["workshop.act"]},
+            "ceiling": ["workshop.act"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    body = workshop_body(store, members=[{"draslId": "f" * 32, "name": "Stranger"}])
+    response = await request(store, "POST", "/v2/workshop/members", body, "act-only")
+    assert response.status_code == 403, response.text
+
+
+async def test_cpp1r2_service_workshop_op_fenced_at_delivery(store):
+    # Accept-time per-kind scopes are not enough on their own: a NULL-account
+    # (service-issued) operation that is not the workshop gate leg must stay
+    # rejected at delivery, so its frame is never executable.
+    store["tokens"]["messenger"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "messenger",
+                "via": "game",
+                "ceiling": ["workshop.act", "workshop.message"],
+            },
+            "ceiling": ["workshop.act", "workshop.message"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    body = workshop_body(store, message="hi")
+    response = await request(store, "POST", "/v2/workshop/message", body, "messenger")
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["operationId"]
+    rows = await sql(
+        store,
+        "SELECT account_id FROM operations WHERE id=%s",
+        (operation_id,),
+    )
+    assert rows[0]["account_id"] is None
+    frames = await envelopes(store, cid="workshop")
+    frame = next(item for item in frames if item["operationId"] == operation_id)
+    assert not frame["executable"]
+    assert frame["payload"] is None
