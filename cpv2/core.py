@@ -2,7 +2,7 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
 from pydantic import ValidationError
@@ -31,6 +31,31 @@ def gate_model(namespace, target, definition):
     if namespace == "gate" and target == "workshop":
         return WorkshopGate
     return definition.model
+
+
+# Deterministic namespace for service-principal account ids: a service
+# credential has no account, so its writes attribute a stable per-client
+# principal instead of NULL, never a human account.
+SERVICE_PRINCIPAL_NAMESPACE = uuid5(
+    NAMESPACE_URL, "https://blockfield/control-plane/service-principal"
+)
+
+
+async def service_principal(conn, identity):
+    """Stable accounts row attributing a service-credential write.
+
+    settings_revisions.actor is NOT NULL REFERENCES accounts. The display
+    name ("service:<client id>") marks the row as a service principal; no
+    credential ever points at it (credentials stay account-less by CHECK),
+    so it can never authenticate or hold grants.
+    """
+    name = f"service:{identity.client['id']}"[:128]
+    principal = uuid5(SERVICE_PRINCIPAL_NAMESPACE, name)
+    await conn.execute(
+        "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+        (principal, name),
+    )
+    return principal
 
 
 async def event(conn, op, state, detail=None):
@@ -290,6 +315,11 @@ async def settings_change(
     revision = head["revision"] + 1
     if revision > 9223372036854775807:
         raise Problem("revision_exhausted", 409)
+    actor = identity.actor
+    if actor is None:
+        # Service-credential write (the workshop gate leg): attribute the
+        # stable service principal instead of failing the NOT NULL actor.
+        actor = await service_principal(conn, identity)
     await conn.execute(
         "INSERT INTO settings_revisions(namespace,environment,backend,target,revision,base_revision,value,diff,value_hash,operation_id,actor,rollback_of,state_since) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
@@ -303,7 +333,7 @@ async def settings_change(
             Jsonb(diff),
             digest(after),
             op["id"],
-            identity.actor,
+            actor,
             data["revision"] if rollback else None,
             before.get("state_since", now())
             if namespace == "gate"

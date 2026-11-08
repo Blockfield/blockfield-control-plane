@@ -4611,3 +4611,117 @@ async def test_cpp1_workshop_leg_fail_closed_and_validated(store):
             {"draslId": "abababababababababababababababab", "name": "Builder1"}
         ],
     }
+
+
+async def test_cpp3_service_reports_workshop_leg_with_service_actor(store):
+    # CPP3: the workshop controller reports its gate leg with a
+    # workshop.gate service credential. Before the fix the PATCH failed 503
+    # (settings_revisions.actor NOT NULL, service has no account) and, even
+    # accepted, the frame stayed non-executable at delivery.
+    store["tokens"]["reporter"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "workshop-reporter",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    # The reporter reads the leg back with the write scope alone (no global
+    # settings.read) to report idempotently; other namespaces stay denied.
+    view = await request(store, "GET", "/v2/settings/gate/workshop", role="reporter")
+    assert view.status_code == 200, view.text
+    assert view.json()["initialized"] is False
+    assert view.json()["value"]["state"] == "closed"
+    denied = await request(store, "GET", "/v2/settings/gameplay/arena", role="reporter")
+    assert denied.status_code == 403, denied.text
+    leg = patch(
+        "reporter-leg-1",
+        0,
+        {
+            "state": "builders",
+            "message": "night build",
+            "allowed": [
+                {
+                    "draslId": "abababababababababababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gate/workshop", leg, "reporter"
+    )
+    assert accepted.status_code == 202, accepted.text
+    operation = accepted.json()["operationId"]
+    rows = await sql(
+        store,
+        "SELECT account_id, credential_id FROM operations WHERE id=%s",
+        (operation,),
+    )
+    assert rows[0]["account_id"] is None
+    revisions = await sql(
+        store,
+        "SELECT actor FROM settings_revisions WHERE operation_id=%s",
+        (operation,),
+    )
+    names = await sql(
+        store, "SELECT display_name FROM accounts WHERE id=%s", (revisions[0]["actor"],)
+    )
+    assert names == [{"display_name": "service:workshop-reporter"}]
+    # The proxy consumer receives the leg in snapshot and executable frames.
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == [
+        {
+            "namespace": "gate",
+            "target": "workshop",
+            "revision": 1,
+            "value": leg["patch"],
+            "value_hash": digest(leg["patch"]),
+        }
+    ]
+    frames = await envelopes(store, cid="game")
+    assert {
+        "kind": "settings",
+        "namespace": "gate",
+        "target": "workshop",
+        "value": leg["patch"],
+        "timing": "live",
+    } in [frame["payload"] for frame in frames if frame["executable"]]
+    # A changed report revises the same leg under the same service actor; a
+    # stale revision still conflicts.
+    update = patch("reporter-leg-2", 1, {"message": "morning build"})
+    updated = await request(
+        store, "PATCH", "/v2/settings/gate/workshop", update, "reporter"
+    )
+    assert updated.status_code == 202, updated.text
+    again = await sql(
+        store,
+        "SELECT actor FROM settings_revisions WHERE operation_id=%s",
+        (updated.json()["operationId"],),
+    )
+    assert again == revisions
+    stale = patch("reporter-leg-3", 1, {"message": "stale"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", stale, "reporter")
+    ).status_code == 409
+    # The reporter scope reaches nothing else.
+    other = patch("reporter-other", 0, {"lobby": {"pvpEnabled": True}})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gameplay/arena", other, "reporter")
+    ).status_code == 403
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/*", other, "reporter")
+    ).status_code == 403

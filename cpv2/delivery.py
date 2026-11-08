@@ -93,37 +93,57 @@ async def valid_operation(conn, op):
     c = await one(conn, "SELECT * FROM credentials WHERE id=%s", (op["credential_id"],))
     if not c or c["revoked_at"] or c["expires_at"] <= now():
         return "rejected"
-    account = await one(
-        conn, "SELECT * FROM accounts WHERE id=%s FOR SHARE", (op["account_id"],)
-    )
-    if (
-        not account
-        or account["status"] != "active"
-        or account["is_test"]
-        or account["authorization_epoch"] != op["authorization_epoch"]
-    ):
-        return "rejected"
-    c = await one(
-        conn, "SELECT * FROM credentials WHERE id=%s FOR SHARE", (op["credential_id"],)
-    )
-    if c["revoked_at"] or c["expires_at"] <= now():
-        return "rejected"
-    client = await one(conn, "SELECT * FROM clients WHERE id=%s", (c["client_id"],))
-    grants = await rows(
-        conn,
-        "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
-        (account["id"], now()),
-    )
-    owner = is_owner_session(
-        client,
-        c,
-        await one(
+    # Service-issued operation (e.g. the workshop gate leg): no human
+    # account exists, so delivery rechecks the provisioned scope exactly
+    # like the accept-time check. A narrowed or revoked credential, or a
+    # narrowed client ceiling, fences the frame; nothing here mints
+    # human authority.
+    if op["account_id"] is None:
+        if c["kind"] != "service":
+            return "rejected"
+        c = await one(
             conn,
-            "SELECT 1 FROM owner_memberships WHERE account_id=%s",
-            (account["id"],),
-        ),
-    )
-    identity = Identity(c, client, account, grants, owner)
+            "SELECT * FROM credentials WHERE id=%s FOR SHARE",
+            (op["credential_id"],),
+        )
+        if c["revoked_at"] or c["expires_at"] <= now():
+            return "rejected"
+        client = await one(conn, "SELECT * FROM clients WHERE id=%s", (c["client_id"],))
+        identity = Identity(c, client, None, [], False)
+    else:
+        account = await one(
+            conn, "SELECT * FROM accounts WHERE id=%s FOR SHARE", (op["account_id"],)
+        )
+        if (
+            not account
+            or account["status"] != "active"
+            or account["is_test"]
+            or account["authorization_epoch"] != op["authorization_epoch"]
+        ):
+            return "rejected"
+        c = await one(
+            conn,
+            "SELECT * FROM credentials WHERE id=%s FOR SHARE",
+            (op["credential_id"],),
+        )
+        if c["revoked_at"] or c["expires_at"] <= now():
+            return "rejected"
+        client = await one(conn, "SELECT * FROM clients WHERE id=%s", (c["client_id"],))
+        grants = await rows(
+            conn,
+            "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+            (account["id"], now()),
+        )
+        owner = is_owner_session(
+            client,
+            c,
+            await one(
+                conn,
+                "SELECT 1 FROM owner_memberships WHERE account_id=%s",
+                (account["id"],),
+            ),
+        )
+        identity = Identity(c, client, account, grants, owner)
     # required_scope lists every permission the accepted diff required
     # (comma-joined); losing any one of them fences the frame.
     if not all(
