@@ -15,6 +15,18 @@ from cpv2.settings import digest
 AUDIENCE = "blockfield-control-v2"
 WORKSHOP_WRITE_SCOPES = {"workshop.message", "workshop.wake", "workshop.cancel"}
 WORKSHOP_ADMIN_SCOPES = {"workshop.members", "workshop.release.select"}
+# Site RCON replacements every moderator may issue (mirrors site `moderate`).
+MODERATION_SCOPES = {
+    "moderation.say",
+    "moderation.list",
+    "moderation.team-kick",
+    "moderation.class-lock",
+    "moderation.class-unlock",
+    "moderation.range",
+    "moderation.stop-room",
+}
+# Pardon needs the site `ban` permission: admin only, like moderation.ban.
+MODERATION_ADMIN_SCOPES = {"moderation.pardon"}
 ROLE_SCOPES = {
     "builder": {"settings.read", "operations.read", "maps.edit"},
     "moderator": {
@@ -22,6 +34,7 @@ ROLE_SCOPES = {
         "operations.read",
         "maps.edit",
         "moderation.kick",
+        *MODERATION_SCOPES,
         *WORKSHOP_WRITE_SCOPES,
     },
     "admin": {
@@ -33,6 +46,8 @@ ROLE_SCOPES = {
         "settings.gameplay.write",
         "staff.lower.manage",
         "audit.read",
+        *MODERATION_SCOPES,
+        *MODERATION_ADMIN_SCOPES,
         *WORKSHOP_WRITE_SCOPES,
         *WORKSHOP_ADMIN_SCOPES,
     },

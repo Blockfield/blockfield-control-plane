@@ -151,6 +151,14 @@ async def store(postgres):
                         "settings.gate",
                         "moderation.kick",
                         "moderation.ban",
+                        "moderation.say",
+                        "moderation.list",
+                        "moderation.pardon",
+                        "moderation.team-kick",
+                        "moderation.class-lock",
+                        "moderation.class-unlock",
+                        "moderation.range",
+                        "moderation.stop-room",
                     ]
                     + (
                         [
@@ -774,6 +782,110 @@ async def test_ack_identity_hash_generation_and_audit(store):
         and audit[0]["actor"] is None
         and audit[0]["outcome"] == "received"
     )
+
+
+async def test_moderation_commands_validate_rbac_push_and_ack(store):
+    room = "12345678-1234-1234-1234-123456789012"
+    bodies = {
+        "moderation.say": {"text": "Hello players"},
+        "moderation.list": {},
+        "moderation.pardon": {"player": "Steve_01"},
+        "moderation.team-kick": {"player": "Steve_01"},
+        "moderation.class-lock": {"classId": "drone"},
+        "moderation.class-unlock": {"classId": "drone"},
+        "moderation.range": {"op": "open"},
+        "moderation.stop-room": {"roomId": room, "outcome": "draw"},
+    }
+    for kind, extra in bodies.items():
+        body = {
+            "idempotencyKey": f"cpc0-{kind}",
+            "environment": "prod",
+            "backend": "game",
+            "consumerId": "game",
+            "generation": str(store["generation"]),
+            "target": "arena",
+            **extra,
+        }
+        role = "admin" if kind == "moderation.pardon" else "moderator"
+        assert (
+            await request(store, "POST", f"/v2/actions/{kind}", body, "builder")
+        ).status_code == 403
+        if kind == "moderation.pardon":
+            assert (
+                await request(store, "POST", f"/v2/actions/{kind}", body, "moderator")
+            ).status_code == 403
+        response = await request(store, "POST", f"/v2/actions/{kind}", body, role)
+        assert response.status_code == 202, (kind, response.text)
+        again = await request(store, "POST", f"/v2/actions/{kind}", body, role)
+        assert again.json()["operationId"] == response.json()["operationId"]
+    frames = await envelopes(store)
+    assert [f["payload"]["kind"] for f in frames] == list(bodies), [
+        f["payload"] for f in frames
+    ]
+    say = next(f for f in frames if f["payload"]["kind"] == "moderation.say")
+    assert say["payload"] == {
+        "kind": "moderation.say",
+        "target": "arena",
+        "text": "Hello players",
+    }
+    stop = next(f for f in frames if f["payload"]["kind"] == "moderation.stop-room")
+    assert stop["payload"] == {
+        "kind": "moderation.stop-room",
+        "target": "arena",
+        "roomId": room,
+        "outcome": "draw",
+    }
+    for state in ("received", "validated", "applied"):
+        acked = await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(say, state), "game-agent"
+        )
+        assert acked.status_code == 200, (state, acked.text)
+    read = await request(
+        store, "GET", f"/v2/operations/{say['operationId']}", role="moderator"
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["status"] == "applied"
+    assert [r["state"] for r in read.json()["receipts"]] == [
+        "received",
+        "validated",
+        "applied",
+    ]
+
+
+async def test_moderation_commands_reject_bad_shapes(store):
+    room = "12345678-1234-1234-1234-123456789012"
+    bad = [
+        ("moderation.say", {"text": "/not-a-chat"}, 422),
+        ("moderation.say", {"text": "x" * 121}, 422),
+        ("moderation.say", {}, 422),
+        ("moderation.say", {"text": "a\x00b"}, 422),
+        ("moderation.pardon", {"player": "ab"}, 422),
+        ("moderation.team-kick", {"player": "has space"}, 422),
+        ("moderation.class-lock", {"classId": "Drone"}, 422),
+        ("moderation.range", {"op": "half"}, 422),
+        ("moderation.stop-room", {"roomId": "nope", "outcome": "none"}, 422),
+        ("moderation.stop-room", {"roomId": room, "outcome": "maybe"}, 422),
+        (
+            "moderation.stop-room",
+            {"roomId": room, "outcome": "none", "reason": "win fast"},
+            422,
+        ),
+        ("moderation.fly", {}, 404),
+    ]
+    for kind, extra, status in bad:
+        body = {
+            "idempotencyKey": f"cpc0-bad-{kind}-{status}-{len(extra)}",
+            "environment": "prod",
+            "backend": "game",
+            "consumerId": "game",
+            "generation": str(store["generation"]),
+            "target": "arena",
+            **extra,
+        }
+        response = await request(store, "POST", f"/v2/actions/{kind}", body, "admin")
+        assert response.status_code == status, (kind, extra, response.text)
+    assert not await sql(store, "SELECT * FROM operations")
+    assert not await sql(store, "SELECT * FROM outbox")
 
 
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
