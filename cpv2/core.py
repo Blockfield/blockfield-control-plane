@@ -790,6 +790,10 @@ WORKSHOP_SCOPES = {
     "wake": "workshop.wake",
     "cancel": "workshop.cancel",
     "release.select": "workshop.release.select",
+    "map": "workshop.map",
+    "sessions": "workshop.sessions",
+    "ai-key": "workshop.ai-key",
+    "mode": "workshop.mode",
 }
 WORKSHOP_NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
 WORKSHOP_ROLES = ("builder", "lead", "admin")
@@ -848,6 +852,224 @@ def _workshop_message(value):
     if "§" in value or any(unicodedata.category(char) == "Cc" for char in value):
         raise Problem("invalid_workshop_message", 422)
     return value
+
+
+# Remaining inbox kinds (map/sessions/ai-key/mode). Bounds mirror the site
+# writers (blockfield-site src/lib/admin.ts writeRequest) and the Workshop
+# consumer (controller _apply/_map_change/_apply_ai_key); the live catalog
+# (known map ids) stays consumer-side, like the members maps rule.
+_WORKSHOP_MAP_ID = re.compile(r"^[a-z0-9_]{1,32}$")
+_WORKSHOP_NEW_MAP_ID = re.compile(r"^[a-z0-9][a-z0-9_]{0,31}$")
+_WORKSHOP_RESERVED_MAP_IDS = ("hub", "lobby", "limbo")
+_WORKSHOP_ARENA_MODES = (
+    "campaign",
+    "room",
+    "tdm",
+    "snipers",
+    "awp",
+    "deathmatch",
+    "training",
+)
+_WORKSHOP_BRANCH = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_WORKSHOP_COPY_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_WORKSHOP_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+_WORKSHOP_AI_KEY = re.compile(r"[\x21-\x7e]{20,2048}")
+_WORKSHOP_PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+_WORKSHOP_AI_PRESETS = ("openrouter", "vercel-gateway")
+# Preset key files/statuses a custom provider id must never collide with
+# (controller AI_PROVIDER_RESERVED_IDS): openrouter.key, gateway.key,
+# ai-key.json, ai-gateway-key.json.
+_WORKSHOP_AI_RESERVED = frozenset(
+    {"openrouter", "vercel-gateway", "gateway", "ai-key", "ai-gateway-key"}
+)
+
+
+def _workshop_map_title(value):
+    if (
+        not isinstance(value, str)
+        or "§" in value
+        or any(unicodedata.category(char) == "Cc" for char in value)
+    ):
+        raise Problem("invalid_workshop_map", 422)
+    name = value.strip()
+    if not 1 <= len(name) <= 100:
+        raise Problem("invalid_workshop_map", 422)
+    return name
+
+
+def _workshop_map(model):
+    # Map ids are outside any scoped grant (same rule as members maps): map
+    # operations require a global target; the consumer checks catalog membership.
+    if model.target != "*":
+        raise Problem("invalid_workshop_map", 422)
+    map_op = model.mapOp
+    if map_op not in ("map-create", "map-properties"):
+        raise Problem("invalid_workshop_map", 422)
+    map_id = model.mapId
+    if map_op == "map-create":
+        if (
+            not isinstance(map_id, str)
+            or _WORKSHOP_NEW_MAP_ID.fullmatch(map_id) is None
+            or map_id in _WORKSHOP_RESERVED_MAP_IDS
+        ):
+            raise Problem("invalid_workshop_map", 422)
+    elif not isinstance(map_id, str) or _WORKSHOP_MAP_ID.fullmatch(map_id) is None:
+        raise Problem("invalid_workshop_map", 422)
+    name = _workshop_map_title(model.name)
+    revision = model.expectedRevision
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise Problem("invalid_workshop_map", 422)
+    partial = {
+        "mapOp": map_op,
+        "mapId": map_id,
+        "name": name,
+        "expectedRevision": revision,
+    }
+    if map_op == "map-create":
+        modes = model.supportedModes
+        if (
+            not isinstance(modes, list)
+            or not 1 <= len(modes) <= 7
+            or len(set(modes)) != len(modes)
+            or any(mode not in _WORKSHOP_ARENA_MODES for mode in modes)
+        ):
+            raise Problem("invalid_workshop_map", 422)
+        partial["supportedModes"] = list(modes)
+    else:
+        if (
+            not isinstance(model.workingCopyId, str)
+            or _WORKSHOP_COPY_UUID.fullmatch(model.workingCopyId) is None
+        ):
+            raise Problem("invalid_workshop_map", 422)
+        partial["workingCopyId"] = model.workingCopyId
+    return partial
+
+
+def _workshop_sessions(model):
+    if model.target != "*":
+        raise Problem("invalid_workshop_sessions", 422)
+    offset = model.offset
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or not 0 <= offset <= 1000000
+    ):
+        raise Problem("invalid_workshop_sessions", 422)
+    limit = 100 if model.limit is None else model.limit
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise Problem("invalid_workshop_sessions", 422)
+    return {"offset": offset, "limit": limit}
+
+
+def _workshop_ai_key(model, fields_set):
+    # Keys are write-only like the inbox: validation errors never echo them,
+    # and audit/result rows carry no key material (only the payload hash).
+    if model.target != "*":
+        raise Problem("invalid_workshop_aikey", 422)
+    provider = model.provider
+    if not isinstance(provider, str) or (
+        provider not in _WORKSHOP_AI_PRESETS
+        and (
+            _WORKSHOP_PROVIDER_ID.fullmatch(provider) is None
+            or provider in _WORKSHOP_AI_RESERVED
+        )
+    ):
+        raise Problem("invalid_workshop_aikey", 422)
+    if "key" not in fields_set:
+        raise Problem("invalid_workshop_aikey", 422)
+    key = model.key
+    if key is not None and (
+        not isinstance(key, str) or _WORKSHOP_AI_KEY.fullmatch(key) is None
+    ):
+        raise Problem("invalid_workshop_aikey", 422)
+    return {"provider": provider, "key": key}
+
+
+def _workshop_mode_map_id(value):
+    return isinstance(value, str) and (
+        value == "hub" or _WORKSHOP_MAP_ID.fullmatch(value) is not None
+    )
+
+
+def _workshop_mode(model):
+    if model.target != "*":
+        raise Problem("invalid_workshop_mode", 422)
+    profile = model.profile
+    if profile not in ("game", "workshop", "test"):
+        raise Problem("invalid_workshop_mode", 422)
+    revision = model.expectedRevision
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise Problem("invalid_workshop_mode", 422)
+    recover = model.recover is True
+    if recover and profile != "game":
+        raise Problem("invalid_workshop_mode", 422)
+    # Every profile carries only its own fields (mirrors the inbox writer:
+    # archived sessionId only toward workshop, modeId only for a test).
+    if profile != "workshop" and (
+        model.session is not None
+        or model.maps is not None
+        or model.branches is not None
+        or model.sessionId is not None
+    ):
+        raise Problem("invalid_workshop_mode", 422)
+    if profile != "test" and (
+        model.candidateId is not None or model.modeId is not None
+    ):
+        raise Problem("invalid_workshop_mode", 422)
+    partial = {"profile": profile, "expectedRevision": revision}
+    if recover:
+        partial["recover"] = True
+    if profile == "workshop":
+        session = model.session
+        if session not in ("new", "resume"):
+            raise Problem("invalid_workshop_mode", 422)
+        if session == "new":
+            maps = model.maps
+            if maps is not None and (
+                not isinstance(maps, list)
+                or not maps
+                or len(set(maps)) != len(maps)
+                or not all(_workshop_mode_map_id(entry) for entry in maps)
+            ):
+                raise Problem("invalid_workshop_mode", 422)
+            partial["session"] = "new"
+            if maps is not None:
+                partial["maps"] = list(maps)
+            branches = model.branches
+            if branches is not None:
+                if (
+                    not isinstance(branches, dict)
+                    or not isinstance(maps, list)
+                    or set(branches) != set(maps)
+                    or any(
+                        not isinstance(name, str)
+                        or _WORKSHOP_BRANCH.fullmatch(name) is None
+                        or name == "main"
+                        for name in branches.values()
+                    )
+                ):
+                    raise Problem("invalid_workshop_mode", 422)
+                partial["branches"] = dict(branches)
+        else:
+            partial["session"] = "resume"
+            if model.sessionId is not None:
+                if _WORKSHOP_COPY_UUID.fullmatch(model.sessionId) is None:
+                    raise Problem("invalid_workshop_mode", 422)
+                partial["sessionId"] = model.sessionId
+    elif profile == "test":
+        if (
+            not isinstance(model.candidateId, str)
+            or _WORKSHOP_HEX32.fullmatch(model.candidateId) is None
+        ):
+            raise Problem("invalid_workshop_mode", 422)
+        partial["candidateId"] = model.candidateId
+        if model.modeId is not None:
+            if model.modeId not in _WORKSHOP_ARENA_MODES:
+                raise Problem("invalid_workshop_mode", 422)
+            partial["modeId"] = model.modeId
+    return partial
 
 
 async def _workshop_caller(conn, identity, actor):
@@ -921,6 +1143,14 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
         key = "actor"
     elif kind in ("wake", "cancel"):
         partial, key = {}, "actor"
+    elif kind == "map":
+        partial, key = _workshop_map(model), "actor"
+    elif kind == "sessions":
+        partial, key = _workshop_sessions(model), "actor"
+    elif kind == "ai-key":
+        partial, key = _workshop_ai_key(model, model.model_fields_set), "actor"
+    elif kind == "mode":
+        partial, key = _workshop_mode(model), "actor"
     else:
         release = model.release
         if not isinstance(release, str) or WORKSHOP_RELEASE.fullmatch(release) is None:
@@ -966,7 +1196,8 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
         "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id "
         "WHERE o.consumer_id=%s AND p.kind IN "
         "('workshop.members','workshop.message','workshop.wake','workshop.cancel',"
-        "'workshop.release.select') AND p.deadline>now() AND NOT EXISTS(SELECT 1 "
+        "'workshop.release.select','workshop.map','workshop.sessions',"
+        "'workshop.ai-key','workshop.mode') AND p.deadline>now() AND NOT EXISTS(SELECT 1 "
         "FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND "
         "a.sequence=o.sequence AND a.state IN "
         "('effective','rejected','unknown'))",

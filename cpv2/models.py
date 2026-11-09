@@ -87,6 +87,26 @@ class WorkshopAction(Mutation):
     message: str | None = None
     release: str | None = None
     record: dict | None = None
+    # Remaining inbox kinds (map/sessions/ai-key/mode): kind-specific shapes
+    # are validated in core.workshop_op, which rejects unknown combinations.
+    mapOp: str | None = None
+    mapId: str | None = None
+    name: str | None = None
+    supportedModes: list | None = None
+    workingCopyId: str | None = None
+    expectedRevision: int | None = None
+    offset: int | None = None
+    limit: int | None = None
+    provider: str | None = None
+    key: str | None = None
+    profile: str | None = None
+    recover: bool | None = None
+    session: str | None = None
+    maps: list | None = None
+    branches: dict | None = None
+    sessionId: str | None = None
+    candidateId: str | None = None
+    modeId: str | None = None
     expiresInSeconds: int = Field(default=30, ge=1, le=60)
 
 
