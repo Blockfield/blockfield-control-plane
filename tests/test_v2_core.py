@@ -8,6 +8,7 @@ import random
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -27,7 +28,12 @@ from webauthn.helpers import bytes_to_base64url
 import api
 from cpv2 import app as cpv2_app
 from cpv2 import core, delivery
-from cpv2.admin import bootstrap, provision
+from cpv2.admin import (
+    bootstrap,
+    main as admin_main,
+    provision,
+    revoke as revoke_credential,
+)
 from cpv2.app import create_app
 from cpv2.auth import (
     OWNER_SCOPES,
@@ -151,6 +157,14 @@ async def store(postgres):
                         "settings.gate",
                         "moderation.kick",
                         "moderation.ban",
+                        "moderation.say",
+                        "moderation.list",
+                        "moderation.pardon",
+                        "moderation.team-kick",
+                        "moderation.class-lock",
+                        "moderation.class-unlock",
+                        "moderation.range",
+                        "moderation.stop-room",
                     ]
                     + (
                         [
@@ -776,6 +790,427 @@ async def test_ack_identity_hash_generation_and_audit(store):
     )
 
 
+async def test_moderation_commands_validate_rbac_push_and_ack(store):
+    room = "12345678-1234-1234-1234-123456789012"
+    bodies = {
+        "moderation.say": {"text": "Hello players"},
+        "moderation.list": {},
+        "moderation.pardon": {"player": "Steve_01"},
+        "moderation.team-kick": {"player": "Steve_01"},
+        "moderation.class-lock": {"classId": "drone"},
+        "moderation.class-unlock": {"classId": "drone"},
+        "moderation.range": {"op": "open"},
+        "moderation.stop-room": {"roomId": room, "outcome": "draw"},
+    }
+    for kind, extra in bodies.items():
+        body = {
+            "idempotencyKey": f"cpc0-{kind}",
+            "environment": "prod",
+            "backend": "game",
+            "consumerId": "game",
+            "generation": str(store["generation"]),
+            "target": "arena",
+            **extra,
+        }
+        role = "admin" if kind == "moderation.pardon" else "moderator"
+        assert (
+            await request(store, "POST", f"/v2/actions/{kind}", body, "builder")
+        ).status_code == 403
+        if kind == "moderation.pardon":
+            assert (
+                await request(store, "POST", f"/v2/actions/{kind}", body, "moderator")
+            ).status_code == 403
+        response = await request(store, "POST", f"/v2/actions/{kind}", body, role)
+        assert response.status_code == 202, (kind, response.text)
+        again = await request(store, "POST", f"/v2/actions/{kind}", body, role)
+        assert again.json()["operationId"] == response.json()["operationId"]
+    frames = await envelopes(store)
+    assert [f["payload"]["kind"] for f in frames] == list(bodies), [
+        f["payload"] for f in frames
+    ]
+    say = next(f for f in frames if f["payload"]["kind"] == "moderation.say")
+    assert say["payload"] == {
+        "kind": "moderation.say",
+        "target": "arena",
+        "text": "Hello players",
+    }
+    stop = next(f for f in frames if f["payload"]["kind"] == "moderation.stop-room")
+    assert stop["payload"] == {
+        "kind": "moderation.stop-room",
+        "target": "arena",
+        "roomId": room,
+        "outcome": "draw",
+    }
+    for state in ("received", "validated", "applied"):
+        acked = await request(
+            store, "POST", "/v2/agents/game/acks", ack_body(say, state), "game-agent"
+        )
+        assert acked.status_code == 200, (state, acked.text)
+    read = await request(
+        store, "GET", f"/v2/operations/{say['operationId']}", role="moderator"
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["status"] == "applied"
+    assert [r["state"] for r in read.json()["receipts"]] == [
+        "received",
+        "validated",
+        "applied",
+    ]
+
+
+async def test_moderation_commands_reject_bad_shapes(store):
+    room = "12345678-1234-1234-1234-123456789012"
+    bad = [
+        ("moderation.say", {"text": "/not-a-chat"}, 422),
+        ("moderation.say", {"text": "x" * 121}, 422),
+        ("moderation.say", {}, 422),
+        ("moderation.say", {"text": "a\x00b"}, 422),
+        ("moderation.pardon", {"player": "ab"}, 422),
+        ("moderation.team-kick", {"player": "has space"}, 422),
+        ("moderation.class-lock", {"classId": "Drone"}, 422),
+        ("moderation.range", {"op": "half"}, 422),
+        ("moderation.stop-room", {"roomId": "nope", "outcome": "none"}, 422),
+        ("moderation.stop-room", {"roomId": room, "outcome": "maybe"}, 422),
+        (
+            "moderation.stop-room",
+            {"roomId": room, "outcome": "none", "reason": "win fast"},
+            422,
+        ),
+        ("moderation.fly", {}, 404),
+    ]
+    for kind, extra, status in bad:
+        body = {
+            "idempotencyKey": f"cpc0-bad-{kind}-{status}-{len(extra)}",
+            "environment": "prod",
+            "backend": "game",
+            "consumerId": "game",
+            "generation": str(store["generation"]),
+            "target": "arena",
+            **extra,
+        }
+        response = await request(store, "POST", f"/v2/actions/{kind}", body, "admin")
+        assert response.status_code == status, (kind, extra, response.text)
+    assert not await sql(store, "SELECT * FROM operations")
+    assert not await sql(store, "SELECT * FROM outbox")
+
+
+async def test_service_moderation_asserts_actor_and_executes(store):
+    # Site moderation principal: service credential with a moderation.*
+    # ceiling; every call asserts the logged-in site user, and that actor's
+    # own grants decide exactly like a direct call.
+    token = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "modsite",
+                "via": "game",
+                "ceiling": ["agents.events", "moderation.kick", "moderation.say"],
+            },
+            "ceiling": ["agents.events", "moderation.kick", "moderation.say"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "modsite",
+                "generation": str(store["generation"]),
+                "capabilities": ["moderation.kick", "moderation.say"],
+            },
+        },
+    )
+    store["tokens"]["modsite-agent"] = token
+    moderator = store["accounts"]["moderator"]
+    kick = {
+        "idempotencyKey": "modsite-kick",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "modsite",
+        "generation": str(store["generation"]),
+        "target": "arena",
+        "playerId": str(uuid4()),
+        "actorAccountId": str(moderator),
+    }
+    response = await request(
+        store, "POST", "/v2/actions/moderation.kick", kick, "modsite-agent"
+    )
+    assert response.status_code == 202, response.text
+    operation = response.json()["operationId"]
+    attributed = await sql(
+        store,
+        "SELECT account_id, client_id FROM operations WHERE id=%s",
+        (operation,),
+    )
+    assert attributed == [{"account_id": moderator, "client_id": "modsite"}]
+    frames = await envelopes(store, cid="modsite")
+    frame = next(item for item in frames if item["operationId"] == operation)
+    assert frame["executable"] and frame["payload"]["kind"] == "moderation.kick"
+    # The ModerationAction model carries the same assertion.
+    say = {
+        "idempotencyKey": "modsite-say",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "modsite",
+        "generation": str(store["generation"]),
+        "target": "arena",
+        "text": "Hello players",
+        "actorAccountId": str(moderator),
+    }
+    response = await request(
+        store, "POST", "/v2/actions/moderation.say", say, "modsite-agent"
+    )
+    assert response.status_code == 202, response.text
+
+
+async def test_service_moderation_refusals_and_direct_actor_forbidden(store):
+    store["tokens"]["modsite"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "modsite",
+                "via": "game",
+                "ceiling": ["moderation.kick", "moderation.pardon"],
+            },
+            "ceiling": ["moderation.kick", "moderation.pardon"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "modsite",
+                "generation": str(store["generation"]),
+                "capabilities": ["moderation.kick", "moderation.pardon"],
+            },
+        },
+    )
+    moderator = store["accounts"]["moderator"]
+    ordinary = store["accounts"]["ordinary"]
+
+    def kick(key, actor=None):
+        body = {
+            "idempotencyKey": key,
+            "environment": "prod",
+            "backend": "game",
+            "consumerId": "modsite",
+            "generation": str(store["generation"]),
+            "target": "arena",
+            "playerId": str(uuid4()),
+        }
+        if actor is not None:
+            body["actorAccountId"] = str(actor)
+        return body
+
+    denied = await request(
+        store, "POST", "/v2/actions/moderation.kick", kick("no-actor"), "modsite"
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "service_actor_required", denied.text
+    unknown = await request(
+        store,
+        "POST",
+        "/v2/actions/moderation.kick",
+        kick("unknown-actor", uuid4()),
+        "modsite",
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "account_not_found", unknown.text
+    # The asserted actor holds no moderation grant.
+    unscoped = await request(
+        store,
+        "POST",
+        "/v2/actions/moderation.kick",
+        kick("unscoped-actor", ordinary),
+        "modsite",
+    )
+    assert unscoped.status_code == 403, unscoped.text
+    # Admin-only kind under a moderator actor: the actor's grants decide.
+    pardon = {
+        "idempotencyKey": "pardon-peer",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "modsite",
+        "generation": str(store["generation"]),
+        "target": "arena",
+        "player": "Steve_01",
+        "actorAccountId": str(moderator),
+    }
+    refused = await request(
+        store, "POST", "/v2/actions/moderation.pardon", pardon, "modsite"
+    )
+    assert refused.status_code == 403, refused.text
+    # An admin actor reaches the admin-only kind through the same assertion.
+    pardon["idempotencyKey"] = "pardon-admin"
+    pardon["actorAccountId"] = str(store["accounts"]["admin"])
+    assert (
+        await request(store, "POST", "/v2/actions/moderation.pardon", pardon, "modsite")
+    ).status_code == 202
+    # Direct callers are authenticated and must never send an actor.
+    forged = await request(
+        store,
+        "POST",
+        "/v2/actions/moderation.kick",
+        kick("direct-actor", moderator),
+        "moderator",
+    )
+    assert forged.status_code == 403
+    assert forged.json()["error"] == "actor_forbidden", forged.text
+    # A scoped consumer could act as any covered moderator, so only the
+    # unbound site principal may assert an actor.
+    store["tokens"]["modscoped"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "modscoped",
+                "via": "game",
+                "ceiling": ["moderation.kick"],
+            },
+            "ceiling": ["moderation.kick"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "arena",
+            "consumer": {
+                "id": "modscoped",
+                "generation": str(store["generation"]),
+                "capabilities": ["moderation.kick"],
+            },
+        },
+    )
+    scoped = kick("scoped-actor", moderator) | {"consumerId": "modscoped"}
+    bound = await request(
+        store, "POST", "/v2/actions/moderation.kick", scoped, "modscoped"
+    )
+    assert bound.status_code == 403
+    assert bound.json()["error"] == "actor_forbidden", bound.text
+
+
+async def test_workshop_gate_scope_is_patch_only_for_service(store):
+    store["tokens"]["reporter"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "reporter",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    leg = patch("reporter-leg-1", 0, {"state": "builders"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", leg, "reporter")
+    ).status_code == 202
+    rollback = {
+        "idempotencyKey": "reporter-rollback",
+        "environment": "prod",
+        "backend": "game",
+        "expectedRevision": 1,
+        "revision": 1,
+    }
+    refused = await request(
+        store, "POST", "/v2/settings/gate/workshop/rollback", rollback, "reporter"
+    )
+    assert refused.status_code == 403
+    assert refused.json()["error"] == "forbidden", refused.text
+    preview = await request(
+        store, "POST", "/v2/settings/gate/workshop/validate", leg, "reporter"
+    )
+    assert preview.status_code == 403
+    assert preview.json()["error"] == "forbidden", preview.text
+
+
+async def test_provision_ttl_cap_is_30d_for_service_24h_for_human(store):
+    service = {
+        "client": {"id": "ttl-service", "via": "game", "ceiling": ["gate:read"]},
+        "ceiling": ["gate:read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    await provision(store["admin"], {**service, "expiresInSeconds": 30 * 86400})
+    with pytest.raises(ValueError, match="invalid credential lifetime"):
+        await provision(store["admin"], {**service, "expiresInSeconds": 30 * 86400 + 1})
+    human = {
+        "accountId": str(uuid4()),
+        "displayName": "ttl-human",
+        "client": {
+            "id": "ttl-human",
+            "via": "cli",
+            "human": True,
+            "ceiling": ["settings.read"],
+        },
+        "ceiling": ["settings.read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    await provision(store["admin"], {**human, "expiresInSeconds": 86400})
+    with pytest.raises(ValueError, match="invalid credential lifetime"):
+        await provision(store["admin"], {**human, "expiresInSeconds": 86401})
+
+
+async def test_admin_cli_provision_receipt_and_revoke(
+    store, tmp_path, monkeypatch, capsys
+):
+    db_file = tmp_path / "dsn"
+    db_file.write_text(store["admin"])
+    db_file.chmod(0o600)
+    spec = {
+        "client": {"id": "cli-site", "via": "game", "ceiling": ["gate:read"]},
+        "ceiling": ["gate:read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+    spec_file.chmod(0o600)
+    token_file = tmp_path / "bearer"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cpv2.admin",
+            "--database-file",
+            str(db_file),
+            "provision",
+            "--spec-file",
+            str(spec_file),
+            "--token-file",
+            str(token_file),
+        ],
+    )
+    await admin_main()
+    out, _ = capsys.readouterr()
+    receipt = json.loads(out.strip())
+    assert set(receipt) == {"credentialId", "fingerprint"}
+    token = token_file.read_text().strip()
+    assert receipt["fingerprint"] == verifier(token)[:16]
+    assert token not in out
+    credential_id = UUID(receipt["credentialId"])
+    # Revoke is offline, audited and idempotent; unknown ids are refused.
+    with pytest.raises(ValueError, match="unknown credential"):
+        await revoke_credential(store["admin"], uuid4())
+    assert await revoke_credential(store["admin"], credential_id) == credential_id
+    assert await revoke_credential(store["admin"], credential_id) == credential_id
+    audits = await sql(
+        store,
+        "SELECT outcome, detail FROM audit_events WHERE action=%s ORDER BY sequence",
+        ("credentials.revoke",),
+    )
+    assert [row["outcome"] for row in audits] == ["accepted", "accepted"]
+    assert [row["detail"]["alreadyRevoked"] for row in audits] == [False, True]
+    assert (
+        await request(
+            store,
+            "GET",
+            "/v2/me",
+            None,
+            "admin",
+            {"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 401
+
+
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
     wakeups = store["app"].state.wakeups
     waiter = wakeups.subscribe("game")
@@ -974,6 +1409,75 @@ async def test_uninitialized_service_and_migration_checksums_fail_closed(
     with pytest.raises(RuntimeError, match="least-privilege"):
         async with app.router.lifespan_context(app):
             pass
+
+
+async def test_v1_database_with_original_checksum_migrates_cleanly(postgres):
+    # Applied migrations are immutable: an existing v1 database carrying the
+    # original 001 checksum must re-migrate without a mismatch.
+    name = "cp_" + uuid4().hex
+    async with await psycopg.AsyncConnection.connect(postgres, autocommit=True) as conn:
+        await conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        admin = make_conninfo(postgres, dbname=name)
+        await migrate(admin, name)
+        original = hashlib.sha256(
+            Path("migrations/001_core.sql").read_bytes()
+        ).hexdigest()
+        async with await psycopg.AsyncConnection.connect(admin) as conn:
+            recorded = await (
+                await conn.execute(
+                    "SELECT checksum FROM control.schema_migrations WHERE version=1"
+                )
+            ).fetchone()
+        assert recorded[0] == original
+        await migrate(admin, name)
+        async with await psycopg.AsyncConnection.connect(admin) as conn:
+            again = await (
+                await conn.execute(
+                    "SELECT checksum FROM control.schema_migrations WHERE version=1"
+                )
+            ).fetchone()
+        assert again[0] == original
+    finally:
+        async with await psycopg.AsyncConnection.connect(
+            postgres, autocommit=True
+        ) as conn:
+            await conn.execute(f'DROP DATABASE "{name}"')
+
+
+async def test_service_principal_row_provisioned_offline_needs_no_runtime_insert(
+    store,
+):
+    # provision() runs privileged and creates the service principal row, so
+    # the runtime (cp_runtime, no INSERT on accounts) only resolves its id.
+    await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "offline-principal",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    assert await sql(
+        store,
+        "SELECT display_name FROM accounts WHERE display_name=%s",
+        ("service:offline-principal",),
+    ) == [{"display_name": "service:offline-principal"}]
+    async with await psycopg.AsyncConnection.connect(
+        store["runtime"], options="-c search_path=control,pg_catalog"
+    ) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO accounts(id,display_name) VALUES(%s,%s)",
+                    (uuid4(), "runtime-probe"),
+                )
 
 
 async def test_actual_sse_frames_disconnect_and_socket_flush_is_not_execution(store):
@@ -3879,8 +4383,12 @@ async def test_workshop_service_act_scope(store):
     site = await provision(
         store["admin"],
         {
-            "client": {"id": "site", "via": "game", "ceiling": ["workshop.act"]},
-            "ceiling": ["workshop.act"],
+            "client": {
+                "id": "site",
+                "via": "game",
+                "ceiling": ["workshop.act", "workshop.message"],
+            },
+            "ceiling": ["workshop.act", "workshop.message"],
             "environment": "prod",
             "backend": "game",
             "resource": "*",
@@ -3942,8 +4450,10 @@ async def test_workshop_admin_members_need_owner_step_up(store):
     response = await request(
         store, "POST", "/v2/workshop/members", service, "site-stepup"
     )
+    # Members needs the admin-only workshop.members scope, which no service
+    # credential may hold: rejected before any owner step-up is evaluated.
     assert response.status_code == 403, response.text
-    assert response.json()["error"] == "owner_approval_required"
+    assert response.json()["error"] == "forbidden"
 
 
 async def test_c20_health_reports_database_outage(store, monkeypatch):
@@ -4398,3 +4908,271 @@ async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
     ).status_code == 202
     bad = patch("g-bad", 1, {"ai": {"hardLimit": None}})
     assert (await request(store, "PATCH", gpath, bad, "owner")).status_code == 422
+
+
+async def test_cpp1_workshop_leg_reaches_proxy_snapshot_and_frames(store):
+    # Writer contract: whoever holds workshop.gate reports the leg (admin here;
+    # the autonomous workshop reporter needs the authorship follow-up noted in
+    # .dev/cpp1/map.md). Serving is identical whoever writes: the proxy
+    # consumer (settings.gate, resource *) gets the leg in its snapshot and
+    # frames with the same lease semantics as the game leg.
+    leg = patch(
+        "workshop-leg-1",
+        0,
+        {
+            "state": "builders",
+            "message": "night build",
+            "allowed": [
+                {
+                    "draslId": "abababababababababababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    accepted = await request(store, "PATCH", "/v2/settings/gate/workshop", leg)
+    assert accepted.status_code == 202
+    value = leg["patch"]
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == [
+        {
+            "namespace": "gate",
+            "target": "workshop",
+            "revision": 1,
+            "value": value,
+            "value_hash": digest(value),
+        }
+    ]
+    frames = await envelopes(store, cid="game")
+    assert {
+        "kind": "settings",
+        "namespace": "gate",
+        "target": "workshop",
+        "value": value,
+        "timing": "live",
+    } in [frame["payload"] for frame in frames if frame["executable"]]
+
+
+async def test_cpp1_workshop_leg_fail_closed_and_validated(store):
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == []
+    view = await request(store, "GET", "/v2/settings/gate/workshop")
+    assert view.json()["initialized"] is False
+    assert view.json()["value"]["state"] == "closed"
+    game_leg = patch("g-bad", 0, {"state": "builders"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/*", game_leg)
+    ).status_code == 422
+    bad_mode = patch("w-bad", 0, {"mode": "open"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", bad_mode)
+    ).status_code == 422
+    bad_state = patch("w-bad-state", 0, {"state": "open"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", bad_state)
+    ).status_code == 422
+    starting = patch(
+        "w-starting",
+        0,
+        {
+            "state": "STARTING",
+            "allowed": [
+                {
+                    "draslId": "abab-abababababab-abababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", starting)
+    ).status_code == 202
+    view = await request(store, "GET", "/v2/settings/gate/workshop")
+    assert view.json()["value"] == {
+        "state": "starting",
+        "message": "",
+        "allowed": [
+            {"draslId": "abababababababababababababababab", "name": "Builder1"}
+        ],
+    }
+
+
+async def test_cpp3_service_reports_workshop_leg_with_service_actor(store):
+    # CPP3: the workshop controller reports its gate leg with a
+    # workshop.gate service credential. Before the fix the PATCH failed 503
+    # (settings_revisions.actor NOT NULL, service has no account) and, even
+    # accepted, the frame stayed non-executable at delivery.
+    store["tokens"]["reporter"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "workshop-reporter",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    # The reporter reads the leg back with the write scope alone (no global
+    # settings.read) to report idempotently; other namespaces stay denied.
+    view = await request(store, "GET", "/v2/settings/gate/workshop", role="reporter")
+    assert view.status_code == 200, view.text
+    assert view.json()["initialized"] is False
+    assert view.json()["value"]["state"] == "closed"
+    denied = await request(store, "GET", "/v2/settings/gameplay/arena", role="reporter")
+    assert denied.status_code == 403, denied.text
+    leg = patch(
+        "reporter-leg-1",
+        0,
+        {
+            "state": "builders",
+            "message": "night build",
+            "allowed": [
+                {
+                    "draslId": "abababababababababababababababab",
+                    "name": "Builder1",
+                }
+            ],
+        },
+    )
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gate/workshop", leg, "reporter"
+    )
+    assert accepted.status_code == 202, accepted.text
+    operation = accepted.json()["operationId"]
+    rows = await sql(
+        store,
+        "SELECT account_id, credential_id FROM operations WHERE id=%s",
+        (operation,),
+    )
+    assert rows[0]["account_id"] is None
+    revisions = await sql(
+        store,
+        "SELECT actor FROM settings_revisions WHERE operation_id=%s",
+        (operation,),
+    )
+    names = await sql(
+        store, "SELECT display_name FROM accounts WHERE id=%s", (revisions[0]["actor"],)
+    )
+    assert names == [{"display_name": "service:workshop-reporter"}]
+    # The proxy consumer receives the leg in snapshot and executable frames.
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert [
+        entry
+        for entry in snapshot.json()["settings"]
+        if entry["namespace"] == "gate" and entry["target"] == "workshop"
+    ] == [
+        {
+            "namespace": "gate",
+            "target": "workshop",
+            "revision": 1,
+            "value": leg["patch"],
+            "value_hash": digest(leg["patch"]),
+        }
+    ]
+    frames = await envelopes(store, cid="game")
+    assert {
+        "kind": "settings",
+        "namespace": "gate",
+        "target": "workshop",
+        "value": leg["patch"],
+        "timing": "live",
+    } in [frame["payload"] for frame in frames if frame["executable"]]
+    # A changed report revises the same leg under the same service actor; a
+    # stale revision still conflicts.
+    update = patch("reporter-leg-2", 1, {"message": "morning build"})
+    updated = await request(
+        store, "PATCH", "/v2/settings/gate/workshop", update, "reporter"
+    )
+    assert updated.status_code == 202, updated.text
+    again = await sql(
+        store,
+        "SELECT actor FROM settings_revisions WHERE operation_id=%s",
+        (updated.json()["operationId"],),
+    )
+    assert again == revisions
+    stale = patch("reporter-leg-3", 1, {"message": "stale"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", stale, "reporter")
+    ).status_code == 409
+    # The reporter scope reaches nothing else.
+    other = patch("reporter-other", 0, {"lobby": {"pvpEnabled": True}})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gameplay/arena", other, "reporter")
+    ).status_code == 403
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/*", other, "reporter")
+    ).status_code == 403
+
+
+async def test_cpp1r2_service_act_alone_cannot_post_members(store):
+    # A service holding only workshop.act must not change the workshop member
+    # ACL: members needs the admin-only workshop.members scope, which no
+    # service credential may hold.
+    store["tokens"]["act-only"] = await provision(
+        store["admin"],
+        {
+            "client": {"id": "act-only", "via": "game", "ceiling": ["workshop.act"]},
+            "ceiling": ["workshop.act"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    body = workshop_body(store, members=[{"draslId": "f" * 32, "name": "Stranger"}])
+    response = await request(store, "POST", "/v2/workshop/members", body, "act-only")
+    assert response.status_code == 403, response.text
+
+
+async def test_cpp1r2_service_workshop_op_fenced_at_delivery(store):
+    # Accept-time per-kind scopes are not enough on their own: a NULL-account
+    # (service-issued) operation that is not the workshop gate leg must stay
+    # rejected at delivery, so its frame is never executable.
+    store["tokens"]["messenger"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "messenger",
+                "via": "game",
+                "ceiling": ["workshop.act", "workshop.message"],
+            },
+            "ceiling": ["workshop.act", "workshop.message"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    body = workshop_body(store, message="hi")
+    response = await request(store, "POST", "/v2/workshop/message", body, "messenger")
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["operationId"]
+    rows = await sql(
+        store,
+        "SELECT account_id FROM operations WHERE id=%s",
+        (operation_id,),
+    )
+    assert rows[0]["account_id"] is None
+    frames = await envelopes(store, cid="workshop")
+    frame = next(item for item in frames if item["operationId"] == operation_id)
+    assert not frame["executable"]
+    assert frame["payload"] is None

@@ -15,6 +15,28 @@ from cpv2.settings import digest
 AUDIENCE = "blockfield-control-v2"
 WORKSHOP_WRITE_SCOPES = {"workshop.message", "workshop.wake", "workshop.cancel"}
 WORKSHOP_ADMIN_SCOPES = {"workshop.members", "workshop.release.select"}
+# Site RCON replacements every moderator may issue (mirrors site `moderate`).
+MODERATION_SCOPES = {
+    "moderation.say",
+    "moderation.list",
+    "moderation.team-kick",
+    "moderation.class-lock",
+    "moderation.class-unlock",
+    "moderation.range",
+    "moderation.stop-room",
+}
+# Pardon needs the site `ban` permission: admin only, like moderation.ban.
+MODERATION_ADMIN_SCOPES = {"moderation.pardon"}
+# Site moderation via the service principal: a service credential may hold
+# any moderation kind, but every call must assert the acting human account
+# (see core.action, mirroring grant_change) — the actor's own grants then
+# decide, so a moderator actor can never reach admin-only kinds.
+SERVICE_MODERATION_SCOPES = {
+    "moderation.kick",
+    "moderation.ban",
+    *MODERATION_SCOPES,
+    *MODERATION_ADMIN_SCOPES,
+}
 ROLE_SCOPES = {
     "builder": {"settings.read", "operations.read", "maps.edit"},
     "moderator": {
@@ -22,6 +44,7 @@ ROLE_SCOPES = {
         "operations.read",
         "maps.edit",
         "moderation.kick",
+        *MODERATION_SCOPES,
         *WORKSHOP_WRITE_SCOPES,
     },
     "admin": {
@@ -33,8 +56,13 @@ ROLE_SCOPES = {
         "settings.gameplay.write",
         "staff.lower.manage",
         "audit.read",
+        *MODERATION_SCOPES,
+        *MODERATION_ADMIN_SCOPES,
         *WORKSHOP_WRITE_SCOPES,
         *WORKSHOP_ADMIN_SCOPES,
+        # The workshop controller reports its own gate leg (gate settings at
+        # target "workshop"); admins keep manual PATCH access to the same leg.
+        "workshop.gate",
     },
 }
 OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
@@ -43,7 +71,22 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     "settings.protected.write",
     "audit.full",
 }
-SERVICE_SCOPES = {"agents.events", "agents.acks", "gate:read", "workshop.act"}
+SERVICE_SCOPES = {
+    "agents.events",
+    "agents.acks",
+    "gate:read",
+    "workshop.act",
+    # Service-holdable so the workshop controller can report its own gate leg.
+    "workshop.gate",
+    # Service-holdable per-kind workshop scopes: a service may post these
+    # kinds only when also provisioned for the kind (workshop.act alone never
+    # authorizes a kind). The admin-only kinds (members, release.select) stay
+    # out, so no service credential can ever mint them.
+    *WORKSHOP_WRITE_SCOPES,
+    # Site moderation kinds: every service call asserts the acting account,
+    # so the actor's own grants still decide (see core.action).
+    *SERVICE_MODERATION_SCOPES,
+}
 # Site principal only: provisioned solely on a resource="*" service credential,
 # since a staff write asserts an acting account (see core.grant_change).
 STAFF_SCOPES = {"staff.read", "staff.lower.manage", "staff.admin.manage"}

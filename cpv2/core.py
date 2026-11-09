@@ -2,7 +2,7 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
 from pydantic import ValidationError
@@ -18,8 +18,46 @@ from cpv2.auth import (
     step_up,
     verifier,
 )
+from cpv2 import models
 from cpv2.db import one, record, rows
-from cpv2.settings import DEFINITIONS, changed, digest, merge
+from cpv2.settings import DEFINITIONS, WorkshopGate, changed, digest, merge
+
+
+def gate_model(namespace, target, definition):
+    # The workshop leg lives in the gate namespace at target "workshop" so
+    # the proxy consumer (settings.gate, resource *) receives it in the same
+    # snapshot/frames as the game leg; its value shape is the controller
+    # states the file gate carried, not the game modes.
+    if namespace == "gate" and target == "workshop":
+        return WorkshopGate
+    return definition.model
+
+
+# Deterministic namespace for service-principal account ids: a service
+# credential has no account, so its writes attribute a stable per-client
+# principal instead of NULL, never a human account.
+SERVICE_PRINCIPAL_NAMESPACE = uuid5(
+    NAMESPACE_URL, "https://blockfield/control-plane/service-principal"
+)
+
+
+def service_principal_id(client_id):
+    name = f"service:{client_id}"[:128]
+    return uuid5(SERVICE_PRINCIPAL_NAMESPACE, name), name
+
+
+async def service_principal(conn, identity):
+    """Stable id attributing a service-credential write.
+
+    settings_revisions.actor is NOT NULL REFERENCES accounts. The row is
+    created offline by provision(), which runs privileged; the runtime
+    (cp_runtime, no INSERT on accounts) only resolves the id. The display
+    name ("service:<client id>") marks the row as a service principal; no
+    credential ever points at it (credentials stay account-less by CHECK),
+    so it can never authenticate or hold grants.
+    """
+    principal, _ = service_principal_id(identity.client["id"])
+    return principal
 
 
 async def event(conn, op, state, detail=None):
@@ -135,11 +173,12 @@ async def current_settings(conn, namespace, environment, backend, target):
                     legacy["value"]["since"] / 1000, timezone.utc
                 ),
             }
+    default = gate_model(namespace, target, definition)()
     return {
         "initialized": False,
         "revision": 0,
-        "value": definition.model().model_dump(),
-        "value_hash": digest(definition.model().model_dump()),
+        "value": default.model_dump(),
+        "value_hash": digest(default.model_dump()),
     }
 
 
@@ -184,7 +223,19 @@ async def settings_change(
         raise Problem("unknown_namespace", 404)
     data = model.model_dump(mode="json")
     env, backend = data["environment"], data["backend"]
-    identity.require(definition.write, env, backend, target)
+    # The workshop leg is reported by the workshop service, not toggled by
+    # game-entry admins: it carries its own service-holdable write scope.
+    scope = (
+        "workshop.gate"
+        if (namespace, target) == ("gate", "workshop")
+        else definition.write
+    )
+    identity.require(scope, env, backend, target)
+    if scope == "workshop.gate" and identity.account is None and (rollback or validate):
+        # The controller reports its leg with PATCH only: rollback/validate
+        # under this scope are refused at accept (delivery would reject a
+        # non-patch service-issued op anyway, so this only fails fast).
+        raise Problem("forbidden")
     op, duplicate = (
         (None, False)
         if validate
@@ -194,7 +245,7 @@ async def settings_change(
             f"settings.{namespace}.{'rollback' if rollback else 'patch'}",
             target,
             data,
-            definition.write,
+            scope,
             seconds=86400,
         )
     )
@@ -228,7 +279,11 @@ async def settings_change(
     else:
         candidate = merge(before["value"], data["patch"])
     try:
-        after = definition.model.model_validate(candidate).model_dump()
+        after = (
+            gate_model(namespace, target, definition)
+            .model_validate(candidate)
+            .model_dump()
+        )
     except ValidationError:
         raise Problem("invalid_settings", 422) from None
     diff = changed(before["value"], after)
@@ -267,6 +322,11 @@ async def settings_change(
     revision = head["revision"] + 1
     if revision > 9223372036854775807:
         raise Problem("revision_exhausted", 409)
+    actor = identity.actor
+    if actor is None:
+        # Service-credential write (the workshop gate leg): attribute the
+        # stable service principal instead of failing the NOT NULL actor.
+        actor = await service_principal(conn, identity)
     await conn.execute(
         "INSERT INTO settings_revisions(namespace,environment,backend,target,revision,base_revision,value,diff,value_hash,operation_id,actor,rollback_of,state_since) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
@@ -280,10 +340,12 @@ async def settings_change(
             Jsonb(diff),
             digest(after),
             op["id"],
-            identity.actor,
+            actor,
             data["revision"] if rollback else None,
             before.get("state_since", now())
-            if namespace == "gate" and before["value"]["mode"] == after["mode"]
+            if namespace == "gate"
+            and before["value"].get("mode", before["value"].get("state"))
+            == after.get("mode", after.get("state"))
             else now(),
         ),
     )
@@ -476,39 +538,174 @@ async def test_status(conn, identity, attempt, account_id, model, assertion, pat
     return await finish(conn, attempt, identity, op, {"isTest": True}, effective=True)
 
 
-async def action(conn, identity, attempt, kind, model):
-    if kind not in ("moderation.kick", "moderation.ban"):
+# Site RCON replacements (admin.ts rconCommand): typed moderation commands the
+# mod applies from its SSE stream. Scopes equal kinds; site `moderate`
+# maps to the moderator role, site `ban` (pardon) to admin.
+MODERATION_COMMANDS = (
+    "moderation.say",
+    "moderation.list",
+    "moderation.pardon",
+    "moderation.team-kick",
+    "moderation.class-lock",
+    "moderation.class-unlock",
+    "moderation.range",
+    "moderation.stop-room",
+)
+MODERATION_PLAYER = re.compile(r"[A-Za-z0-9_]{3,16}")
+MODERATION_CLASS = re.compile(r"[a-z0-9_]{1,32}")
+MODERATION_ROOM = re.compile(r"[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}")
+MODERATION_RANGE_OPS = ("open", "close", "reset")
+MODERATION_OUTCOMES = ("none", "draw", "RED", "BLUE")
+
+
+def _moderation_text(value, *, required=True, problem="invalid_moderation_text"):
+    # Same wire rule as the site text(): control characters and § become
+    # spaces, runs collapse, and the result is 1-120 chars not starting
+    # with `/` (so it can never become a different server command).
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str):
+        raise Problem(problem, 422)
+    clean = re.sub(
+        r" {2,}",
+        " ",
+        "".join(
+            " " if c == "§" or unicodedata.category(c) == "Cc" else c for c in value
+        ),
+    ).strip()
+    if (not clean and required) or len(clean) > 120 or clean.startswith("/"):
+        raise Problem(problem, 422)
+    return clean
+
+
+def _moderation_payload(kind, data):
+    base = {"kind": kind, "target": data["target"]}
+    name = kind[len("moderation.") :]
+    if name == "say":
+        return base | {"text": _moderation_text(data["text"])}
+    if name == "list":
+        return base
+    if name in ("pardon", "team-kick"):
+        player = data["player"]
+        if not isinstance(player, str) or MODERATION_PLAYER.fullmatch(player) is None:
+            raise Problem("invalid_moderation_player", 422)
+        return base | {"player": player}
+    if name in ("class-lock", "class-unlock"):
+        class_id = data["classId"]
+        if (
+            not isinstance(class_id, str)
+            or MODERATION_CLASS.fullmatch(class_id) is None
+        ):
+            raise Problem("invalid_moderation_class", 422)
+        return base | {"classId": class_id}
+    if name == "range":
+        if data["op"] not in MODERATION_RANGE_OPS:
+            raise Problem("invalid_moderation_range", 422)
+        return base | {"op": data["op"]}
+    room = data["roomId"]
+    if not isinstance(room, str) or MODERATION_ROOM.fullmatch(room) is None:
+        raise Problem("invalid_moderation_room", 422)
+    if data["outcome"] not in MODERATION_OUTCOMES:
+        raise Problem("invalid_moderation_outcome", 422)
+    reason = _moderation_text(data["reason"], required=False)
+    if data["outcome"] == "none" and re.match(r"^(win|draw)\b", reason):
+        raise Problem("invalid_moderation_reason", 422)
+    payload = base | {"roomId": room, "outcome": data["outcome"]}
+    return payload | {"reason": reason} if reason else payload
+
+
+async def action(conn, identity, attempt, kind, body):
+    if kind in ("moderation.kick", "moderation.ban"):
+        try:
+            data = models.Action.model_validate(body).model_dump(mode="json")
+        except ValidationError:
+            raise Problem("invalid_action", 422) from None
+        payload = {
+            "kind": kind,
+            "target": data["target"],
+            "playerId": data["playerId"],
+            "reason": data["reason"],
+        }
+    elif kind in MODERATION_COMMANDS:
+        try:
+            data = models.ModerationAction.model_validate(body).model_dump(mode="json")
+        except ValidationError:
+            raise Problem("invalid_action", 422) from None
+        payload = _moderation_payload(kind, data)
+    else:
         raise Problem("unknown_action", 404)
-    data = model.model_dump(mode="json")
-    identity.require(kind, model.environment, model.backend, model.target)
+    data_target = payload["target"]
+    identity.require(kind, data["environment"], data["backend"], data_target)
+    if identity.credential["kind"] == "service":
+        # The site principal asserts the logged-in human; the same scope,
+        # peer and grant rules below then evaluate that actor like a direct
+        # call. role_grants-independent moderation still needs an actor, so
+        # an unasserted service call is refused before any operation exists.
+        if data["actorAccountId"] is None:
+            raise Problem("service_actor_required")
+        # Only the unbound site principal may assert an actor; a scoped
+        # consumer would otherwise act as any moderator whose grant covers it.
+        if identity.credential["resource"] != "*":
+            raise Problem("actor_forbidden")
+        # FOR SHARE like authenticate(): a concurrent revocation of this actor
+        # (FOR UPDATE + invalidate) waits for this change to commit.
+        actor = await one(
+            conn,
+            "SELECT * FROM accounts WHERE id=%s FOR SHARE",
+            (UUID(data["actorAccountId"]),),
+        )
+        if not actor:
+            raise Problem("account_not_found", 404)
+        if actor["is_test"] or actor["status"] != "active":
+            raise Problem("ineligible_account")
+        identity = Identity(
+            identity.credential,
+            identity.client,
+            actor,
+            await rows(
+                conn,
+                "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+                (actor["id"], now()),
+            ),
+            bool(
+                await one(
+                    conn,
+                    "SELECT 1 FROM owner_memberships WHERE account_id=%s",
+                    (actor["id"],),
+                )
+            ),
+        )
+        identity.require(kind, data["environment"], data["backend"], data_target)
+    elif data["actorAccountId"] is not None:
+        raise Problem("actor_forbidden")
     op, duplicate = await operation(
         conn,
         identity,
         kind,
-        model.target,
+        data_target,
         data,
         kind,
-        model.expiresInSeconds,
-        model.generation,
+        data["expiresInSeconds"],
+        data["generation"],
     )
     if duplicate:
         return receipt(op)
     consumer = await one(
-        conn, "SELECT * FROM consumers WHERE id=%s FOR UPDATE", (model.consumerId,)
+        conn, "SELECT * FROM consumers WHERE id=%s FOR UPDATE", (data["consumerId"],)
     )
     if (
         not consumer
-        or consumer["generation"] != model.generation
-        or consumer["environment"] != model.environment
-        or consumer["backend"] != model.backend
-        or not covers(consumer["resource"], model.target)
+        or str(consumer["generation"]) != str(data["generation"])
+        or consumer["environment"] != data["environment"]
+        or consumer["backend"] != data["backend"]
+        or not covers(consumer["resource"], data_target)
         or kind not in consumer["capabilities"]
     ):
         raise Problem("consumer_generation_or_capability", 409)
     unsettled = await one(
         conn,
-        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND p.kind IN ('moderation.kick','moderation.ban') AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
-        (model.consumerId,),
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND p.kind LIKE 'moderation.%%' AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
+        (data["consumerId"],),
     )
     if (
         consumer["next_sequence"] - consumer["received_cursor"] > 128
@@ -519,12 +716,7 @@ async def action(conn, identity, attempt, kind, model):
         conn,
         op,
         [consumer],
-        {
-            "kind": kind,
-            "target": model.target,
-            "playerId": data["playerId"],
-            "reason": model.reason,
-        },
+        payload,
     )
     return await finish(
         conn,
@@ -532,14 +724,7 @@ async def action(conn, identity, attempt, kind, model):
         identity,
         op,
         {
-            "payloadHash": digest(
-                {
-                    "kind": kind,
-                    "target": model.target,
-                    "playerId": data["playerId"],
-                    "reason": model.reason,
-                }
-            )
+            "payloadHash": digest(payload),
         },
     )
 
@@ -751,8 +936,15 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
         raise Problem("unknown_action", 404)
     data = model.model_dump(mode="json")
     if identity.account is None:
+        # A service may only supply the actor (workshop.act) for a kind it is
+        # also provisioned for: workshop.act alone never authorizes a kind.
+        # The admin-only kinds are not service-holdable (see SERVICE_SCOPES),
+        # so no service credential can mint them.
         identity.require("workshop.act", model.environment, model.backend, model.target)
-        scope = "workshop.act"
+        identity.require(
+            WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target
+        )
+        scope = "workshop.act," + WORKSHOP_SCOPES[kind]
     else:
         identity.require(
             WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target

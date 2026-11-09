@@ -58,6 +58,30 @@ class Action(Mutation):
     playerId: ID
     reason: str = Field(default="", max_length=500)
     expiresInSeconds: int = Field(default=30, ge=1, le=60)
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
+
+
+class ModerationAction(Mutation):
+    # Site RCON replacements (say/list/pardon/team-kick/class-lock/unlock,
+    # range/stop-room): per-kind fields, validated in core.action like
+    # WorkshopAction. playerId stays for kick/ban only; the rest address
+    # server-side nicknames/ids the mod resolves itself.
+    consumerId: str = Field(min_length=1, max_length=128)
+    generation: ID
+    target: str = Field(min_length=1, max_length=128)
+    text: str | None = None
+    player: str | None = None
+    classId: str | None = None
+    op: str | None = None
+    roomId: str | None = None
+    outcome: str | None = None
+    reason: str = Field(default="", max_length=500)
+    expiresInSeconds: int = Field(default=30, ge=1, le=60)
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class WorkshopAction(Mutation):

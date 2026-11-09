@@ -26,6 +26,7 @@ from cpv2.auth import (
     now,
     verifier,
 )
+from cpv2.core import service_principal_id
 from cpv2.db import history, migrate, one, record
 
 
@@ -104,6 +105,52 @@ async def bootstrap(dsn, account_id, name, credential):
 
 async def provision(dsn, spec, bearer_sink=None):
     """Operator-only seed for accounts/clients/executors; no HTTP minting authority."""
+    token, _ = await _provision(dsn, spec, bearer_sink)
+    return token
+
+
+# Service credentials (account-less) live at most 30 days and are re-issued
+# monthly; human session credentials stay at 24h, like staff rotation.
+SERVICE_TTL_CAP = 30 * 86400
+HUMAN_TTL_CAP = 86400
+
+
+async def revoke(dsn, credential_id):
+    """Offline revocation; idempotent, refuses unknown ids. No HTTP route."""
+    async with (
+        await psycopg.AsyncConnection.connect(
+            dsn, row_factory=dict_row, options="-c search_path=control,pg_catalog"
+        ) as conn,
+        history(conn),
+    ):
+        row = await one(
+            conn,
+            "SELECT revoked_at FROM credentials WHERE id=%s FOR UPDATE",
+            (credential_id,),
+        )
+        if not row:
+            raise ValueError("unknown credential")
+        await conn.execute(
+            "UPDATE credentials SET revoked_at=coalesce(revoked_at,now()) WHERE id=%s",
+            (credential_id,),
+        )
+        await conn.execute("SELECT pg_notify('cp_events', '')")
+        attempt = uuid4()
+        await record(
+            conn,
+            "INSERT INTO audit_events(attempt_id,via,request_id,action,target,outcome,detail) VALUES(%s,'recovery',%s,'credentials.revoke',%s,'accepted',%s)",
+            (
+                attempt,
+                attempt,
+                str(credential_id),
+                Jsonb({"alreadyRevoked": row["revoked_at"] is not None}),
+            ),
+        )
+    return credential_id
+
+
+async def _provision(dsn, spec, bearer_sink=None):
+    """Same as provision() but also returns the credential id for the receipt."""
     token, cid = "cp2_" + secrets.token_urlsafe(32), uuid4()
     async with (
         await psycopg.AsyncConnection.connect(
@@ -177,12 +224,21 @@ async def provision(dsn, spec, bearer_sink=None):
                 raise ValueError("service credential ceiling")
             if STAFF_SCOPES & set(spec["ceiling"]) and spec["resource"] != "*":
                 raise ValueError("staff scopes need an unbound site credential")
+            # The service principal row lives here, not at runtime: this path
+            # runs privileged while the service (cp_runtime) cannot INSERT accounts.
+            principal, name = service_principal_id(client["id"])
+            await conn.execute(
+                "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (principal, name),
+            )
         if set(spec["ceiling"]) - (
             OWNER_SCOPES if account_id else SERVICE_SCOPES | STAFF_SCOPES
         ):
             raise ValueError("unknown scope")
         ttl = spec.get("expiresInSeconds", 3600)
-        if type(ttl) is not int or not 1 <= ttl <= 86400:
+        if type(ttl) is not int or not 1 <= ttl <= (
+            HUMAN_TTL_CAP if account_id else SERVICE_TTL_CAP
+        ):
             raise ValueError("invalid credential lifetime")
         await conn.execute(
             "INSERT INTO credentials(id,verifier,account_id,client_id,ceiling,environment,backend,resource,kind,authorization_epoch,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -238,7 +294,7 @@ async def provision(dsn, spec, bearer_sink=None):
             # later write failure rolls the credential back instead of leaving
             # a live credential nobody holds.
             bearer_sink(token)
-    return token
+    return token, cid
 
 
 async def main():
@@ -266,6 +322,13 @@ async def main():
     issue = commands.add_parser("provision")
     issue.add_argument("--spec-file", required=True)
     issue.add_argument("--token-file", required=True)
+    revoke_cmd = commands.add_parser("revoke")
+    revoke_cmd.add_argument(
+        "--credential-id",
+        type=UUID,
+        required=True,
+        help="offline revocation; idempotent, refuses unknown ids",
+    )
     legacy = commands.add_parser("import-u1")
     legacy.add_argument("--sqlite", required=True)
     args = parser.parse_args()
@@ -289,7 +352,7 @@ async def main():
                 os.fsync(stream.fileno())
 
         try:
-            await provision(
+            token, cid = await _provision(
                 dsn, json.loads(private_file(args.spec_file)), bearer_sink=sink
             )
         except BaseException:
@@ -302,6 +365,20 @@ async def main():
             except OSError:
                 pass
             raise
+        # Receipt on stdout, never the token: credential id plus the
+        # verifier prefix for the operator's records.
+        print(
+            json.dumps(
+                {
+                    "credentialId": str(cid),
+                    "fingerprint": verifier(token)[:16],
+                },
+                sort_keys=True,
+            )
+        )
+    elif args.command == "revoke":
+        cid = await revoke(dsn, args.credential_id)
+        print(json.dumps({"credentialId": str(cid)}, sort_keys=True))
     else:
         from cpv2.legacy import import_u1
 

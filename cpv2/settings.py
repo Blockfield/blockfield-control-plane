@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Strict(BaseModel):
@@ -75,6 +75,39 @@ class Gameplay(Strict):
 class Gate(Strict):
     mode: str = Field(default="maintenance", pattern="^(open|draining|maintenance)$")
     message: str = Field(default="", max_length=500)
+
+
+class WorkshopGateMember(Strict):
+    # Same identity rule the workshop controller enforces on its ACL
+    # (core.WORKSHOP_NAME); stored normalized like the consumer member().
+    draslId: str = Field(pattern="^[0-9a-f]{32}$")
+    name: str = Field(pattern="^[A-Za-z0-9_]{3,16}$")
+
+    @field_validator("draslId", mode="before")
+    @classmethod
+    def normalize_drasl(cls, value):
+        if isinstance(value, str):
+            return value.replace("-", "").lower()
+        return value
+
+
+class WorkshopGate(Strict):
+    # Workshop leg of the proxy gate (gate settings at target "workshop"):
+    # the controller states the file gate carried, plus its member ACL.
+    # STARTING is the legacy phase-name spelling the old file accepted.
+    state: str = Field(
+        default="closed",
+        pattern="^(builders|testers|closed|sleeping|starting)$",
+    )
+    message: str = Field(default="", max_length=500)
+    allowed: list[WorkshopGateMember] = Field(default_factory=list, max_length=256)
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def normalize_state(cls, value):
+        if value == "STARTING":
+            return "starting"
+        return value
 
 
 # Site settings.json sections as v2 namespaces. Shapes and limits mirror the

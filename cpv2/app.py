@@ -426,7 +426,20 @@ def create_app(dsn=None):
         environment: str = "prod",
         backend: str = "game",
     ):
-        request.state.identity.require("settings.read", environment, backend, target)
+        if namespace == "gate" and target == "workshop":
+            # The workshop reporter authenticates with the leg's write scope,
+            # not the global settings read scope: whoever may report the leg
+            # may read it back to report idempotently (no write when unchanged).
+            if not request.state.identity.allows(
+                "settings.read", environment, backend, target
+            ):
+                request.state.identity.require(
+                    "workshop.gate", environment, backend, target
+                )
+        else:
+            request.state.identity.require(
+                "settings.read", environment, backend, target
+            )
         async with database.transaction() as conn:
             value = await core.current_settings(
                 conn, namespace, environment, backend, target
@@ -560,7 +573,9 @@ def create_app(dsn=None):
     @app.post(
         "/v2/actions/{kind}", status_code=202, response_model=models.OperationReceipt
     )
-    async def action(kind: str, body: models.Action, request: Request):
+    async def action(kind: str, body: dict, request: Request):
+        # Raw dict: core.action picks the per-kind model (kick/ban keep
+        # models.Action, the say/list/... replacements use ModerationAction).
         return await write(request, core.action, kind, body)
 
     @app.post(
