@@ -27,6 +27,16 @@ MODERATION_SCOPES = {
 }
 # Pardon needs the site `ban` permission: admin only, like moderation.ban.
 MODERATION_ADMIN_SCOPES = {"moderation.pardon"}
+# Site moderation via the service principal: a service credential may hold
+# any moderation kind, but every call must assert the acting human account
+# (see core.action, mirroring grant_change) — the actor's own grants then
+# decide, so a moderator actor can never reach admin-only kinds.
+SERVICE_MODERATION_SCOPES = {
+    "moderation.kick",
+    "moderation.ban",
+    *MODERATION_SCOPES,
+    *MODERATION_ADMIN_SCOPES,
+}
 ROLE_SCOPES = {
     "builder": {"settings.read", "operations.read", "maps.edit"},
     "moderator": {
@@ -73,6 +83,9 @@ SERVICE_SCOPES = {
     # authorizes a kind). The admin-only kinds (members, release.select) stay
     # out, so no service credential can ever mint them.
     *WORKSHOP_WRITE_SCOPES,
+    # Site moderation kinds: every service call asserts the acting account,
+    # so the actor's own grants still decide (see core.action).
+    *SERVICE_MODERATION_SCOPES,
 }
 # Site principal only: provisioned solely on a resource="*" service credential,
 # since a staff write asserts an acting account (see core.grant_change).
