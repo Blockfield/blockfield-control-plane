@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CP owner bootstrap ceremony</title>
+<style>body{font-family:sans-serif;max-width:60em;margin:2em}pre{white-space:pre-wrap;word-break:break-all;background:#f4f4f4;padding:1em}</style>
+</head>
+<body>
+<h1>CP owner bootstrap ceremony</h1>
+<p>Open this file from the future central owner origin over HTTPS, with the
+owner's authenticator available. It creates a WebAuthn credential and prints
+the owner-registration JSON that <code>python -m cpv2.admin bootstrap
+--credential-file</code> expects. Nothing leaves this page: save the output
+into an owned mode-0600 file yourself.</p>
+<label>RP ID <input id="rpid" size="40"></label>
+<button id="go">Create credential</button>
+<pre id="out">Press the button, then complete the authenticator ceremony.</pre>
+<script>
+const $ = (id) => document.getElementById(id);
+$("rpid").value = location.hostname;
+const b64url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+$("go").onclick = async () => {
+  const out = $("out");
+  try {
+    if (location.protocol !== "https:") {
+      throw new Error("serve or open this page over HTTPS on the owner origin");
+    }
+    const rpId = $("rpid").value.trim();
+    if (!rpId || !(location.hostname === rpId || location.hostname.endsWith("." + rpId))) {
+      throw new Error("rpId must match this origin's host");
+    }
+    const userId = crypto.getRandomValues(new Uint8Array(32));
+    const credential = await navigator.credentials.create({
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        rp: { id: rpId, name: "Blockfield control plane" },
+        user: { id: userId, name: "owner", displayName: "owner" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: { userVerification: "required" },
+        attestation: "none",
+        timeout: 60000,
+      },
+    });
+    const cose = credential.response.getPublicKey();
+    if (!cose) {
+      throw new Error("browser did not return the COSE public key; use a current browser");
+    }
+    out.textContent = JSON.stringify(
+      {
+        id: b64url(new Uint8Array(credential.rawId)),
+        publicKey: b64url(new Uint8Array(cose)),
+        rpId,
+        origin: location.origin,
+      },
+      null,
+      2,
+    );
+  } catch (error) {
+    out.textContent = "failed: " + (error && error.message ? error.message : error);
+  }
+};
+</script>
+</body>
+</html>

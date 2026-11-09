@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from cpv2.models import GrantChange, SettingsChange
+from cpv2.models import Action, GrantChange, ModerationAction, SettingsChange
 from cpv2.settings import (
     DEFINITIONS,
     AiLimits,
@@ -60,6 +60,34 @@ def test_grant_change_accepts_service_actor_but_rejects_bare_actor():
     assert GrantChange(**{**base, "actorAccountId": uuid4()}).actorAccountId is not None
     with pytest.raises(ValidationError):
         GrantChange(**{**base, "actor": "owner"})
+
+
+def test_action_models_accept_service_actor_but_reject_bare_actor():
+    from uuid import uuid4
+
+    kick = {
+        "idempotencyKey": "t",
+        "consumerId": "site",
+        "generation": uuid4(),
+        "target": "arena",
+        "playerId": uuid4(),
+    }
+    say = {
+        "idempotencyKey": "t",
+        "consumerId": "site",
+        "generation": uuid4(),
+        "target": "arena",
+        "text": "Hello players",
+    }
+    assert Action(**kick).actorAccountId is None
+    assert Action(**{**kick, "actorAccountId": uuid4()}).actorAccountId is not None
+    assert ModerationAction(**say).actorAccountId is None
+    assert (
+        ModerationAction(**{**say, "actorAccountId": uuid4()}).actorAccountId
+        is not None
+    )
+    with pytest.raises(ValidationError):
+        Action(**{**kick, "actor": "owner"})
 
 
 def test_complete_object_and_nested_diff():

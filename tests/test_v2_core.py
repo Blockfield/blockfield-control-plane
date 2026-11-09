@@ -8,6 +8,7 @@ import random
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -27,7 +28,12 @@ from webauthn.helpers import bytes_to_base64url
 import api
 from cpv2 import app as cpv2_app
 from cpv2 import core, delivery
-from cpv2.admin import bootstrap, provision
+from cpv2.admin import (
+    bootstrap,
+    main as admin_main,
+    provision,
+    revoke as revoke_credential,
+)
 from cpv2.app import create_app
 from cpv2.auth import (
     OWNER_SCOPES,
@@ -886,6 +892,323 @@ async def test_moderation_commands_reject_bad_shapes(store):
         assert response.status_code == status, (kind, extra, response.text)
     assert not await sql(store, "SELECT * FROM operations")
     assert not await sql(store, "SELECT * FROM outbox")
+
+
+async def test_service_moderation_asserts_actor_and_executes(store):
+    # Site moderation principal: service credential with a moderation.*
+    # ceiling; every call asserts the logged-in site user, and that actor's
+    # own grants decide exactly like a direct call.
+    token = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "modsite",
+                "via": "game",
+                "ceiling": ["agents.events", "moderation.kick", "moderation.say"],
+            },
+            "ceiling": ["agents.events", "moderation.kick", "moderation.say"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "modsite",
+                "generation": str(store["generation"]),
+                "capabilities": ["moderation.kick", "moderation.say"],
+            },
+        },
+    )
+    store["tokens"]["modsite-agent"] = token
+    moderator = store["accounts"]["moderator"]
+    kick = {
+        "idempotencyKey": "modsite-kick",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "modsite",
+        "generation": str(store["generation"]),
+        "target": "arena",
+        "playerId": str(uuid4()),
+        "actorAccountId": str(moderator),
+    }
+    response = await request(
+        store, "POST", "/v2/actions/moderation.kick", kick, "modsite-agent"
+    )
+    assert response.status_code == 202, response.text
+    operation = response.json()["operationId"]
+    attributed = await sql(
+        store,
+        "SELECT account_id, client_id FROM operations WHERE id=%s",
+        (operation,),
+    )
+    assert attributed == [{"account_id": moderator, "client_id": "modsite"}]
+    frames = await envelopes(store, cid="modsite")
+    frame = next(item for item in frames if item["operationId"] == operation)
+    assert frame["executable"] and frame["payload"]["kind"] == "moderation.kick"
+    # The ModerationAction model carries the same assertion.
+    say = {
+        "idempotencyKey": "modsite-say",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "modsite",
+        "generation": str(store["generation"]),
+        "target": "arena",
+        "text": "Hello players",
+        "actorAccountId": str(moderator),
+    }
+    response = await request(
+        store, "POST", "/v2/actions/moderation.say", say, "modsite-agent"
+    )
+    assert response.status_code == 202, response.text
+
+
+async def test_service_moderation_refusals_and_direct_actor_forbidden(store):
+    store["tokens"]["modsite"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "modsite",
+                "via": "game",
+                "ceiling": ["moderation.kick", "moderation.pardon"],
+            },
+            "ceiling": ["moderation.kick", "moderation.pardon"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "modsite",
+                "generation": str(store["generation"]),
+                "capabilities": ["moderation.kick", "moderation.pardon"],
+            },
+        },
+    )
+    moderator = store["accounts"]["moderator"]
+    ordinary = store["accounts"]["ordinary"]
+
+    def kick(key, actor=None):
+        body = {
+            "idempotencyKey": key,
+            "environment": "prod",
+            "backend": "game",
+            "consumerId": "modsite",
+            "generation": str(store["generation"]),
+            "target": "arena",
+            "playerId": str(uuid4()),
+        }
+        if actor is not None:
+            body["actorAccountId"] = str(actor)
+        return body
+
+    denied = await request(
+        store, "POST", "/v2/actions/moderation.kick", kick("no-actor"), "modsite"
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "service_actor_required", denied.text
+    unknown = await request(
+        store,
+        "POST",
+        "/v2/actions/moderation.kick",
+        kick("unknown-actor", uuid4()),
+        "modsite",
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "account_not_found", unknown.text
+    # The asserted actor holds no moderation grant.
+    unscoped = await request(
+        store,
+        "POST",
+        "/v2/actions/moderation.kick",
+        kick("unscoped-actor", ordinary),
+        "modsite",
+    )
+    assert unscoped.status_code == 403, unscoped.text
+    # Admin-only kind under a moderator actor: the actor's grants decide.
+    pardon = {
+        "idempotencyKey": "pardon-peer",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "modsite",
+        "generation": str(store["generation"]),
+        "target": "arena",
+        "player": "Steve_01",
+        "actorAccountId": str(moderator),
+    }
+    refused = await request(
+        store, "POST", "/v2/actions/moderation.pardon", pardon, "modsite"
+    )
+    assert refused.status_code == 403, refused.text
+    # An admin actor reaches the admin-only kind through the same assertion.
+    pardon["idempotencyKey"] = "pardon-admin"
+    pardon["actorAccountId"] = str(store["accounts"]["admin"])
+    assert (
+        await request(store, "POST", "/v2/actions/moderation.pardon", pardon, "modsite")
+    ).status_code == 202
+    # Direct callers are authenticated and must never send an actor.
+    forged = await request(
+        store,
+        "POST",
+        "/v2/actions/moderation.kick",
+        kick("direct-actor", moderator),
+        "moderator",
+    )
+    assert forged.status_code == 403
+    assert forged.json()["error"] == "actor_forbidden", forged.text
+    # A scoped consumer could act as any covered moderator, so only the
+    # unbound site principal may assert an actor.
+    store["tokens"]["modscoped"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "modscoped",
+                "via": "game",
+                "ceiling": ["moderation.kick"],
+            },
+            "ceiling": ["moderation.kick"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "arena",
+            "consumer": {
+                "id": "modscoped",
+                "generation": str(store["generation"]),
+                "capabilities": ["moderation.kick"],
+            },
+        },
+    )
+    scoped = kick("scoped-actor", moderator) | {"consumerId": "modscoped"}
+    bound = await request(
+        store, "POST", "/v2/actions/moderation.kick", scoped, "modscoped"
+    )
+    assert bound.status_code == 403
+    assert bound.json()["error"] == "actor_forbidden", bound.text
+
+
+async def test_workshop_gate_scope_is_patch_only_for_service(store):
+    store["tokens"]["reporter"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "reporter",
+                "via": "game",
+                "ceiling": ["workshop.gate"],
+            },
+            "ceiling": ["workshop.gate"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    leg = patch("reporter-leg-1", 0, {"state": "builders"})
+    assert (
+        await request(store, "PATCH", "/v2/settings/gate/workshop", leg, "reporter")
+    ).status_code == 202
+    rollback = {
+        "idempotencyKey": "reporter-rollback",
+        "environment": "prod",
+        "backend": "game",
+        "expectedRevision": 1,
+        "revision": 1,
+    }
+    refused = await request(
+        store, "POST", "/v2/settings/gate/workshop/rollback", rollback, "reporter"
+    )
+    assert refused.status_code == 403
+    assert refused.json()["error"] == "forbidden", refused.text
+    preview = await request(
+        store, "POST", "/v2/settings/gate/workshop/validate", leg, "reporter"
+    )
+    assert preview.status_code == 403
+    assert preview.json()["error"] == "forbidden", preview.text
+
+
+async def test_provision_ttl_cap_is_30d_for_service_24h_for_human(store):
+    service = {
+        "client": {"id": "ttl-service", "via": "game", "ceiling": ["gate:read"]},
+        "ceiling": ["gate:read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    await provision(store["admin"], {**service, "expiresInSeconds": 30 * 86400})
+    with pytest.raises(ValueError, match="invalid credential lifetime"):
+        await provision(store["admin"], {**service, "expiresInSeconds": 30 * 86400 + 1})
+    human = {
+        "accountId": str(uuid4()),
+        "displayName": "ttl-human",
+        "client": {
+            "id": "ttl-human",
+            "via": "cli",
+            "human": True,
+            "ceiling": ["settings.read"],
+        },
+        "ceiling": ["settings.read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    await provision(store["admin"], {**human, "expiresInSeconds": 86400})
+    with pytest.raises(ValueError, match="invalid credential lifetime"):
+        await provision(store["admin"], {**human, "expiresInSeconds": 86401})
+
+
+async def test_admin_cli_provision_receipt_and_revoke(
+    store, tmp_path, monkeypatch, capsys
+):
+    db_file = tmp_path / "dsn"
+    db_file.write_text(store["admin"])
+    db_file.chmod(0o600)
+    spec = {
+        "client": {"id": "cli-site", "via": "game", "ceiling": ["gate:read"]},
+        "ceiling": ["gate:read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+    spec_file.chmod(0o600)
+    token_file = tmp_path / "bearer"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cpv2.admin",
+            "--database-file",
+            str(db_file),
+            "provision",
+            "--spec-file",
+            str(spec_file),
+            "--token-file",
+            str(token_file),
+        ],
+    )
+    await admin_main()
+    out, _ = capsys.readouterr()
+    receipt = json.loads(out.strip())
+    assert set(receipt) == {"credentialId", "fingerprint"}
+    token = token_file.read_text().strip()
+    assert receipt["fingerprint"] == verifier(token)[:16]
+    assert token not in out
+    credential_id = UUID(receipt["credentialId"])
+    # Revoke is offline, audited and idempotent; unknown ids are refused.
+    with pytest.raises(ValueError, match="unknown credential"):
+        await revoke_credential(store["admin"], uuid4())
+    assert await revoke_credential(store["admin"], credential_id) == credential_id
+    assert await revoke_credential(store["admin"], credential_id) == credential_id
+    audits = await sql(
+        store,
+        "SELECT outcome, detail FROM audit_events WHERE action=%s ORDER BY sequence",
+        ("credentials.revoke",),
+    )
+    assert [row["outcome"] for row in audits] == ["accepted", "accepted"]
+    assert [row["detail"]["alreadyRevoked"] for row in audits] == [False, True]
+    assert (
+        await request(
+            store,
+            "GET",
+            "/v2/me",
+            None,
+            "admin",
+            {"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 401
 
 
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
