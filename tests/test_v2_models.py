@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from cpv2.models import Action, GrantChange, ModerationAction, SettingsChange
+from cpv2.models import Action, GrantChange, ModerationAction, Rollback, SettingsChange
 from cpv2.settings import (
     DEFINITIONS,
     AiLimits,
@@ -88,6 +88,26 @@ def test_action_models_accept_service_actor_but_reject_bare_actor():
     )
     with pytest.raises(ValidationError):
         Action(**{**kick, "actor": "owner"})
+
+
+def test_settings_changes_accept_service_actor_but_reject_bare_actor():
+    from uuid import uuid4
+
+    patch = {"idempotencyKey": "t", "expectedRevision": 0, "patch": {}}
+    assert SettingsChange(**patch).actorAccountId is None
+    assert (
+        SettingsChange(**{**patch, "actorAccountId": uuid4()}).actorAccountId
+        is not None
+    )
+    with pytest.raises(ValidationError):
+        SettingsChange(**{**patch, "actor": "owner"})
+    rollback = {"idempotencyKey": "t", "expectedRevision": 0, "revision": 1}
+    assert Rollback(**rollback).actorAccountId is None
+    assert (
+        Rollback(**{**rollback, "actorAccountId": uuid4()}).actorAccountId is not None
+    )
+    with pytest.raises(ValidationError):
+        Rollback(**{**rollback, "actor": "owner"})
 
 
 def test_complete_object_and_nested_diff():

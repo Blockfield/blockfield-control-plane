@@ -21,6 +21,7 @@ from cpv2.auth import (
     OWNER_SCOPES,
     ROLE_SCOPES,
     SERVICE_SCOPES,
+    SITE_SETTINGS_SCOPES,
     STAFF_SCOPES,
     invalidate,
     now,
@@ -277,12 +278,14 @@ async def _provision(dsn, spec, bearer_sink=None):
                 )
         else:
             epoch = None
-            if set(spec["ceiling"]) - (SERVICE_SCOPES | STAFF_SCOPES) or client.get(
-                "human"
-            ):
+            if set(spec["ceiling"]) - (
+                SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES
+            ) or client.get("human"):
                 raise ValueError("service credential ceiling")
-            if STAFF_SCOPES & set(spec["ceiling"]) and spec["resource"] != "*":
-                raise ValueError("staff scopes need an unbound site credential")
+            if (STAFF_SCOPES | SITE_SETTINGS_SCOPES) & set(spec["ceiling"]) and spec[
+                "resource"
+            ] != "*":
+                raise ValueError("site scopes need an unbound site credential")
             # The service principal row lives here, not at runtime: this path
             # runs privileged while the service (cp_runtime) cannot INSERT accounts.
             principal, name = service_principal_id(client["id"])
@@ -291,7 +294,9 @@ async def _provision(dsn, spec, bearer_sink=None):
                 (principal, name),
             )
         if set(spec["ceiling"]) - (
-            OWNER_SCOPES if account_id else SERVICE_SCOPES | STAFF_SCOPES
+            OWNER_SCOPES
+            if account_id
+            else SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES
         ):
             raise ValueError("unknown scope")
         ttl = spec.get("expiresInSeconds", 3600)

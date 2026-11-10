@@ -26,11 +26,17 @@ class Mutation(Strict):
 class SettingsChange(Mutation):
     expectedRevision: int = Field(ge=0, le=9223372036854775807)
     patch: dict
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class Rollback(Mutation):
     expectedRevision: int = Field(ge=0, le=9223372036854775807)
     revision: int = Field(ge=1, le=9223372036854775807)
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class GrantChange(Mutation):
