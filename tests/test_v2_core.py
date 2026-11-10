@@ -4321,9 +4321,23 @@ async def test_workshop_remaining_kinds_produce_exact_consumer_payloads(store):
                 "expectedRevision": 7,
                 "session": "new",
                 "maps": ["arena1", "hub"],
+            },
+            stranger,
+        ),
+        # Linear history (workshop#65): a stale caller may still send
+        # `branches`; it is accepted for shape and dropped from the payload.
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 7,
+                "session": "new",
+                "maps": ["arena1", "hub"],
                 "branches": {"arena1": "draft", "hub": "wip"},
             },
             stranger,
+            {"branches": {"arena1": "draft", "hub": "wip"}},
         ),
         (
             "admin",
@@ -4337,7 +4351,7 @@ async def test_workshop_remaining_kinds_produce_exact_consumer_payloads(store):
             stranger,
         ),
     ]
-    for role, kind, fields, actor in cases:
+    for role, kind, fields, actor, *rest in cases:
         body = workshop_body(store, actor=dict(actor), **fields)
         response = await request(store, "POST", f"/v2/workshop/{kind}", body, role)
         assert response.status_code == 202, (kind, fields, response.text)
@@ -4348,6 +4362,9 @@ async def test_workshop_remaining_kinds_produce_exact_consumer_payloads(store):
             expected.update({**fields, "limit": 100})
         else:
             expected.update(fields)
+        for dropped in rest:
+            for key in dropped:
+                expected.pop(key, None)
         assert rows[0]["payload"] == expected, kind
         # Same canonical JSON the Workshop cp_client verifies its frames with.
         assert rows[0]["payload_hash"] == digest(expected), kind
@@ -4426,6 +4443,17 @@ async def test_workshop_remaining_kinds_reject_bad_shapes(store):
                 "session": "new",
                 "maps": ["arena1"],
                 "branches": {"other": "draft"},
+            },
+        ),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 1,
+                "session": "new",
+                "maps": ["arena1"],
+                "branches": {"arena1": "main"},
             },
         ),
         (
