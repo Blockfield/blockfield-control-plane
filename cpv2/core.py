@@ -1134,6 +1134,9 @@ def _workshop_mode(model):
             partial["session"] = "new"
             if maps is not None:
                 partial["maps"] = list(maps)
+            # Linear history (workshop#65): sessions track maps only. A stale
+            # caller may still send `branches`; it is validated for shape and
+            # then dropped — the workshop ignores it the same way.
             branches = model.branches
             if branches is not None:
                 if (
@@ -1148,7 +1151,6 @@ def _workshop_mode(model):
                     )
                 ):
                     raise Problem("invalid_workshop_mode", 422)
-                partial["branches"] = dict(branches)
         else:
             partial["session"] = "resume"
             if model.sessionId is not None:
