@@ -367,3 +367,27 @@ def test_deathmatch_streak_rewards_mirror_server():
     for bad in bad_tables:
         with pytest.raises(ValidationError):
             Deathmatch.model_validate(_streak_doc(bad))
+
+
+def test_settings_body_without_actor_keeps_the_pre_actor_fingerprint():
+    # A retry of an operation accepted before actorAccountId existed must hash
+    # to the stored request: absent actor == old body, byte for byte.
+    from uuid import uuid4
+
+    from cpv2.core import settings_request_body
+
+    base = {"idempotencyKey": "k1", "expectedRevision": 3, "patch": {"mode": "public"}}
+    old_shape = {
+        "idempotencyKey": "k1",
+        "environment": "prod",
+        "backend": "game",
+        "expectedRevision": 3,
+        "patch": {"mode": "public"},
+    }
+    assert settings_request_body(SettingsChange(**base)) == old_shape
+    assert "actorAccountId" not in settings_request_body(
+        Rollback(idempotencyKey="k2", expectedRevision=3, revision=2)
+    )
+    actor = uuid4()
+    body = settings_request_body(SettingsChange(**base, actorAccountId=actor))
+    assert body["actorAccountId"] == str(actor)
