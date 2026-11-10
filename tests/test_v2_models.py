@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from cpv2.models import Action, GrantChange, ModerationAction, SettingsChange
+from cpv2.models import Action, GrantChange, ModerationAction, Rollback, SettingsChange
 from cpv2.settings import (
     DEFINITIONS,
     AiLimits,
@@ -88,6 +88,26 @@ def test_action_models_accept_service_actor_but_reject_bare_actor():
     )
     with pytest.raises(ValidationError):
         Action(**{**kick, "actor": "owner"})
+
+
+def test_settings_changes_accept_service_actor_but_reject_bare_actor():
+    from uuid import uuid4
+
+    patch = {"idempotencyKey": "t", "expectedRevision": 0, "patch": {}}
+    assert SettingsChange(**patch).actorAccountId is None
+    assert (
+        SettingsChange(**{**patch, "actorAccountId": uuid4()}).actorAccountId
+        is not None
+    )
+    with pytest.raises(ValidationError):
+        SettingsChange(**{**patch, "actor": "owner"})
+    rollback = {"idempotencyKey": "t", "expectedRevision": 0, "revision": 1}
+    assert Rollback(**rollback).actorAccountId is None
+    assert (
+        Rollback(**{**rollback, "actorAccountId": uuid4()}).actorAccountId is not None
+    )
+    with pytest.raises(ValidationError):
+        Rollback(**{**rollback, "actor": "owner"})
 
 
 def test_complete_object_and_nested_diff():
@@ -347,3 +367,39 @@ def test_deathmatch_streak_rewards_mirror_server():
     for bad in bad_tables:
         with pytest.raises(ValidationError):
             Deathmatch.model_validate(_streak_doc(bad))
+
+
+def test_settings_body_without_actor_keeps_the_pre_actor_fingerprint():
+    # A retry of an operation accepted before actorAccountId existed must hash
+    # to the stored request: absent actor == old body, byte for byte.
+    from uuid import uuid4
+
+    from cpv2.models import request_body as settings_request_body
+
+    base = {"idempotencyKey": "k1", "expectedRevision": 3, "patch": {"mode": "public"}}
+    old_shape = {
+        "idempotencyKey": "k1",
+        "environment": "prod",
+        "backend": "game",
+        "expectedRevision": 3,
+        "patch": {"mode": "public"},
+    }
+    assert settings_request_body(SettingsChange(**base)) == old_shape
+    assert "actorAccountId" not in settings_request_body(
+        Rollback(idempotencyKey="k2", expectedRevision=3, revision=2)
+    )
+    actor = uuid4()
+    body = settings_request_body(SettingsChange(**base, actorAccountId=actor))
+    assert body["actorAccountId"] == str(actor)
+
+
+def test_owner_challenge_and_write_hash_the_same_settings_body():
+    # Review r4524148929: the step-up challenge body (normalized_action) and the
+    # write body must match, or a protected owner write fails its assertion.
+    from cpv2.auth import normalized_action
+    from cpv2.models import request_body
+
+    body = {"idempotencyKey": "k1", "expectedRevision": 3, "patch": {"mode": "public"}}
+    challenged = normalized_action("PATCH", "/v2/settings/gate/*", body)
+    assert challenged == request_body(SettingsChange(**body))
+    assert "actorAccountId" not in challenged

@@ -30,6 +30,7 @@ from cpv2 import app as cpv2_app
 from cpv2 import core, delivery
 from cpv2.admin import (
     bootstrap,
+    enroll_owner,
     main as admin_main,
     provision,
     revoke as revoke_credential,
@@ -173,6 +174,10 @@ async def store(postgres):
                             "workshop.wake",
                             "workshop.cancel",
                             "workshop.release.select",
+                            "workshop.map",
+                            "workshop.sessions",
+                            "workshop.ai-key",
+                            "workshop.mode",
                         ]
                         if consumer == "workshop"
                         else []
@@ -1078,6 +1083,147 @@ async def test_service_moderation_refusals_and_direct_actor_forbidden(store):
     )
     assert bound.status_code == 403
     assert bound.json()["error"] == "actor_forbidden", bound.text
+
+
+async def test_service_settings_actor_grant_decides_and_scoped_refused(store):
+    # Site settings travel like staff/moderation: the unbound site principal
+    # asserts the acting admin, and the actor's own grants decide.
+    store["tokens"]["sitesettings"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "sitesettings",
+                "via": "game",
+                "ceiling": ["settings.read", "settings.gameplay.write"],
+            },
+            "ceiling": ["settings.read", "settings.gameplay.write"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+
+    def change(key, revision=0, actor=None, value=None):
+        body = {
+            "idempotencyKey": key,
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": revision,
+            "patch": value or {"lobby": {"pvpEnabled": True}},
+        }
+        if actor is not None:
+            body["actorAccountId"] = str(actor)
+        return body
+
+    denied = await request(
+        store, "PATCH", "/v2/settings/gameplay/*", change("no-actor"), "sitesettings"
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "service_actor_required", denied.text
+    unknown = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("unknown-actor", actor=uuid4()),
+        "sitesettings",
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "account_not_found", unknown.text
+    # The asserted actor holds no gameplay-write grant.
+    ordinary = store["accounts"]["ordinary"]
+    unscoped = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("unscoped-actor", actor=ordinary),
+        "sitesettings",
+    )
+    assert unscoped.status_code == 403, unscoped.text
+    # A moderator actor reads settings but cannot write gameplay: the actor's
+    # grants decide, not the service ceiling.
+    moderator = store["accounts"]["moderator"]
+    peer = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("moderator-actor", actor=moderator),
+        "sitesettings",
+    )
+    assert peer.status_code == 403, peer.text
+    # An admin actor reaches the write through the same assertion.
+    admin = store["accounts"]["admin"]
+    accepted = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("admin-actor", actor=admin),
+        "sitesettings",
+    )
+    assert accepted.status_code == 202, accepted.text
+    operation = accepted.json()["operationId"]
+    attributed = await sql(
+        store,
+        "SELECT account_id FROM operations WHERE id=%s",
+        (operation,),
+    )
+    assert attributed == [{"account_id": admin}]
+    revised = await sql(
+        store,
+        "SELECT actor, revision FROM settings_revisions WHERE namespace=%s AND revision=1",
+        ("gameplay",),
+    )
+    assert revised == [{"actor": admin, "revision": 1}]
+    # Reads ride the same token without an actor: no attribution needed.
+    view = await request(store, "GET", "/v2/settings/gameplay/*", None, "sitesettings")
+    assert view.status_code == 200, view.text
+    assert view.json()["revision"] == 1
+    # Direct callers are authenticated and must never send an actor.
+    forged = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("direct-actor", revision=1, actor=admin),
+        "admin",
+    )
+    assert forged.status_code == 403
+    assert forged.json()["error"] == "actor_forbidden", forged.text
+    # Only the unbound site principal may assert an actor: narrowing the
+    # credential resource fences even a covered target (faithful admins keep
+    # working through the unbound credential above).
+    await sql(
+        store,
+        "UPDATE credentials SET resource='arena' WHERE verifier=%s",
+        (hashlib.sha256(store["tokens"]["sitesettings"].encode()).hexdigest(),),
+    )
+    bound = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/arena",
+        change("scoped-actor", actor=admin),
+        "sitesettings",
+    )
+    assert bound.status_code == 403
+    assert bound.json()["error"] == "actor_forbidden", bound.text
+
+
+async def test_site_settings_scopes_only_on_unbound_site_credential(store):
+    # A resource-bound consumer credential holding settings scopes could
+    # assert any covered admin as the acting account, so provision refuses.
+    with pytest.raises(ValueError, match="unbound site credential"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "arena-settings",
+                    "via": "game",
+                    "ceiling": ["settings.gameplay.write"],
+                },
+                "ceiling": ["settings.gameplay.write"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "arena",
+            },
+        )
 
 
 async def test_workshop_gate_scope_is_patch_only_for_service(store):
@@ -4258,9 +4404,424 @@ async def test_workshop_invalid_operations_rejected(store):
 
 async def test_workshop_unknown_kind_rejected(store):
     response = await request(
-        store, "POST", "/v2/workshop/map-create", workshop_body(store), "admin"
+        store, "POST", "/v2/workshop/checkpoint", workshop_body(store), "admin"
     )
     assert response.status_code == 404
+
+
+WORKSHOP_MAP_CREATE = {
+    "mapOp": "map-create",
+    "mapId": "arena1",
+    "name": "Arena 1",
+    "supportedModes": ["tdm", "room"],
+    "expectedRevision": 3,
+}
+WORKSHOP_MAP_PROPERTIES = {
+    "mapOp": "map-properties",
+    "mapId": "arena1",
+    "name": "Arena One",
+    "workingCopyId": "e10438e4-797b-4971-88cf-ecec6a8fa171",
+    "expectedRevision": 4,
+}
+
+
+async def test_workshop_remaining_kinds_produce_exact_consumer_payloads(store):
+    await bind(store, "moderator")
+    await bind(store, "admin", "f" * 32, "Stranger")
+    await bind(store, "owner", "b" * 32, "Helper")
+    helper = {"draslId": "b" * 32, "name": "Helper"}
+    stranger = {"draslId": "f" * 32, "name": "Stranger"}
+    cases = [
+        ("moderator", "map", WORKSHOP_MAP_CREATE, WORKSHOP_ACTOR),
+        ("moderator", "map", WORKSHOP_MAP_PROPERTIES, WORKSHOP_ACTOR),
+        ("moderator", "sessions", {"offset": 10, "limit": 25}, WORKSHOP_ACTOR),
+        ("moderator", "sessions", {"offset": 0}, WORKSHOP_ACTOR),
+        (
+            "owner",
+            "ai-key",
+            {"provider": "openrouter", "key": "sk-" + "x" * 20},
+            helper,
+        ),
+        (
+            "owner",
+            "ai-key",
+            {"provider": "custom-1", "key": None},
+            helper,
+        ),
+        (
+            "admin",
+            "mode",
+            {"profile": "game", "expectedRevision": 7, "recover": True},
+            stranger,
+        ),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 7,
+                "session": "new",
+                "maps": ["arena1", "hub"],
+            },
+            stranger,
+        ),
+        # Linear history (workshop#65): a stale caller may still send
+        # `branches`; it is accepted for shape and dropped from the payload.
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 7,
+                "session": "new",
+                "maps": ["arena1", "hub"],
+                "branches": {"arena1": "draft", "hub": "wip"},
+            },
+            stranger,
+            {"branches": {"arena1": "draft", "hub": "wip"}},
+        ),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "test",
+                "expectedRevision": 7,
+                "candidateId": "a" * 32,
+                "modeId": "tdm",
+            },
+            stranger,
+        ),
+    ]
+    for role, kind, fields, actor, *rest in cases:
+        body = workshop_body(store, actor=dict(actor), **fields)
+        response = await request(store, "POST", f"/v2/workshop/{kind}", body, role)
+        assert response.status_code == 202, (kind, fields, response.text)
+        rows = await workshop_outbox(store, response.json()["operationId"])
+        assert len(rows) == 1, kind
+        expected = {"kind": kind, "target": "*", "actor": dict(actor)}
+        if kind == "sessions" and "limit" not in fields:
+            expected.update({**fields, "limit": 100})
+        else:
+            expected.update(fields)
+        for dropped in rest:
+            for key in dropped:
+                expected.pop(key, None)
+        assert rows[0]["payload"] == expected, kind
+        # Same canonical JSON the Workshop cp_client verifies its frames with.
+        assert rows[0]["payload_hash"] == digest(expected), kind
+
+
+async def test_workshop_remaining_kinds_reject_bad_shapes(store):
+    await bind(store, "moderator")
+    await bind(store, "admin", "f" * 32, "Stranger")
+    await bind(store, "owner", "b" * 32, "Helper")
+    copy = "e10438e4-797b-4971-88cf-ecec6a8fa171"
+    key = "sk-" + "x" * 20
+    cases = [
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "mapOp": "map-rename"}),
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "mapId": "hub"}),
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "mapId": "Arena!"}),
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "name": " §bad"}),
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "supportedModes": []}),
+        (
+            "moderator",
+            "map",
+            {**WORKSHOP_MAP_CREATE, "supportedModes": ["tdm", "nope"]},
+        ),
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "supportedModes": ["tdm", "tdm"]}),
+        # Unhashable elements must 422, not 500 (set() runs on validated strs).
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "supportedModes": [[]]}),
+        ("moderator", "map", {**WORKSHOP_MAP_PROPERTIES, "workingCopyId": "nope"}),
+        ("moderator", "map", {**WORKSHOP_MAP_PROPERTIES, "expectedRevision": -1}),
+        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "target": "arena1"}),
+        ("moderator", "sessions", {"offset": -1}),
+        ("moderator", "sessions", {"offset": True}),
+        ("moderator", "sessions", {"offset": 0, "limit": 101}),
+        ("moderator", "sessions", {"offset": 0, "target": "arena1"}),
+        ("owner", "ai-key", {"provider": "openrouter"}),
+        ("owner", "ai-key", {"provider": "openrouter", "key": "short"}),
+        ("owner", "ai-key", {"provider": "gateway", "key": key}),
+        ("owner", "ai-key", {"provider": "OPENROUTER", "key": key}),
+        ("owner", "ai-key", {"provider": "openrouter", "key": key, "target": "hub"}),
+        ("admin", "mode", {"profile": "game"}),
+        (
+            "admin",
+            "mode",
+            {"profile": "workshop", "expectedRevision": 1, "recover": True},
+        ),
+        (
+            "admin",
+            "mode",
+            {"profile": "workshop", "expectedRevision": 1, "session": "later"},
+        ),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 1,
+                "session": "new",
+                "maps": ["arena1", "arena1"],
+            },
+        ),
+        # Unhashable entries must 422, not 500 (set() runs on validated strs).
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 1,
+                "session": "new",
+                "maps": [{}],
+            },
+        ),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 1,
+                "session": "new",
+                "maps": ["arena1"],
+                "branches": {"other": "draft"},
+            },
+        ),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 1,
+                "session": "new",
+                "maps": ["arena1"],
+                "branches": {"arena1": "main"},
+            },
+        ),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "workshop",
+                "expectedRevision": 1,
+                "session": "resume",
+                "sessionId": "nope",
+            },
+        ),
+        (
+            "admin",
+            "mode",
+            {"profile": "game", "expectedRevision": 1, "sessionId": copy},
+        ),
+        ("admin", "mode", {"profile": "test", "expectedRevision": 1}),
+        (
+            "admin",
+            "mode",
+            {
+                "profile": "test",
+                "expectedRevision": 1,
+                "candidateId": "a" * 32,
+                "modeId": "nope",
+            },
+        ),
+        (
+            "admin",
+            "mode",
+            {"profile": "game", "expectedRevision": 1, "target": "arena1"},
+        ),
+    ]
+    for role, kind, fields in cases:
+        body = workshop_body(store, **fields)
+        response = await request(store, "POST", f"/v2/workshop/{kind}", body, role)
+        assert response.status_code == 422, (kind, fields, response.text)
+
+
+async def test_workshop_remaining_kinds_rbac(store):
+    await bind(store, "builder")
+    await bind(store, "moderator", "c" * 32, "Mod")
+    await bind(store, "admin", "f" * 32, "Stranger")
+    await bind(store, "owner", "b" * 32, "Helper")
+    mod = {"draslId": "c" * 32, "name": "Mod"}
+    stranger = {"draslId": "f" * 32, "name": "Stranger"}
+    helper = {"draslId": "b" * 32, "name": "Helper"}
+    # Builders page drafts only; moderators handle map drafts; mode is admin;
+    # keys are founders only.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/workshop/sessions",
+            workshop_body(store, offset=0),
+            "builder",
+        )
+    ).status_code == 202
+    for kind, fields in (
+        ("map", WORKSHOP_MAP_CREATE),
+        ("mode", {"profile": "game", "expectedRevision": 0}),
+        ("ai-key", {"provider": "openrouter", "key": "sk-" + "x" * 20}),
+    ):
+        assert (
+            await request(
+                store,
+                "POST",
+                f"/v2/workshop/{kind}",
+                workshop_body(store, **fields),
+                "builder",
+            )
+        ).status_code == 403
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/workshop/map",
+            workshop_body(store, actor=mod, **WORKSHOP_MAP_CREATE),
+            "moderator",
+        )
+    ).status_code == 202
+    for kind, fields in (
+        ("mode", {"profile": "game", "expectedRevision": 0}),
+        ("ai-key", {"provider": "openrouter", "key": "sk-" + "x" * 20}),
+    ):
+        assert (
+            await request(
+                store,
+                "POST",
+                f"/v2/workshop/{kind}",
+                workshop_body(store, **fields),
+                "moderator",
+            )
+        ).status_code == 403
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/workshop/mode",
+            workshop_body(store, actor=stranger, profile="game", expectedRevision=0),
+            "admin",
+        )
+    ).status_code == 202
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/workshop/ai-key",
+            workshop_body(store, provider="openrouter", key="sk-" + "x" * 20),
+            "admin",
+        )
+    ).status_code == 403
+    key_body = workshop_body(
+        store, actor=helper, provider="openrouter", key="sk-" + "x" * 20
+    )
+    response = await request(store, "POST", "/v2/workshop/ai-key", key_body, "owner")
+    assert response.status_code == 202, response.text
+    # Key material never reaches operation results or the audit trail.
+    operation = await request(
+        store, "GET", f"/v2/operations/{response.json()['operationId']}", role="owner"
+    )
+    assert operation.status_code == 200, operation.text
+    assert "sk-" not in json.dumps(operation.json()["result"])
+    audit = await sql(
+        store,
+        "SELECT detail FROM audit_events WHERE action='workshop.ai-key' ORDER BY sequence DESC LIMIT 1",
+    )
+    assert "sk-" not in json.dumps(audit[0]["detail"])
+
+
+async def test_workshop_remaining_kinds_service_split(store):
+    await bind(store, "moderator")
+    site = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "site-maps",
+                "via": "game",
+                "ceiling": ["workshop.act", "workshop.map", "workshop.sessions"],
+            },
+            "ceiling": ["workshop.act", "workshop.map", "workshop.sessions"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    store["tokens"]["site-maps"] = site
+    for kind, fields in (
+        ("map", WORKSHOP_MAP_CREATE),
+        ("sessions", {"offset": 0}),
+    ):
+        assert (
+            await request(
+                store,
+                "POST",
+                f"/v2/workshop/{kind}",
+                workshop_body(store, **fields),
+                "site-maps",
+            )
+        ).status_code == 202
+    # Mode and keys are never service-holdable: provisioning such a ceiling
+    # is refused, and act-only credentials cannot mint them either.
+    with pytest.raises(ValueError, match="service credential ceiling"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "site-mode",
+                    "via": "game",
+                    "ceiling": ["workshop.act", "workshop.mode"],
+                },
+                "ceiling": ["workshop.act", "workshop.mode"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+    act_only = await provision(
+        store["admin"],
+        {
+            "client": {"id": "site-act", "via": "game", "ceiling": ["workshop.act"]},
+            "ceiling": ["workshop.act"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    store["tokens"]["site-act"] = act_only
+    for kind, fields in (
+        ("mode", {"profile": "game", "expectedRevision": 0}),
+        ("ai-key", {"provider": "openrouter", "key": "sk-" + "x" * 20}),
+    ):
+        assert (
+            await request(
+                store,
+                "POST",
+                f"/v2/workshop/{kind}",
+                workshop_body(store, **fields),
+                "site-act",
+            )
+        ).status_code == 403
+
+
+async def test_owner_enroll_names_second_founder_explicitly(store, postgres):
+    founder = uuid4()
+    second = dict(store["credential"], id=bytes_to_base64url(b"test-credential-2"))
+    await enroll_owner(store["admin"], founder, "cofounder", second)
+    rows = await sql(store, "SELECT account_id FROM owner_memberships")
+    assert {row["account_id"] for row in rows} == {
+        store["accounts"]["owner"],
+        founder,
+    }
+    with pytest.raises(ValueError, match="already an owner"):
+        await enroll_owner(store["admin"], founder, "cofounder", second)
+    with pytest.raises(ValueError, match="both founders"):
+        await enroll_owner(store["admin"], uuid4(), "third", second)
+    bad = dict(second, origin="http://control.example.test")
+    with pytest.raises(ValueError, match="independent HTTPS origin"):
+        await enroll_owner(store["admin"], uuid4(), "third", bad)
+    name = "cp_" + uuid4().hex
+    async with await psycopg.AsyncConnection.connect(postgres, autocommit=True) as conn:
+        await conn.execute(f'CREATE DATABASE "{name}"')
+    fresh = make_conninfo(postgres, dbname=name)
+    await migrate(fresh, name)
+    with pytest.raises(ValueError, match="not bootstrapped"):
+        await enroll_owner(fresh, uuid4(), "first", second)
 
 
 async def test_workshop_rbac_mirrors_moderation_split(store):

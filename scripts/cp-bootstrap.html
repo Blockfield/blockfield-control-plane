@@ -45,10 +45,15 @@ $("go").onclick = async () => {
         timeout: 60000,
       },
     });
-    const cose = credential.response.getPublicKey();
-    if (!cose) {
-      throw new Error("browser did not return the COSE public key; use a current browser");
-    }
+    // getPublicKey() is SPKI DER; cpv2.admin bootstrap decodes a COSE key,
+    // which sits in authenticatorData after the attested credential header.
+    const auth = new Uint8Array(credential.response.getAuthenticatorData());
+    if (!(auth[32] & 0x40)) throw new Error("no attested credential data");
+    if (auth[32] & 0x80) throw new Error("authenticator added extensions; COSE key boundary unknown");
+    if (auth.length < 55) throw new Error("authenticatorData is truncated");
+    const idLen = (auth[53] << 8) | auth[54];
+    const cose = auth.slice(55 + idLen);
+    if (!cose.length) throw new Error("authenticatorData has no COSE key");
     out.textContent = JSON.stringify(
       {
         id: b64url(new Uint8Array(credential.rawId)),

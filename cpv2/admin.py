@@ -21,6 +21,7 @@ from cpv2.auth import (
     OWNER_SCOPES,
     ROLE_SCOPES,
     SERVICE_SCOPES,
+    SITE_SETTINGS_SCOPES,
     STAFF_SCOPES,
     invalidate,
     now,
@@ -42,7 +43,7 @@ def private_file(path):
     return path.read_text()
 
 
-async def bootstrap(dsn, account_id, name, credential):
+def _checked_credential(credential):
     key = base64url_to_bytes(credential["publicKey"])
     decode_credential_public_key(key)
     base64url_to_bytes(credential["id"])
@@ -60,6 +61,11 @@ async def bootstrap(dsn, account_id, name, credential):
         raise ValueError(
             "owner credential requires an independent HTTPS origin and matching RP ID"
         )
+    return key, credential["id"], rp_id, credential["origin"]
+
+
+async def bootstrap(dsn, account_id, name, credential):
+    key, credential_id, rp_id, origin = _checked_credential(credential)
     async with (
         await psycopg.AsyncConnection.connect(
             dsn, row_factory=dict_row, options="-c search_path=control,pg_catalog"
@@ -100,6 +106,60 @@ async def bootstrap(dsn, account_id, name, credential):
             )
         # Sessions provisioned before the account became owner must not ride
         # into owner authority: revoke every pre-bootstrap credential.
+        await invalidate(conn, account_id)
+
+
+# The owner list names both founders explicitly (control-plane#11): the
+# first founder comes from bootstrap(), the second from here. Founder
+# identities travel in the operator's offline config (account UUID, display
+# name, verified WebAuthn registration) — never in code. Two seats, no
+# more: a further owner is a separately reviewed offline migration, like
+# bootstrap recovery.
+async def enroll_owner(dsn, account_id, name, credential):
+    key, credential_id, rp_id, origin = _checked_credential(credential)
+    async with (
+        await psycopg.AsyncConnection.connect(
+            dsn, row_factory=dict_row, options="-c search_path=control,pg_catalog"
+        ) as conn,
+        history(conn),
+    ):
+        await conn.execute("SELECT pg_advisory_xact_lock(278003)")
+        owners = await one(conn, "SELECT count(*) AS n FROM owner_memberships")
+        if owners["n"] == 0:
+            raise ValueError("not bootstrapped; the first owner comes from bootstrap")
+        if await one(
+            conn, "SELECT 1 FROM owner_memberships WHERE account_id=%s", (account_id,)
+        ):
+            raise ValueError("already an owner")
+        if owners["n"] >= 2:
+            raise ValueError("the owner list holds both founders; no further owners")
+        await conn.execute(
+            "INSERT INTO accounts(id,display_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+            (account_id, name),
+        )
+        attempt = uuid4()
+        for outcome in ("pending", "accepted"):
+            if outcome == "accepted":
+                await conn.execute(
+                    "INSERT INTO owner_memberships(account_id) VALUES(%s)",
+                    (account_id,),
+                )
+                await conn.execute(
+                    "INSERT INTO owner_credentials(id,account_id,public_key,rp_id,origin) VALUES(%s,%s,%s,%s,%s)",
+                    (credential_id, account_id, key, rp_id, origin),
+                )
+            await record(
+                conn,
+                "INSERT INTO audit_events(attempt_id,actor,via,request_id,action,target,outcome,detail) VALUES(%s,%s,'recovery',%s,'owner.enroll',%s,%s,%s)",
+                (
+                    attempt,
+                    account_id,
+                    attempt,
+                    str(account_id),
+                    outcome,
+                    Jsonb({"credentialFingerprint": verifier(credential["publicKey"])}),
+                ),
+            )
         await invalidate(conn, account_id)
 
 
@@ -218,12 +278,14 @@ async def _provision(dsn, spec, bearer_sink=None):
                 )
         else:
             epoch = None
-            if set(spec["ceiling"]) - (SERVICE_SCOPES | STAFF_SCOPES) or client.get(
-                "human"
-            ):
+            if set(spec["ceiling"]) - (
+                SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES
+            ) or client.get("human"):
                 raise ValueError("service credential ceiling")
-            if STAFF_SCOPES & set(spec["ceiling"]) and spec["resource"] != "*":
-                raise ValueError("staff scopes need an unbound site credential")
+            if (STAFF_SCOPES | SITE_SETTINGS_SCOPES) & set(spec["ceiling"]) and spec[
+                "resource"
+            ] != "*":
+                raise ValueError("site scopes need an unbound site credential")
             # The service principal row lives here, not at runtime: this path
             # runs privileged while the service (cp_runtime) cannot INSERT accounts.
             principal, name = service_principal_id(client["id"])
@@ -232,7 +294,9 @@ async def _provision(dsn, spec, bearer_sink=None):
                 (principal, name),
             )
         if set(spec["ceiling"]) - (
-            OWNER_SCOPES if account_id else SERVICE_SCOPES | STAFF_SCOPES
+            OWNER_SCOPES
+            if account_id
+            else SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES
         ):
             raise ValueError("unknown scope")
         ttl = spec.get("expiresInSeconds", 3600)
@@ -319,6 +383,14 @@ async def main():
         required=True,
         help="offline-verified WebAuthn registration: id/publicKey (base64url COSE), rpId, origin",
     )
+    enroll = commands.add_parser("enroll-owner")
+    enroll.add_argument("--account", type=UUID, required=True)
+    enroll.add_argument("--name", required=True)
+    enroll.add_argument(
+        "--credential-file",
+        required=True,
+        help="offline-verified WebAuthn registration of the second founder",
+    )
     issue = commands.add_parser("provision")
     issue.add_argument("--spec-file", required=True)
     issue.add_argument("--token-file", required=True)
@@ -337,6 +409,10 @@ async def main():
         await migrate(dsn, args.database)
     elif args.command == "bootstrap":
         await bootstrap(
+            dsn, args.account, args.name, json.loads(private_file(args.credential_file))
+        )
+    elif args.command == "enroll-owner":
+        await enroll_owner(
             dsn, args.account, args.name, json.loads(private_file(args.credential_file))
         )
     elif args.command == "provision":
