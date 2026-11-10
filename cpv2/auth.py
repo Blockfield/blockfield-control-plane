@@ -359,7 +359,7 @@ def normalized_action(method, path, body):
     else:
         raise Problem("invalid_owner_action", 422)
     try:
-        return model.model_validate(body).model_dump(mode="json")
+        return models.request_body(model.model_validate(body))
     except ValueError:
         raise Problem("invalid_owner_action", 422) from None
 

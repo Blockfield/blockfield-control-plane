@@ -206,19 +206,6 @@ async def enqueue(conn, op, consumers, payload, revision=None):
         await conn.execute("SELECT pg_notify('cp_events',%s)", (c["id"],))
 
 
-def settings_request_body(model):
-    """The body a settings PATCH/rollback is fingerprinted by.
-
-    actorAccountId was added later: when it is absent the body must stay
-    byte-identical to the pre-actor shape, or a retry of an operation accepted
-    before the upgrade hashes differently and gets idempotency_conflict.
-    """
-    data = model.model_dump(mode="json")
-    if data.get("actorAccountId") is None:
-        data.pop("actorAccountId", None)
-    return data
-
-
 async def settings_change(
     conn,
     identity,
@@ -235,7 +222,7 @@ async def settings_change(
     definition = DEFINITIONS.get(namespace)
     if not definition:
         raise Problem("unknown_namespace", 404)
-    data = settings_request_body(model)
+    data = models.request_body(model)
     env, backend = data["environment"], data["backend"]
     # The workshop leg is reported by the workshop service, not toggled by
     # game-entry admins: it carries its own service-holdable write scope.

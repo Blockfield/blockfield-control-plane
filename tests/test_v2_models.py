@@ -374,7 +374,7 @@ def test_settings_body_without_actor_keeps_the_pre_actor_fingerprint():
     # to the stored request: absent actor == old body, byte for byte.
     from uuid import uuid4
 
-    from cpv2.core import settings_request_body
+    from cpv2.models import request_body as settings_request_body
 
     base = {"idempotencyKey": "k1", "expectedRevision": 3, "patch": {"mode": "public"}}
     old_shape = {
@@ -391,3 +391,15 @@ def test_settings_body_without_actor_keeps_the_pre_actor_fingerprint():
     actor = uuid4()
     body = settings_request_body(SettingsChange(**base, actorAccountId=actor))
     assert body["actorAccountId"] == str(actor)
+
+
+def test_owner_challenge_and_write_hash_the_same_settings_body():
+    # Review r4524148929: the step-up challenge body (normalized_action) and the
+    # write body must match, or a protected owner write fails its assertion.
+    from cpv2.auth import normalized_action
+    from cpv2.models import request_body
+
+    body = {"idempotencyKey": "k1", "expectedRevision": 3, "patch": {"mode": "public"}}
+    challenged = normalized_action("PATCH", "/v2/settings/gate/*", body)
+    assert challenged == request_body(SettingsChange(**body))
+    assert "actorAccountId" not in challenged
