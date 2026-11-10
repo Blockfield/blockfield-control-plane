@@ -58,6 +58,9 @@ class Action(Mutation):
     playerId: ID
     reason: str = Field(default="", max_length=500)
     expiresInSeconds: int = Field(default=30, ge=1, le=60)
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class ModerationAction(Mutation):
@@ -76,6 +79,9 @@ class ModerationAction(Mutation):
     outcome: str | None = None
     reason: str = Field(default="", max_length=500)
     expiresInSeconds: int = Field(default=30, ge=1, le=60)
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class WorkshopAction(Mutation):

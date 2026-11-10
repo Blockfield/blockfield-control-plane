@@ -2,7 +2,7 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
 from pydantic import ValidationError
@@ -231,6 +231,11 @@ async def settings_change(
         else definition.write
     )
     identity.require(scope, env, backend, target)
+    if scope == "workshop.gate" and identity.account is None and (rollback or validate):
+        # The controller reports its leg with PATCH only: rollback/validate
+        # under this scope are refused at accept (delivery would reject a
+        # non-patch service-issued op anyway, so this only fails fast).
+        raise Problem("forbidden")
     op, duplicate = (
         (None, False)
         if validate
@@ -631,6 +636,48 @@ async def action(conn, identity, attempt, kind, body):
         raise Problem("unknown_action", 404)
     data_target = payload["target"]
     identity.require(kind, data["environment"], data["backend"], data_target)
+    if identity.credential["kind"] == "service":
+        # The site principal asserts the logged-in human; the same scope,
+        # peer and grant rules below then evaluate that actor like a direct
+        # call. role_grants-independent moderation still needs an actor, so
+        # an unasserted service call is refused before any operation exists.
+        if data["actorAccountId"] is None:
+            raise Problem("service_actor_required")
+        # Only the unbound site principal may assert an actor; a scoped
+        # consumer would otherwise act as any moderator whose grant covers it.
+        if identity.credential["resource"] != "*":
+            raise Problem("actor_forbidden")
+        # FOR SHARE like authenticate(): a concurrent revocation of this actor
+        # (FOR UPDATE + invalidate) waits for this change to commit.
+        actor = await one(
+            conn,
+            "SELECT * FROM accounts WHERE id=%s FOR SHARE",
+            (UUID(data["actorAccountId"]),),
+        )
+        if not actor:
+            raise Problem("account_not_found", 404)
+        if actor["is_test"] or actor["status"] != "active":
+            raise Problem("ineligible_account")
+        identity = Identity(
+            identity.credential,
+            identity.client,
+            actor,
+            await rows(
+                conn,
+                "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+                (actor["id"], now()),
+            ),
+            bool(
+                await one(
+                    conn,
+                    "SELECT 1 FROM owner_memberships WHERE account_id=%s",
+                    (actor["id"],),
+                )
+            ),
+        )
+        identity.require(kind, data["environment"], data["backend"], data_target)
+    elif data["actorAccountId"] is not None:
+        raise Problem("actor_forbidden")
     op, duplicate = await operation(
         conn,
         identity,
@@ -932,6 +979,8 @@ def _workshop_map(model):
         if (
             not isinstance(modes, list)
             or not 1 <= len(modes) <= 7
+            # str check before set(): unhashable elements must 422, not 500.
+            or not all(isinstance(mode, str) for mode in modes)
             or len(set(modes)) != len(modes)
             or any(mode not in _WORKSHOP_ARENA_MODES for mode in modes)
         ):
@@ -1030,6 +1079,8 @@ def _workshop_mode(model):
             if maps is not None and (
                 not isinstance(maps, list)
                 or not maps
+                # str check before set(): unhashable elements must 422, not 500.
+                or not all(isinstance(entry, str) for entry in maps)
                 or len(set(maps)) != len(maps)
                 or not all(_workshop_mode_map_id(entry) for entry in maps)
             ):
