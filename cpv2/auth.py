@@ -13,8 +13,14 @@ from cpv2.db import one, record, rows
 from cpv2.settings import digest
 
 AUDIENCE = "blockfield-control-v2"
-WORKSHOP_WRITE_SCOPES = {"workshop.message", "workshop.wake", "workshop.cancel"}
-WORKSHOP_ADMIN_SCOPES = {"workshop.members", "workshop.release.select"}
+WORKSHOP_WRITE_SCOPES = {
+    "workshop.message",
+    "workshop.wake",
+    "workshop.cancel",
+    "workshop.map",
+    "workshop.sessions",
+}
+WORKSHOP_ADMIN_SCOPES = {"workshop.members", "workshop.release.select", "workshop.mode"}
 # Site RCON replacements every moderator may issue (mirrors site `moderate`).
 MODERATION_SCOPES = {
     "moderation.say",
@@ -38,7 +44,14 @@ SERVICE_MODERATION_SCOPES = {
     *MODERATION_ADMIN_SCOPES,
 }
 ROLE_SCOPES = {
-    "builder": {"settings.read", "operations.read", "maps.edit"},
+    "builder": {
+        "settings.read",
+        "operations.read",
+        "maps.edit",
+        # Sessions queries mirror the site `view` permission: every staff
+        # member may page saved drafts, like waking the workshop.
+        "workshop.sessions",
+    },
     "moderator": {
         "settings.read",
         "operations.read",
@@ -70,6 +83,9 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     "accounts.test.manage",
     "settings.protected.write",
     "audit.full",
+    # Workshop AI keys mirror the site `ai` permission: founders only. In no
+    # role, so no admin, moderator or service credential can ever hold it.
+    "workshop.ai-key",
 }
 SERVICE_SCOPES = {
     "agents.events",
