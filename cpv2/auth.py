@@ -106,6 +106,11 @@ SERVICE_SCOPES = {
 # Site principal only: provisioned solely on a resource="*" service credential,
 # since a staff write asserts an acting account (see core.grant_change).
 STAFF_SCOPES = {"staff.read", "staff.lower.manage", "staff.admin.manage"}
+# Site settings principal only: the site asserts the acting admin for every
+# settings write (see core.settings_change), so the actor's own grants decide
+# while the token itself stays unbound (see admin.provision). Reads ride the
+# same token without an actor since they need no attribution.
+SITE_SETTINGS_SCOPES = {"settings.read", "settings.gameplay.write"}
 
 
 class Problem(Exception):
@@ -171,11 +176,11 @@ class Identity:
             return False
         if c["kind"] == "service":
             if self.account is None:
-                return scope in SERVICE_SCOPES | STAFF_SCOPES
-            # Service-asserted actor (staff writes via the site principal): the
-            # service must be provisioned for the scope, and the asserted actor
-            # must hold it exactly like a direct caller.
-            if scope not in SERVICE_SCOPES | STAFF_SCOPES:
+                return scope in SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES
+            # Service-asserted actor (staff/settings writes via the site
+            # principal): the service must be provisioned for the scope, and
+            # the asserted actor must hold it exactly like a direct caller.
+            if scope not in SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES:
                 return False
         if self.owner:
             return scope in OWNER_SCOPES
@@ -354,7 +359,7 @@ def normalized_action(method, path, body):
     else:
         raise Problem("invalid_owner_action", 422)
     try:
-        return model.model_validate(body).model_dump(mode="json")
+        return models.request_body(model.model_validate(body))
     except ValueError:
         raise Problem("invalid_owner_action", 422) from None
 

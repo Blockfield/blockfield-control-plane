@@ -1085,6 +1085,147 @@ async def test_service_moderation_refusals_and_direct_actor_forbidden(store):
     assert bound.json()["error"] == "actor_forbidden", bound.text
 
 
+async def test_service_settings_actor_grant_decides_and_scoped_refused(store):
+    # Site settings travel like staff/moderation: the unbound site principal
+    # asserts the acting admin, and the actor's own grants decide.
+    store["tokens"]["sitesettings"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "sitesettings",
+                "via": "game",
+                "ceiling": ["settings.read", "settings.gameplay.write"],
+            },
+            "ceiling": ["settings.read", "settings.gameplay.write"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+
+    def change(key, revision=0, actor=None, value=None):
+        body = {
+            "idempotencyKey": key,
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": revision,
+            "patch": value or {"lobby": {"pvpEnabled": True}},
+        }
+        if actor is not None:
+            body["actorAccountId"] = str(actor)
+        return body
+
+    denied = await request(
+        store, "PATCH", "/v2/settings/gameplay/*", change("no-actor"), "sitesettings"
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "service_actor_required", denied.text
+    unknown = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("unknown-actor", actor=uuid4()),
+        "sitesettings",
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "account_not_found", unknown.text
+    # The asserted actor holds no gameplay-write grant.
+    ordinary = store["accounts"]["ordinary"]
+    unscoped = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("unscoped-actor", actor=ordinary),
+        "sitesettings",
+    )
+    assert unscoped.status_code == 403, unscoped.text
+    # A moderator actor reads settings but cannot write gameplay: the actor's
+    # grants decide, not the service ceiling.
+    moderator = store["accounts"]["moderator"]
+    peer = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("moderator-actor", actor=moderator),
+        "sitesettings",
+    )
+    assert peer.status_code == 403, peer.text
+    # An admin actor reaches the write through the same assertion.
+    admin = store["accounts"]["admin"]
+    accepted = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("admin-actor", actor=admin),
+        "sitesettings",
+    )
+    assert accepted.status_code == 202, accepted.text
+    operation = accepted.json()["operationId"]
+    attributed = await sql(
+        store,
+        "SELECT account_id FROM operations WHERE id=%s",
+        (operation,),
+    )
+    assert attributed == [{"account_id": admin}]
+    revised = await sql(
+        store,
+        "SELECT actor, revision FROM settings_revisions WHERE namespace=%s AND revision=1",
+        ("gameplay",),
+    )
+    assert revised == [{"actor": admin, "revision": 1}]
+    # Reads ride the same token without an actor: no attribution needed.
+    view = await request(store, "GET", "/v2/settings/gameplay/*", None, "sitesettings")
+    assert view.status_code == 200, view.text
+    assert view.json()["revision"] == 1
+    # Direct callers are authenticated and must never send an actor.
+    forged = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        change("direct-actor", revision=1, actor=admin),
+        "admin",
+    )
+    assert forged.status_code == 403
+    assert forged.json()["error"] == "actor_forbidden", forged.text
+    # Only the unbound site principal may assert an actor: narrowing the
+    # credential resource fences even a covered target (faithful admins keep
+    # working through the unbound credential above).
+    await sql(
+        store,
+        "UPDATE credentials SET resource='arena' WHERE verifier=%s",
+        (hashlib.sha256(store["tokens"]["sitesettings"].encode()).hexdigest(),),
+    )
+    bound = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/arena",
+        change("scoped-actor", actor=admin),
+        "sitesettings",
+    )
+    assert bound.status_code == 403
+    assert bound.json()["error"] == "actor_forbidden", bound.text
+
+
+async def test_site_settings_scopes_only_on_unbound_site_credential(store):
+    # A resource-bound consumer credential holding settings scopes could
+    # assert any covered admin as the acting account, so provision refuses.
+    with pytest.raises(ValueError, match="unbound site credential"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "arena-settings",
+                    "via": "game",
+                    "ceiling": ["settings.gameplay.write"],
+                },
+                "ceiling": ["settings.gameplay.write"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "arena",
+            },
+        )
+
+
 async def test_workshop_gate_scope_is_patch_only_for_service(store):
     store["tokens"]["reporter"] = await provision(
         store["admin"],

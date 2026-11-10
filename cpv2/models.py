@@ -26,11 +26,17 @@ class Mutation(Strict):
 class SettingsChange(Mutation):
     expectedRevision: int = Field(ge=0, le=9223372036854775807)
     patch: dict
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class Rollback(Mutation):
     expectedRevision: int = Field(ge=0, le=9223372036854775807)
     revision: int = Field(ge=1, le=9223372036854775807)
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class GrantChange(Mutation):
@@ -183,3 +189,22 @@ class AckReceipt(Strict):
         "received", "validated", "applied", "effective", "rejected", "unknown"
     ]
     sequence: int
+
+
+def request_body(model):
+    """The normalized body a request is fingerprinted and challenged by.
+
+    SettingsChange and Rollback gained actorAccountId later: when it is absent
+    their body must stay byte-identical to the pre-actor shape, so a retry of an
+    operation accepted before the upgrade still matches its stored hash. The
+    owner step-up challenge (auth.normalized_action) and the write path
+    (core.settings_change) both use this, so they always hash the same body.
+    Other models already carried the field and keep their shape.
+    """
+    data = model.model_dump(mode="json")
+    if (
+        isinstance(model, (SettingsChange, Rollback))
+        and data.get("actorAccountId") is None
+    ):
+        data.pop("actorAccountId", None)
+    return data

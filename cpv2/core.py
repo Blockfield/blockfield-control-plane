@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from cpv2.auth import (
     ROLE_SCOPES,
+    SITE_SETTINGS_SCOPES,
     Identity,
     Problem,
     audit,
@@ -221,7 +222,7 @@ async def settings_change(
     definition = DEFINITIONS.get(namespace)
     if not definition:
         raise Problem("unknown_namespace", 404)
-    data = model.model_dump(mode="json")
+    data = models.request_body(model)
     env, backend = data["environment"], data["backend"]
     # The workshop leg is reported by the workshop service, not toggled by
     # game-entry admins: it carries its own service-holdable write scope.
@@ -231,6 +232,51 @@ async def settings_change(
         else definition.write
     )
     identity.require(scope, env, backend, target)
+    if scope in SITE_SETTINGS_SCOPES and identity.credential["kind"] == "service":
+        # The site principal asserts the logged-in admin (like staff/
+        # moderation): CP re-resolves that actor's account, live grants and
+        # owner membership, then the actor's own grants decide. Only the
+        # unbound site principal may assert an actor. Other service scopes
+        # (workshop.gate, moderation.ban) keep the stable-principal path, and
+        # protected paths still fail closed below (owner step-up needs a
+        # direct owner session).
+        if model.actorAccountId is None:
+            raise Problem("service_actor_required")
+        # Only the unbound site principal may assert an actor; a scoped
+        # consumer would otherwise act as any admin whose grant covers it.
+        if identity.credential["resource"] != "*":
+            raise Problem("actor_forbidden")
+        # FOR SHARE like authenticate(): a concurrent revocation of this actor
+        # (FOR UPDATE + invalidate) waits for this change to commit.
+        actor = await one(
+            conn,
+            "SELECT * FROM accounts WHERE id=%s FOR SHARE",
+            (model.actorAccountId,),
+        )
+        if not actor:
+            raise Problem("account_not_found", 404)
+        if actor["is_test"] or actor["status"] != "active":
+            raise Problem("ineligible_account")
+        identity = Identity(
+            identity.credential,
+            identity.client,
+            actor,
+            await rows(
+                conn,
+                "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+                (actor["id"], now()),
+            ),
+            bool(
+                await one(
+                    conn,
+                    "SELECT 1 FROM owner_memberships WHERE account_id=%s",
+                    (actor["id"],),
+                )
+            ),
+        )
+        identity.require(scope, env, backend, target)
+    elif model.actorAccountId is not None:
+        raise Problem("actor_forbidden")
     if scope == "workshop.gate" and identity.account is None and (rollback or validate):
         # The controller reports its leg with PATCH only: rollback/validate
         # under this scope are refused at accept (delivery would reject a
