@@ -1501,7 +1501,9 @@ def _js_number(value):
         return "0"
     if not math.isfinite(value):
         _stat_invalid()
-    if value.is_integer() and abs(value) < 1e21:
+    # Below 2**53 an integral double prints its exact digits in both languages;
+    # above, JS prints the shortest round-trip digits padded with zeros.
+    if value.is_integer() and abs(value) < 2**53:
         return str(int(value))
     sign = "-" if value < 0 else ""
     text = repr(abs(value))
@@ -1510,7 +1512,7 @@ def _js_number(value):
     head, _, tail = mantissa.partition(".")
     digits = head + tail
     leading = len(digits) - len(digits.lstrip("0"))
-    digits = digits.lstrip("0") or "0"
+    digits = digits.lstrip("0").rstrip("0") or "0"
     point = exp + len(head) - leading
     total = len(digits)
     if 0 < point <= 21:
