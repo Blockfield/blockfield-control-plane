@@ -1,3 +1,6 @@
+import hashlib
+import json
+import math
 import re
 import secrets
 import unicodedata
@@ -1412,3 +1415,514 @@ async def site_sessions_revoke_user(conn, identity, attempt, player_uuid):
         "DELETE FROM site_sessions WHERE player_uuid=%s", (player_uuid,)
     )
     return {"revoked": deleted.rowcount}
+
+
+# Game-producer stats ingest (coordination#29 U1). Mirrors the site
+# `stats.ts` ingest contract (validation, normalization, canonical digest,
+# idempotency), so the untouched producer cuts over with the same bytes and a
+# dual-write reconcile can compare digests. Ratings stay out: no reads need
+# them yet, and the stored payloads replay later.
+STAT_UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+STAT_ID = re.compile(r"^[a-z0-9_.:-]{1,128}$")
+STAT_NAME_LIKE_UUID = (
+    r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$"
+)
+STAT_MODES = {"room", "campaign", "deathmatch"}
+STAT_REASONS = {"completed", "draw", "abandoned", "stopped", "shutdown", "error"}
+STAT_TEAMS = {"RED", "BLUE", "NONE"}
+STAT_COUNTERS = (
+    "kills",
+    "deaths",
+    "captures",
+    "neutralizations",
+    "pointSeconds",
+    "playSeconds",
+    "suicides",
+    "teamKills",
+    "maxKillstreak",
+)
+STAT_UTC = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$")
+# Producer outbox contract: 1 MiB/event, same as the site MAX_BODY.
+STAT_MAX_BODY = 1048576
+STAT_MAX_PARTICIPANTS = 512
+STAT_MAX_CLASSES = 256
+STAT_MAX_ROUNDS = 10000
+TELEMETRY_MAX_BYTES = 8192
+# Dropped (not failed) invalid telemetry blocks, like the site process counter.
+telemetry_dropped = 0
+
+
+class _DropTelemetry(Exception):
+    pass
+
+
+def _stat_invalid():
+    raise Problem("invalid_result", 422)
+
+
+def _stat_require(condition):
+    if not condition:
+        _stat_invalid()
+
+
+def _stat_int(value, limit=1000000000):
+    return type(value) is int and 0 <= value <= limit
+
+
+def _stat_utc(value):
+    _stat_require(isinstance(value, str) and STAT_UTC.match(value))
+    try:
+        moment = datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        _stat_invalid()
+    frac = value[19:-1]
+    ms = int(frac[1:4].ljust(3, "0")) if frac.startswith(".") else 0
+    return int(moment.timestamp() * 1000) + ms
+
+
+def _js_number(value):
+    # ECMA-262 Number::toString for finite doubles: the digest must match the
+    # site (JSON.stringify) byte-for-byte, while Python repr differs in
+    # [1e-6,1e-4) and [1e16,1e21). -0 serializes as "0" like the site.
+    if value == 0:
+        return "0"
+    if not math.isfinite(value):
+        _stat_invalid()
+    if value.is_integer() and abs(value) < 1e21:
+        return str(int(value))
+    sign = "-" if value < 0 else ""
+    text = repr(abs(value))
+    mantissa, _, exp = text.partition("e")
+    exp = int(exp) if exp else 0
+    head, _, tail = mantissa.partition(".")
+    digits = head + tail
+    leading = len(digits) - len(digits.lstrip("0"))
+    digits = digits.lstrip("0") or "0"
+    point = exp + len(head) - leading
+    total = len(digits)
+    if 0 < point <= 21:
+        body = (
+            digits + "0" * (point - total)
+            if point >= total
+            else digits[:point] + "." + digits[point:]
+        )
+    elif point <= 0 and point > -6:
+        body = "0." + "0" * -point + digits
+    else:
+        shift = point - 1
+        body = (
+            digits[0]
+            + ("." + digits[1:] if total > 1 else "")
+            + "e"
+            + ("+" if shift >= 0 else "")
+            + str(shift)
+        )
+    return sign + body
+
+
+def _stat_canonical(value):
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return _js_number(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(_stat_canonical(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ",".join(
+                _stat_canonical(key) + ":" + _stat_canonical(value[key])
+                for key in sorted(value)
+            )
+            + "}"
+        )
+    _stat_invalid()
+
+
+def _stat_telemetry(value):
+    _drop = _DropTelemetry()
+    try:
+        _stat_require(isinstance(value, dict) and len(value) <= 64)
+        _stat_require(_stat_int(value.get("shots")))
+        share = value.get("fallbackShare")
+        _stat_require(
+            type(share) in (int, float) and math.isfinite(share) and 0 <= share <= 1
+        )
+        for key in ("tickMsP50", "tickMsP99"):
+            amount = value.get(key)
+            _stat_require(
+                type(amount) in (int, float)
+                and math.isfinite(amount)
+                and 0 <= amount <= 1000000
+            )
+        for key in ("ageTicksP50", "rewindTicksP50"):
+            _stat_require(_stat_int(value.get(key)))
+        for key in (
+            "tickMsP99Overflow",
+            "ageTicksP50Overflow",
+            "rewindTicksP50Overflow",
+        ):
+            _stat_require(type(value.get(key)) is bool)
+        counters = value.get("counters")
+        _stat_require(isinstance(counters, dict) and len(counters) <= 512)
+        clean_counters = {}
+        for name, count in counters.items():
+            _stat_require(
+                isinstance(name, str)
+                and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,160}", name)
+                and _stat_int(count)
+            )
+            clean_counters[name] = count
+
+        def buckets(raw):
+            _stat_require(isinstance(raw, list) and len(raw) <= 32)
+            clean = []
+            for row in raw:
+                _stat_require(isinstance(row, dict))
+                bound, count = row.get("le"), row.get("count")
+                _stat_require(
+                    (
+                        type(bound) in (int, float)
+                        and math.isfinite(bound)
+                        and bound >= 0
+                    )
+                    or bound == "inf"
+                )
+                _stat_require(_stat_int(count))
+                clean.append({"le": bound, "count": count})
+            return clean
+
+        disputes = value.get("disputes")
+        _stat_require(isinstance(disputes, list) and len(disputes) <= 8)
+        clean_disputes = []
+        for sample in disputes:
+            _stat_require(isinstance(sample, dict) and 1 <= len(sample) <= 32)
+            kept = {}
+            for key, entry in sample.items():
+                _stat_require(
+                    isinstance(key, str) and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,64}", key)
+                )
+                # Postgres jsonb rejects NUL and lone surrogates; one such
+                # value would break every aggregate over the match.
+                _stat_require(
+                    (
+                        isinstance(entry, str)
+                        and len(entry) <= 512
+                        and not re.search("[\x00-\x1f\x7f-\x9f\ud800-\udfff]", entry)
+                    )
+                    or (type(entry) in (int, float) and math.isfinite(entry))
+                    or type(entry) is bool
+                )
+                kept[key] = entry
+            clean_disputes.append(kept)
+        clean = {
+            "shots": value["shots"],
+            "fallbackShare": value["fallbackShare"],
+            "tickMsP50": value["tickMsP50"],
+            "tickMsP99": value["tickMsP99"],
+            "tickMsP99Overflow": value["tickMsP99Overflow"],
+            "ageTicksP50": value["ageTicksP50"],
+            "ageTicksP50Overflow": value["ageTicksP50Overflow"],
+            "rewindTicksP50": value["rewindTicksP50"],
+            "rewindTicksP50Overflow": value["rewindTicksP50Overflow"],
+            "counters": clean_counters,
+            "tickMsBuckets": buckets(value.get("tickMsBuckets")),
+            "ageTickBuckets": buckets(value.get("ageTickBuckets")),
+            "rewindTickBuckets": buckets(value.get("rewindTickBuckets")),
+            "disputes": clean_disputes,
+        }
+        _stat_require(
+            len(_stat_canonical(clean).encode("utf-8")) <= TELEMETRY_MAX_BYTES
+        )
+        return clean
+    except Problem:
+        raise _drop
+
+
+def validate_stat_result(value, current_ms):
+    global telemetry_dropped
+    _stat_require(isinstance(value, dict))
+    _stat_require(
+        value.get("schemaVersion") == 1
+        and isinstance(value.get("eventId"), str)
+        and STAT_UUID.match(value["eventId"])
+        and isinstance(value.get("serverId"), str)
+        and STAT_UUID.match(value["serverId"])
+    )
+    _stat_require(value.get("sessionPurpose") == "gameplay")
+    mode = value.get("modeId")
+    _stat_require(
+        mode in STAT_MODES
+        and type(value.get("ranked")) is bool
+        and value["ranked"] == (mode == "campaign")
+    )
+    _stat_require(
+        isinstance(value.get("rulesetVersion"), str)
+        and STAT_ID.match(value["rulesetVersion"])
+    )
+    kind = value.get("kind")
+    reason = value.get("endReason")
+    winner = value.get("winner")
+    _stat_require(
+        kind in ("match", "campaign")
+        and reason in STAT_REASONS
+        and winner in STAT_TEAMS
+        and (reason == "completed" or winner == "NONE")
+    )
+    start = _stat_utc(value.get("startedAt"))
+    end = _stat_utc(value.get("endedAt"))
+    _stat_require(start <= end <= current_ms + 300000)
+    rounds = value.get("rounds")
+    _stat_require(
+        isinstance(rounds, list)
+        and len(rounds) <= STAT_MAX_ROUNDS
+        and all(isinstance(item, str) and STAT_UUID.match(item) for item in rounds)
+        and len(set(rounds)) == len(rounds)
+    )
+    match_id = value.get("matchId")
+    campaign_id = value.get("campaignSessionId")
+    if kind == "match":
+        _stat_require(
+            match_id == value["eventId"]
+            and isinstance(value.get("mapId"), str)
+            and STAT_ID.match(value["mapId"])
+            and (
+                campaign_id is None
+                or (isinstance(campaign_id, str) and STAT_UUID.match(campaign_id))
+            )
+            and (not value["ranked"] or campaign_id is not None)
+            and not rounds
+        )
+    else:
+        _stat_require(
+            mode == "campaign"
+            and match_id is None
+            and value.get("mapId") is None
+            and campaign_id == value["eventId"]
+            and (reason != "completed" or rounds)
+        )
+    participants = value.get("participants")
+    _stat_require(
+        isinstance(participants, list) and len(participants) <= STAT_MAX_PARTICIPANTS
+    )
+    seen = set()
+    clean_participants = []
+    for participant in participants:
+        _stat_require(
+            isinstance(participant, dict)
+            and isinstance(participant.get("uuid"), str)
+            and STAT_UUID.match(participant["uuid"])
+            and participant["uuid"] not in seen
+        )
+        seen.add(participant["uuid"])
+        _stat_require(
+            isinstance(participant.get("name"), str)
+            and 1 <= len(participant["name"]) <= 64
+            and not re.search(r"[\x00-\x1f\x7f]", participant["name"])
+        )
+        score = participant.get("score")
+        _stat_require(
+            participant.get("team") in STAT_TEAMS
+            and type(score) in (int, float)
+            and math.isfinite(score)
+            and abs(score) <= 1000000000
+        )
+        _stat_require(all(_stat_int(participant.get(key)) for key in STAT_COUNTERS))
+        classes = participant.get("classes")
+        _stat_require(isinstance(classes, list) and len(classes) <= STAT_MAX_CLASSES)
+        kinds = set()
+        clean_classes = []
+        for entry in classes:
+            _stat_require(
+                isinstance(entry, dict)
+                and isinstance(entry.get("classId"), str)
+                and STAT_ID.match(entry["classId"])
+                and isinstance(entry.get("variantId"), str)
+                and STAT_ID.match(entry["variantId"])
+            )
+            key = entry["classId"] + "/" + entry["variantId"]
+            _stat_require(key not in kinds)
+            kinds.add(key)
+            _stat_require(
+                all(
+                    _stat_int(entry.get(key))
+                    for key in ("timeSeconds", "kills", "deaths", "pointSeconds")
+                )
+            )
+            clean_classes.append(
+                {
+                    "classId": entry["classId"],
+                    "variantId": entry["variantId"],
+                    "timeSeconds": entry["timeSeconds"],
+                    "kills": entry["kills"],
+                    "deaths": entry["deaths"],
+                    "pointSeconds": entry["pointSeconds"],
+                }
+            )
+        clean_classes.sort(key=lambda item: (item["classId"], item["variantId"]))
+        clean_participants.append(
+            {
+                "uuid": participant["uuid"],
+                "name": participant["name"],
+                "team": participant["team"],
+                "score": score,
+                **{key: participant[key] for key in STAT_COUNTERS},
+                "classes": clean_classes,
+            }
+        )
+    clean_participants.sort(key=lambda item: item["uuid"])
+    personal = "winnerUuid" in value
+    if personal:
+        _stat_require(
+            mode == "deathmatch"
+            and kind == "match"
+            and reason == "completed"
+            and winner == "NONE"
+            and campaign_id is None
+            and isinstance(value.get("winnerUuid"), str)
+            and STAT_UUID.match(value["winnerUuid"])
+            and value["winnerUuid"] in seen
+            and all(item["team"] == "NONE" for item in clean_participants)
+        )
+    telemetry = None
+    if "telemetry" in value:
+        try:
+            telemetry = _stat_telemetry(value["telemetry"])
+        except _DropTelemetry:
+            telemetry_dropped += 1
+    clean = {
+        "schemaVersion": 1,
+        "eventId": value["eventId"],
+        "serverId": value["serverId"],
+        "kind": kind,
+        "sessionPurpose": "gameplay",
+        "modeId": mode,
+        "ranked": value["ranked"],
+        "rulesetVersion": value["rulesetVersion"],
+        "matchId": match_id,
+        "campaignSessionId": campaign_id,
+        "mapId": value.get("mapId"),
+        "startedAt": value["startedAt"],
+        "endedAt": value["endedAt"],
+        "endReason": reason,
+        "winner": winner,
+        **({"winnerUuid": value["winnerUuid"]} if personal else {}),
+        **({"telemetry": telemetry} if telemetry is not None else {}),
+        "rounds": sorted(rounds),
+        "participants": clean_participants,
+    }
+    try:
+        payload = _stat_canonical(clean)
+        payload.encode("utf-8")
+    except (ValueError, UnicodeError):
+        _stat_invalid()
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return clean, digest, end
+
+
+async def stat_ingest(conn, identity, attempt, body):
+    # attempt is consumed by app.write's completion audit; stats carry no
+    # operation row, like site sessions.
+    current_ms = int(now().timestamp() * 1000)
+    clean, digest, ended_ms = validate_stat_result(body, current_ms)
+    server_id, event_id = clean["serverId"], clean["eventId"]
+    # The credential is bound to its server resource at provision; requiring
+    # the scope on the body's server keeps one server from submitting another
+    # server's results, like the site 403 rule.
+    identity.require("stats.ingest", "prod", "game", server_id)
+    # Serialize per result id: a concurrent duplicate POST (producer outbox
+    # retry) replays or conflicts inside one transaction, never as a unique
+    # violation. Same pg_advisory_xact_lock pattern as operation().
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+        (server_id + "/" + event_id,),
+    )
+    existing = await one(
+        conn,
+        "SELECT digest FROM stat_results WHERE server_id=%s AND event_id=%s",
+        (server_id, event_id),
+    )
+    if existing is not None:
+        if existing["digest"] != digest:
+            raise Problem("result_conflict", 409)
+        return {"inserted": False, "eventId": event_id}
+    ended_at = datetime.fromtimestamp(ended_ms / 1000, tz=timezone.utc)
+    await conn.execute(
+        "INSERT INTO stat_results(server_id,event_id,kind,mode,campaign_id,ended_at,reason,winner,digest,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (
+            server_id,
+            event_id,
+            clean["kind"],
+            clean["modeId"],
+            clean["campaignSessionId"],
+            ended_at,
+            clean["endReason"],
+            clean["winner"],
+            digest,
+            Jsonb(clean),
+        ),
+    )
+    for participant in clean["participants"]:
+        # A real name always wins over a UUID-like one, regardless of order,
+        # mirroring the site profiles upsert.
+        await conn.execute(
+            "INSERT INTO stat_profiles(uuid,name,last_seen) VALUES(%s,%s,%s)"
+            " ON CONFLICT(uuid) DO UPDATE SET name=CASE"
+            " WHEN excluded.name ~* %s AND stat_profiles.name !~* %s THEN stat_profiles.name"
+            " WHEN excluded.last_seen>=stat_profiles.last_seen OR stat_profiles.name ~* %s THEN excluded.name"
+            " ELSE stat_profiles.name END,"
+            " last_seen=GREATEST(stat_profiles.last_seen,excluded.last_seen)",
+            (
+                participant["uuid"],
+                participant["name"],
+                ended_at,
+                STAT_NAME_LIKE_UUID,
+                STAT_NAME_LIKE_UUID,
+                STAT_NAME_LIKE_UUID,
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO stat_participants(server_id,event_id,uuid,team,score,kills,deaths,captures,neutralizations,point_seconds,play_seconds,suicides,team_kills,max_streak) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                server_id,
+                event_id,
+                participant["uuid"],
+                participant["team"],
+                participant["score"],
+                participant["kills"],
+                participant["deaths"],
+                participant["captures"],
+                participant["neutralizations"],
+                participant["pointSeconds"],
+                participant["playSeconds"],
+                participant["suicides"],
+                participant["teamKills"],
+                participant["maxKillstreak"],
+            ),
+        )
+        for entry in participant["classes"]:
+            await conn.execute(
+                "INSERT INTO stat_classes(server_id,event_id,uuid,class_id,variant_id,time_seconds,kills,deaths,point_seconds) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    server_id,
+                    event_id,
+                    participant["uuid"],
+                    entry["classId"],
+                    entry["variantId"],
+                    entry["timeSeconds"],
+                    entry["kills"],
+                    entry["deaths"],
+                    entry["pointSeconds"],
+                ),
+            )
+    return {"inserted": True, "eventId": event_id}

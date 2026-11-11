@@ -19,6 +19,11 @@ from cpv2.settings import DEFINITIONS, digest
 # Indirection so tests can expire the /health cache without patching time.
 _health_clock = time.monotonic
 
+# Mutation body caps by path. Everything else stays at 32 KiB; the stats
+# ingest route honors the producer outbox contract (1 MiB/event, same as the
+# site MAX_BODY) so a full 512-player result is never a 413.
+BODY_LIMITS = {"/v2/stats/results": core.STAT_MAX_BODY}
+
 
 class Limits:
     def __init__(self, budget=1000):
@@ -210,10 +215,11 @@ def create_app(dsn=None):
                         "pending",
                     )
                 chunks, size = [], 0
+                limit = BODY_LIMITS.get(request.url.path, 32768)
                 async with asyncio.timeout(5):
                     async for chunk in request.stream():
                         size += len(chunk)
-                        if size > 32768:
+                        if size > limit:
                             raise Problem("body_too_large", 413)
                         chunks.append(chunk)
                 request._body = b"".join(chunks)
@@ -338,18 +344,18 @@ def create_app(dsn=None):
         # Public route: cache success so probe floods cannot drain the DB pool;
         # failures re-check, since an outage has no pool left to protect.
         if _health_clock() < health_ok_until:
-            return {"status": "ok", "schema": 2}
+            return {"status": "ok", "schema": 3}
         try:
             async with database.transaction() as conn:
                 bootstrapped = await one(
                     conn, "SELECT EXISTS(SELECT 1 FROM owner_memberships) AS ok"
                 )
         except Exception:
-            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
+            return JSONResponse({"status": "unavailable", "schema": 3}, status_code=503)
         if not bootstrapped or not bootstrapped["ok"]:
-            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
+            return JSONResponse({"status": "unavailable", "schema": 3}, status_code=503)
         health_ok_until = _health_clock() + 5
-        return {"status": "ok", "schema": 2}
+        return {"status": "ok", "schema": 3}
 
     @app.get("/v1/openapi.json")
     async def openapi():
@@ -615,6 +621,15 @@ def create_app(dsn=None):
             )
             await conn.execute("SELECT pg_notify('cp_events','')")
             return {"revoked": True}
+
+    @app.post("/v2/stats/results")
+    async def stats_ingest(body: dict, request: Request):
+        # The producer outbox acknowledges 200/201 JSON carrying inserted and
+        # the exact eventId; anything else stays under rejected/ for review.
+        # The write path commits the completion audit in the same transaction
+        # as the insert, like site sessions.
+        result = await write(request, core.stat_ingest, body)
+        return JSONResponse(result, status_code=201 if result["inserted"] else 200)
 
     @app.post("/v2/site/sessions", status_code=201)
     async def site_session_create(body: models.SiteSessionCreate, request: Request):

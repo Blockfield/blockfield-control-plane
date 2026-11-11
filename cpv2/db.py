@@ -70,7 +70,7 @@ async def rows(conn, query, args=()):
 
 
 async def migrate(dsn, expected_database):
-    migrations = ["001_core.sql", "002_site_sessions.sql"]
+    migrations = ["001_core.sql", "002_site_sessions.sql", "003_site_stats.sql"]
     checksums = {
         name: hashlib.sha256((ROOT / "migrations" / name).read_bytes()).hexdigest()
         for name in migrations
@@ -135,4 +135,12 @@ async def migrate(dsn, expected_database):
         await conn.execute(
             "INSERT INTO control.schema_migrations VALUES(2,%s)",
             (checksums["002_site_sessions.sql"],),
+        )
+        await conn.execute(
+            (ROOT / "migrations/003_site_stats.sql").read_bytes().decode(),
+            prepare=False,
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(3,%s)",
+            (checksums["003_site_stats.sql"],),
         )

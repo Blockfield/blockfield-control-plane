@@ -19,7 +19,7 @@ as `python -m cpv2`. See [the v2 contract and offline bootstrap](docs/V2.md).
   the current revision; same key + same body → same operation; same key +
   changed body → 409. Only `actor.role` `owner`/`admin` may toggle; every
   write is audited with the actor.
-- `GET /health` -> 200 status-ok when the store answers, 503 otherwise. No auth, no gate state, no bearer logging. Reports schema 2 (requires the owner bootstrap). For deploy gates and Dokploy healthchecks; entry still fails closed on the proxy 60 s lease.
+- `GET /health` -> 200 status-ok when the store answers, 503 otherwise. No auth, no gate state, no bearer logging. Reports schema 3 (requires the owner bootstrap). For deploy gates and Dokploy healthchecks; entry still fails closed on the proxy 60 s lease.
 - `GET /v1/openapi.json` — schema (public).
 
 Proxy polls `GET /v1/gate` every 5 s and fails closed when the answer is

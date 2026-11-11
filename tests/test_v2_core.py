@@ -5142,7 +5142,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 2}
+    assert response.json() == {"status": "ok", "schema": 3}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -5150,7 +5150,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 2}
+    assert broken.json() == {"status": "unavailable", "schema": 3}
 
 
 def _rooms_body(key="rooms", revision=0, value=None):
@@ -6250,3 +6250,482 @@ async def test_site_sessions_completion_audit_atomic(store, monkeypatch):
     )
     assert gone.status_code == 503, gone.text
     assert await sql(store, "SELECT 1 FROM site_sessions WHERE id=%s", (sid,))
+
+
+async def _stats_token(store, server_id, cid="stats-producer"):
+    if cid not in store["tokens"]:
+        store["tokens"][cid] = await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": cid,
+                    "via": "game",
+                    "ceiling": ["stats.ingest"],
+                },
+                "ceiling": ["stats.ingest"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": server_id,
+            },
+        )
+    return store["tokens"][cid]
+
+
+def _stats_counter_set(**over):
+    counters = {
+        "kills": 3,
+        "deaths": 1,
+        "captures": 2,
+        "neutralizations": 0,
+        "pointSeconds": 90,
+        "playSeconds": 120,
+        "suicides": 0,
+        "teamKills": 0,
+        "maxKillstreak": 3,
+    }
+    counters.update(over)
+    return counters
+
+
+def _stats_campaign_body():
+    return {
+        "schemaVersion": 1,
+        "eventId": "11111111-1111-1111-1111-111111111111",
+        "serverId": "22222222-2222-2222-2222-222222222222",
+        "kind": "campaign",
+        "sessionPurpose": "gameplay",
+        "modeId": "campaign",
+        "ranked": True,
+        "rulesetVersion": "review-v1",
+        "matchId": None,
+        "campaignSessionId": "11111111-1111-1111-1111-111111111111",
+        "mapId": None,
+        "startedAt": "2026-11-11T10:00:00Z",
+        "endedAt": "2026-11-11T11:59:00.123456789Z",
+        "endReason": "completed",
+        "winner": "RED",
+        "participants": [
+            {
+                "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "name": "Игрок Один",
+                "team": "RED",
+                "score": 12.5,
+                **_stats_counter_set(),
+                "classes": [
+                    {
+                        "classId": "assault",
+                        "variantId": "0",
+                        "timeSeconds": 60,
+                        "kills": 2,
+                        "deaths": 1,
+                        "pointSeconds": 40,
+                    },
+                    {
+                        "classId": "medic",
+                        "variantId": "10",
+                        "timeSeconds": 60,
+                        "kills": 1,
+                        "deaths": 0,
+                        "pointSeconds": 50,
+                    },
+                ],
+            },
+            {
+                "uuid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "name": "Second Player",
+                "team": "BLUE",
+                "score": 7,
+                **_stats_counter_set(
+                    kills=1,
+                    deaths=3,
+                    captures=0,
+                    neutralizations=1,
+                    pointSeconds=30,
+                    suicides=1,
+                    maxKillstreak=1,
+                ),
+                "classes": [
+                    {
+                        "classId": "recon",
+                        "variantId": "2",
+                        "timeSeconds": 120,
+                        "kills": 1,
+                        "deaths": 3,
+                        "pointSeconds": 30,
+                    },
+                ],
+            },
+        ],
+        "rounds": ["33333333-3333-3333-3333-333333333333"],
+        "telemetry": {
+            "shots": 100,
+            "fallbackShare": 0.00001,
+            "tickMsP50": 0.0001,
+            "tickMsP99": 12.5,
+            "ageTicksP50": 2,
+            "tickMsP99Overflow": False,
+            "ageTicksP50Overflow": False,
+            "rewindTicksP50": 1,
+            "rewindTicksP50Overflow": True,
+            "counters": {"hits": 80, "misses": 20},
+            "tickMsBuckets": [{"le": 5, "count": 90}, {"le": 1e16, "count": 10}],
+            "ageTickBuckets": [{"le": "inf", "count": 100}],
+            "rewindTickBuckets": [{"le": 3, "count": 100}],
+            "disputes": [{"tick": 42, "kind": "rewind", "ok": True}],
+        },
+    }
+
+
+async def test_stats_provision_requires_bound_producer_credential(store):
+    from cpv2.auth import SERVICE_SCOPES, STATS_SCOPES
+
+    assert STATS_SCOPES == {"stats.ingest"}
+    assert not STATS_SCOPES & SERVICE_SCOPES
+    with pytest.raises(ValueError, match="bound producer credential"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "stats-unbound",
+                    "via": "game",
+                    "ceiling": ["stats.ingest"],
+                },
+                "ceiling": ["stats.ingest"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+    with pytest.raises(ValueError, match="service credential ceiling"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "stats-human",
+                    "via": "game",
+                    "ceiling": ["stats.ingest"],
+                    "human": True,
+                },
+                "ceiling": ["stats.ingest"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "22222222-2222-2222-2222-222222222222",
+            },
+        )
+    with pytest.raises(ValueError, match="unknown scope"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "stats-account",
+                    "via": "cli",
+                    "human": True,
+                    "ceiling": sorted(SERVICE_SCOPES | STATS_SCOPES),
+                },
+                "accountId": str(uuid4()),
+                "displayName": "stats-account",
+                "ceiling": ["stats.ingest"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+
+
+async def test_stats_ingest_rbac(store):
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server)
+    body = _stats_campaign_body()
+    for role in ("ordinary", "builder", "moderator", "admin", "game-agent"):
+        response = await request(store, "POST", "/v2/stats/results", body, role)
+        assert response.status_code == 403, (role, response.text)
+    assert (
+        await request(store, "POST", "/v2/stats/results", body, "owner")
+    ).status_code == 403
+    assert (
+        await store["client"].post("/v2/stats/results", json=body)
+    ).status_code == 401
+    other = "33333333-3333-3333-3333-333333333333"
+    await _stats_token(store, other, "stats-other")
+    forged = dict(body, serverId=server)
+    response = await request(store, "POST", "/v2/stats/results", forged, "stats-other")
+    assert response.status_code == 403, response.text
+    denied = await request(store, "GET", "/v2/audit", None, "stats-producer")
+    assert denied.status_code == 403, denied.text
+
+
+async def test_stats_ingest_campaign_roundtrip_replay_and_conflict(store):
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server)
+    body = _stats_campaign_body()
+    created = await request(store, "POST", "/v2/stats/results", body, "stats-producer")
+    assert created.status_code == 201, created.text
+    assert created.json() == {
+        "inserted": True,
+        "eventId": "11111111-1111-1111-1111-111111111111",
+    }
+    rows = await sql(
+        store,
+        "SELECT digest,payload FROM stat_results WHERE server_id=%s",
+        (server,),
+    )
+    assert len(rows) == 1
+    assert rows[0]["digest"] == (
+        "03fa04f02e46766d2f158e563b4a1e32fca61cdcf4bef721912375a9c22782dc"
+    )
+    assert rows[0]["payload"]["telemetry"]["fallbackShare"] == 0.00001
+    assert await sql(store, "SELECT count(*) AS n FROM stat_participants") == [{"n": 2}]
+    assert await sql(store, "SELECT count(*) AS n FROM stat_classes") == [{"n": 3}]
+    names = await sql(store, "SELECT uuid,name FROM stat_profiles ORDER BY uuid")
+    assert [(row["uuid"], row["name"]) for row in names] == [
+        ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Игрок Один"),
+        ("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "Second Player"),
+    ]
+    replayed = await request(store, "POST", "/v2/stats/results", body, "stats-producer")
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json() == {
+        "inserted": False,
+        "eventId": "11111111-1111-1111-1111-111111111111",
+    }
+    assert await sql(store, "SELECT count(*) AS n FROM stat_results") == [{"n": 1}]
+    conflict = dict(body, winner="BLUE")
+    denied = await request(
+        store, "POST", "/v2/stats/results", conflict, "stats-producer"
+    )
+    assert denied.status_code == 409, denied.text
+    assert denied.json() == {"error": "result_conflict"}
+    kept = await sql(
+        store,
+        "SELECT digest FROM stat_results WHERE server_id=%s",
+        (server,),
+    )
+    assert kept[0]["digest"] == rows[0]["digest"]
+
+
+async def test_stats_ingest_validation(store):
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server, "stats-valid")
+    cases = [
+        {"schemaVersion": 2},
+        {"eventId": "not-a-uuid"},
+        {"sessionPurpose": "test"},
+        {"modeId": "room", "ranked": True},
+        {"kind": "campaign", "modeId": "room"},
+        {"endReason": "abandoned", "winner": "RED"},
+        {"startedAt": "2026-11-11T12:00:00Z"},
+        {"endedAt": "2099-01-01T00:00:00Z"},
+        {"endedAt": "not-a-time"},
+        {"rounds": ["not-a-uuid"]},
+        {"matchId": "00000000-0000-0000-0000-000000000000"},
+        {"winnerUuid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
+    ]
+    for index, patch in enumerate(cases):
+        body = _stats_campaign_body()
+        body.update(patch)
+        response = await request(
+            store, "POST", "/v2/stats/results", body, "stats-valid"
+        )
+        assert response.status_code == 422, (index, patch, response.text)
+        assert response.json()["error"] == "invalid_result"
+    players = _stats_campaign_body()
+    players["participants"] = players["participants"] * 257
+    response = await request(store, "POST", "/v2/stats/results", players, "stats-valid")
+    assert response.status_code == 422, response.text
+    dup = _stats_campaign_body()
+    dup["participants"] = [dup["participants"][0], dup["participants"][0]]
+    response = await request(store, "POST", "/v2/stats/results", dup, "stats-valid")
+    assert response.status_code == 422, response.text
+    bad_name = _stats_campaign_body()
+    bad_name["participants"][0]["name"] = "has\x00control"
+    response = await request(
+        store, "POST", "/v2/stats/results", bad_name, "stats-valid"
+    )
+    assert response.status_code == 422, response.text
+
+
+async def test_stats_ingest_drops_bad_telemetry_not_the_match(store):
+    from cpv2 import core as core_module
+
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server, "stats-telemetry")
+    before = core_module.telemetry_dropped
+    body = _stats_campaign_body()
+    body["eventId"] = "55555555-5555-5555-5555-555555555555"
+    body["campaignSessionId"] = body["eventId"]
+    body["telemetry"] = {"shots": -1}
+    created = await request(store, "POST", "/v2/stats/results", body, "stats-telemetry")
+    assert created.status_code == 201, created.text
+    assert core_module.telemetry_dropped == before + 1
+    rows = await sql(
+        store,
+        "SELECT payload FROM stat_results WHERE event_id=%s",
+        (body["eventId"],),
+    )
+    assert "telemetry" not in rows[0]["payload"]
+
+
+async def test_stats_ingest_ffa_winner_and_large_body(store):
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server, "stats-size")
+    body = _stats_ffa_body(server)
+    created = await request(store, "POST", "/v2/stats/results", body, "stats-size")
+    assert created.status_code == 201, created.text
+    rows = await sql(
+        store,
+        "SELECT digest FROM stat_results WHERE event_id=%s",
+        (body["eventId"],),
+    )
+    assert rows[0]["digest"] == (
+        "ade4a1e9d923746a25ef06f362a35ef90aa9b6f5c9b8879e13b81a877073e221"
+    )
+    big = _stats_campaign_body()
+    big["eventId"] = "66666666-6666-6666-6666-666666666666"
+    big["campaignSessionId"] = big["eventId"]
+    base = big["participants"][0]
+    big["participants"] = [
+        {
+            **base,
+            "uuid": str(uuid4()),
+            "name": f"player-{index}",
+            "team": "RED" if index % 2 else "BLUE",
+        }
+        for index in range(512)
+    ]
+    assert len(json.dumps(big).encode()) > 32768
+    accepted = await request(store, "POST", "/v2/stats/results", big, "stats-size")
+    assert accepted.status_code == 201, accepted.text
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_participants WHERE event_id=%s",
+        (big["eventId"],),
+    ) == [{"n": 512}]
+    huge = _stats_campaign_body()
+    huge["eventId"] = "77777777-7777-7777-7777-777777777777"
+    huge["campaignSessionId"] = huge["eventId"]
+    entry = {
+        "classId": "assault",
+        "variantId": "0",
+        "timeSeconds": 1,
+        "kills": 0,
+        "deaths": 0,
+        "pointSeconds": 0,
+    }
+    huge["participants"] = [
+        {
+            **base,
+            "uuid": str(uuid4()),
+            "name": f"player-{index}",
+            "classes": [{**entry, "variantId": str(slot)} for slot in range(256)],
+        }
+        for index in range(512)
+    ]
+    assert len(json.dumps(huge).encode()) > 1048576
+    refused = await request(store, "POST", "/v2/stats/results", huge, "stats-size")
+    assert refused.status_code == 413, refused.status_code
+    assert refused.json() == {"error": "body_too_large"}
+
+
+async def test_stats_ingest_display_name_cache_keeps_real_names(store):
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server, "stats-names")
+    first = _stats_campaign_body()
+    first["eventId"] = "88888888-8888-8888-8888-888888888888"
+    first["campaignSessionId"] = first["eventId"]
+    created = await request(store, "POST", "/v2/stats/results", first, "stats-names")
+    assert created.status_code == 201, created.text
+    second = _stats_campaign_body()
+    second["eventId"] = "99999999-9999-9999-9999-999999999999"
+    second["campaignSessionId"] = second["eventId"]
+    second["participants"][0]["name"] = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    replayed = await request(store, "POST", "/v2/stats/results", second, "stats-names")
+    assert replayed.status_code == 201, replayed.text
+    names = await sql(
+        store,
+        "SELECT name FROM stat_profiles WHERE uuid=%s",
+        ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",),
+    )
+    assert names == [{"name": "Игрок Один"}]
+
+
+def test_js_number_matches_site_stringify():
+    from cpv2.core import _js_number
+
+    assert _js_number(0.0) == "0"
+    assert _js_number(-0.0) == "0"
+    assert _js_number(1e-6) == "0.000001"
+    assert _js_number(0.00001) == "0.00001"
+    assert _js_number(0.0001) == "0.0001"
+    assert _js_number(1e-7) == "1e-7"
+    assert _js_number(123.456) == "123.456"
+    assert _js_number(1e16) == "10000000000000000"
+    assert _js_number(1e20) == "100000000000000000000"
+    assert _js_number(1e21) == "1e+21"
+    assert _js_number(1e300) == "1e+300"
+    assert _js_number(-12.5) == "-12.5"
+    assert _js_number(100) == "100"
+
+
+def _stats_ffa_body(server="22222222-2222-2222-2222-222222222222"):
+    return {
+        "schemaVersion": 1,
+        "eventId": "44444444-4444-4444-4444-444444444444",
+        "serverId": server,
+        "kind": "match",
+        "sessionPurpose": "gameplay",
+        "modeId": "deathmatch",
+        "ranked": False,
+        "rulesetVersion": "review-v1",
+        "matchId": "44444444-4444-4444-4444-444444444444",
+        "campaignSessionId": None,
+        "mapId": "arena-1",
+        "startedAt": "2026-11-11T10:00:00Z",
+        "endedAt": "2026-11-11T10:30:00Z",
+        "endReason": "completed",
+        "winner": "NONE",
+        "winnerUuid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "participants": [
+            {
+                "uuid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "name": "Second Player",
+                "team": "NONE",
+                "score": -0.0,
+                **_stats_counter_set(
+                    kills=5,
+                    deaths=2,
+                    captures=0,
+                    neutralizations=0,
+                    pointSeconds=0,
+                    playSeconds=60,
+                    maxKillstreak=4,
+                ),
+                "classes": [],
+            }
+        ],
+        "rounds": [],
+    }
+
+
+def test_stats_digest_matches_site_producer_contract():
+    # Digests pinned against the site's own validateResult+canonical run on
+    # origin/main (node evidence in .dev/sitedbu1-c1, not committed): a
+    # dual-write reconcile can compare digests across the two stores.
+    import datetime
+
+    from cpv2.core import validate_stat_result
+
+    now = int(
+        datetime.datetime(
+            2026, 11, 11, 12, 0, 0, tzinfo=datetime.timezone.utc
+        ).timestamp()
+        * 1000
+    )
+    campaign, campaign_digest, _ = validate_stat_result(_stats_campaign_body(), now)
+    assert campaign["telemetry"]["fallbackShare"] == 0.00001
+    assert campaign_digest == (
+        "03fa04f02e46766d2f158e563b4a1e32fca61cdcf4bef721912375a9c22782dc"
+    )
+    ffa, ffa_digest, _ = validate_stat_result(_stats_ffa_body(), now)
+    assert ffa["winnerUuid"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    assert ffa_digest == (
+        "ade4a1e9d923746a25ef06f362a35ef90aa9b6f5c9b8879e13b81a877073e221"
+    )
