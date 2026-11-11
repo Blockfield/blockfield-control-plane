@@ -168,7 +168,7 @@ class SiteSessionCreate(Strict):
 
 class StatVoid(Strict):
     # Void/restore one ingested result (site setVoided contract): voiding a
-    # rated campaign replays its season and every later season from scratch.
+    # rated campaign enqueues its season for the background rebuild loop.
     serverId: ID
     eventId: ID
     voided: bool

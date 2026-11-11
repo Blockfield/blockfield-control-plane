@@ -3,7 +3,7 @@ import json
 import os
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from uuid import UUID, uuid4
 
 import psycopg
@@ -58,6 +58,7 @@ def create_app(dsn=None):
     @asynccontextmanager
     async def lifespan(app):
         await database.open()
+        rebuild_task = None
         try:
             async with database.transaction() as conn:
                 role = await one(
@@ -105,8 +106,15 @@ def create_app(dsn=None):
                 if not await one(conn, "SELECT 1 FROM owner_memberships LIMIT 1"):
                     raise RuntimeError("offline owner bootstrap required")
             await wakeups.start()
+            # Rating replays run here, not in the void request: the request
+            # only enqueues the season, this loop drains it.
+            rebuild_task = asyncio.create_task(core.stat_rebuild_loop(database))
             yield
         finally:
+            if rebuild_task is not None:
+                rebuild_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await rebuild_task
             await wakeups.close()
             await database.close()
 

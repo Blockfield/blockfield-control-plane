@@ -1971,8 +1971,10 @@ STAT_SORTS = {
     "score": "score",
     "kills": "kills",
     "captures": "captures",
-    "pointSeconds": "point_seconds",
-    "playSeconds": "play_seconds",
+    # The aggregates are aliased with camelCase quotes, not snake_case
+    # columns: sort by the quoted aliases the GROUP BY actually selects.
+    "pointSeconds": '"pointSeconds"',
+    "playSeconds": '"playSeconds"',
     "wins": "wins",
     "kd": "kd",
     "rating": "COALESCE(rating,-1)",
@@ -2227,6 +2229,9 @@ def _stat_glicko_update(player, games, tau=_STAT_G_TAU):
 
 
 def _stat_rated(clean):
+    # Site `src/lib/stats.ts:1590` rated(): kind/mode/endReason only, no winner
+    # check — a completed campaign with winner NONE is rated, both sides score
+    # 0 (site `stats.ts:908`: draw 0.5 else winner==team ? 1 : 0).
     return (
         clean["kind"] == "campaign"
         and clean["modeId"] == "campaign"
@@ -2296,6 +2301,8 @@ async def _stat_rate(conn, clean, ended_ms):
     ended_at = datetime.fromtimestamp(ended_ms / 1000, tz=timezone.utc)
     for team, own, foes in (("RED", reds, blues), ("BLUE", blues, reds)):
         opponent = _stat_glicko_composite([before[o["uuid"]][0] for o in foes])
+        # Site `src/lib/stats.ts:908`: a draw splits the point, otherwise the
+        # winning team takes it — a completed winner-NONE campaign rates 0-0.
         score = (
             0.5
             if clean["endReason"] == "draw"
@@ -2372,6 +2379,71 @@ async def _stat_rebuild_ratings(conn, season):
     )
     for match in matches:
         await _stat_rate(conn, match["payload"], _stat_ms(match["ended_at"]))
+
+
+async def stat_backfill_ratings(conn):
+    # One-time replay for results ingested before 005 created the ratings
+    # store. Idempotent (the rebuild deletes before replaying); under the same
+    # advisory lock ingest uses, so a concurrent ingest serializes behind it.
+    first = await one(
+        conn,
+        "SELECT MIN(ended_at) AS first FROM stat_results WHERE kind='campaign' AND mode='campaign' AND reason IN ('completed','draw')"
+        " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=stat_results.server_id AND v.event_id=stat_results.event_id)",
+    )
+    if first is None or first["first"] is None:
+        return None
+    season = stat_season_at(_stat_ms(first["first"]))
+    await _stat_rebuild_ratings(conn, season)
+    return season["id"]
+
+
+async def _stat_rebuilding(conn, season_id):
+    row = await one(
+        conn,
+        "SELECT 1 AS pending FROM stat_rating_rebuilds WHERE season_id=%s",
+        (season_id,),
+    )
+    return row is not None
+
+
+async def stat_rebuild_drain(conn):
+    # One queued season per call, inside the caller's transaction: the rebuild
+    # holds the rating lock to commit, so an ingest racing it serializes and
+    # stays correct. Returns the rebuilt season id, or None when idle.
+    row = await one(
+        conn,
+        "SELECT season_id FROM stat_rating_rebuilds ORDER BY requested_at LIMIT 1",
+    )
+    if row is None:
+        return None
+    season = next((s for s in stat_seasons() if s["id"] == row["season_id"]), None)
+    if season is None:
+        await conn.execute(
+            "DELETE FROM stat_rating_rebuilds WHERE season_id=%s",
+            (row["season_id"],),
+        )
+        return None
+    await _stat_rebuild_ratings(conn, season)
+    await conn.execute(
+        "DELETE FROM stat_rating_rebuilds WHERE season_id=%s",
+        (row["season_id"],),
+    )
+    return season["id"]
+
+
+async def stat_rebuild_loop(db, interval=0.5):
+    # Background worker: the void request only enqueues (fast commit), this
+    # loop replays. A crash between enqueue and replay just leaves the row for
+    # the next poll; an unknown season id is dropped, never retried forever.
+    import asyncio
+
+    while True:
+        try:
+            async with db.transaction() as conn:
+                await stat_rebuild_drain(conn)
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
 
 
 def _stat_window(query):
@@ -2471,6 +2543,7 @@ async def stat_leaderboard(conn, query, uuid=None):
         "limit": query["limit"],
         "total": total["total"],
         "ratingStatus": STAT_RULES_VERSION,
+        "ratingsRebuilding": await _stat_rebuilding(conn, query["mmrSeason"]),
         "players": players,
     }
 
@@ -2613,6 +2686,7 @@ async def stat_player(conn, query, player_uuid):
             for row in changes
         ],
         "ratingStatus": STAT_RULES_VERSION,
+        "ratingsRebuilding": await _stat_rebuilding(conn, query["mmrSeason"]),
     }
 
 
@@ -2726,9 +2800,12 @@ async def stat_hitreg(conn, query):
 
 async def stat_void(conn, identity, attempt, model):
     # attempt is consumed by app.write's completion audit; voids carry no
-    # operation row, like site sessions. Voiding or restoring a rated
-    # campaign replays its season and every later season from scratch, which
-    # also folds in any earlier late results — the site setVoided contract.
+    # operation row, like site sessions. Voiding or restoring a rated campaign
+    # replays its season and every later season from scratch, which also folds
+    # in any earlier late results — the site setVoided contract. The replay
+    # must not run inside the 10 s request: the request only commits the void
+    # row and enqueues the season (under the rating lock), and the background
+    # rebuild loop replays it; reads report ratingsRebuilding until it lands.
     identity.require("stats.void", "prod", "game", "*")
     server_id, event_id = str(model.serverId), str(model.eventId)
     await conn.execute(
@@ -2768,7 +2845,13 @@ async def stat_void(conn, identity, attempt, model):
         and match["reason"] in ("completed", "draw")
     ):
         season = stat_season_at(_stat_ms(match["ended_at"]))
-        await _stat_rebuild_ratings(conn, season)
+        await conn.execute("SELECT pg_advisory_xact_lock(782344, 1)")
+        await conn.execute(
+            "INSERT INTO stat_rating_rebuilds(season_id,server_id,event_id) VALUES(%s,%s,%s)"
+            " ON CONFLICT(season_id) DO UPDATE SET server_id=excluded.server_id,"
+            " event_id=excluded.event_id,requested_at=now()",
+            (season["id"], server_id, event_id),
+        )
         rebuilt = season["id"]
     return {
         "rebuilt": rebuilt,
