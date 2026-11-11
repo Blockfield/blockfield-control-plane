@@ -24,6 +24,7 @@ from cpv2.auth import (
     SITE_SESSIONS_SCOPES,
     SITE_SETTINGS_SCOPES,
     STAFF_SCOPES,
+    STATS_SCOPES,
     invalidate,
     now,
     verifier,
@@ -284,12 +285,15 @@ async def _provision(dsn, spec, bearer_sink=None):
                 | STAFF_SCOPES
                 | SITE_SETTINGS_SCOPES
                 | SITE_SESSIONS_SCOPES
+                | STATS_SCOPES
             ) or client.get("human"):
                 raise ValueError("service credential ceiling")
             if (STAFF_SCOPES | SITE_SETTINGS_SCOPES | SITE_SESSIONS_SCOPES) & set(
                 spec["ceiling"]
             ) and spec["resource"] != "*":
                 raise ValueError("site scopes need an unbound site credential")
+            if STATS_SCOPES & set(spec["ceiling"]) and spec["resource"] == "*":
+                raise ValueError("stats.ingest needs a bound producer credential")
             # The service principal row lives here, not at runtime: this path
             # runs privileged while the service (cp_runtime) cannot INSERT accounts.
             principal, name = service_principal_id(client["id"])
@@ -304,6 +308,7 @@ async def _provision(dsn, spec, bearer_sink=None):
             | STAFF_SCOPES
             | SITE_SETTINGS_SCOPES
             | SITE_SESSIONS_SCOPES
+            | STATS_SCOPES
         ):
             raise ValueError("unknown scope")
         ttl = spec.get("expiresInSeconds", 3600)

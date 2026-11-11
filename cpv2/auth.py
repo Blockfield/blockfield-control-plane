@@ -119,6 +119,13 @@ SITE_SETTINGS_SCOPES = {"settings.read", "settings.gameplay.write"}
 # solely on a resource="*" credential, never in a human role, so no scoped
 # consumer can mint sessions for another resource.
 SITE_SESSIONS_SCOPES = {"site.sessions"}
+# Game-producer stats ingest (coordination#29 U1): match/campaign results go
+# to the CP stats schema instead of the site DB. Service-only, never in a
+# human role or owner scope. Unlike the site scopes above the credential stays
+# bound to its server resource (provision refuses "*"), so one server can
+# never submit another server's results; the runtime requires the scope on
+# the body's serverId (see core.stat_ingest).
+STATS_SCOPES = {"stats.ingest"}
 
 
 class Problem(Exception):
@@ -190,6 +197,7 @@ class Identity:
                     | STAFF_SCOPES
                     | SITE_SETTINGS_SCOPES
                     | SITE_SESSIONS_SCOPES
+                    | STATS_SCOPES
                 )
             # Service-asserted actor (staff/settings writes via the site
             # principal): the service must be provisioned for the scope, and
@@ -200,6 +208,7 @@ class Identity:
                 | STAFF_SCOPES
                 | SITE_SETTINGS_SCOPES
                 | SITE_SESSIONS_SCOPES
+                | STATS_SCOPES
             ):
                 return False
         if self.owner:

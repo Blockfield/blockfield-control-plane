@@ -9,6 +9,13 @@ from psycopg_pool import AsyncConnectionPool
 
 ROOT = Path(__file__).resolve().parents[1]
 _HISTORY = ContextVar("cp_history", default=None)
+# Ordered control-schema migrations; version N is list index N-1.
+MIGRATIONS = [
+    "001_core.sql",
+    "002_site_sessions.sql",
+    "003_site_stats.sql",
+    "004_schema_migrations_read.sql",
+]
 
 
 @asynccontextmanager
@@ -70,7 +77,7 @@ async def rows(conn, query, args=()):
 
 
 async def migrate(dsn, expected_database):
-    migrations = ["001_core.sql", "002_site_sessions.sql"]
+    migrations = MIGRATIONS
     checksums = {
         name: hashlib.sha256((ROOT / "migrations" / name).read_bytes()).hexdigest()
         for name in migrations
@@ -135,4 +142,20 @@ async def migrate(dsn, expected_database):
         await conn.execute(
             "INSERT INTO control.schema_migrations VALUES(2,%s)",
             (checksums["002_site_sessions.sql"],),
+        )
+        await conn.execute(
+            (ROOT / "migrations/003_site_stats.sql").read_bytes().decode(),
+            prepare=False,
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(3,%s)",
+            (checksums["003_site_stats.sql"],),
+        )
+        await conn.execute(
+            (ROOT / "migrations/004_schema_migrations_read.sql").read_bytes().decode(),
+            prepare=False,
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(4,%s)",
+            (checksums["004_schema_migrations_read.sql"],),
         )

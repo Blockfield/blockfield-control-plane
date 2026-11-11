@@ -13,11 +13,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from cpv2 import core, delivery, models
 from cpv2.auth import Identity, Problem, audit, authenticate, challenge, verifier
-from cpv2.db import Database, one, rows
+from cpv2.db import MIGRATIONS, Database, one, rows
 from cpv2.settings import DEFINITIONS, digest
 
 # Indirection so tests can expire the /health cache without patching time.
 _health_clock = time.monotonic
+
+# Mutation body caps by path. Everything else stays at 32 KiB; the stats
+# ingest route honors the producer outbox contract (1 MiB/event, same as the
+# site MAX_BODY) so a full 512-player result is never a 413.
+BODY_LIMITS = {"/v2/stats/results": core.STAT_MAX_BODY}
 
 
 class Limits:
@@ -210,10 +215,11 @@ def create_app(dsn=None):
                         "pending",
                     )
                 chunks, size = [], 0
+                limit = BODY_LIMITS.get(request.url.path, 32768)
                 async with asyncio.timeout(5):
                     async for chunk in request.stream():
                         size += len(chunk)
-                        if size > 32768:
+                        if size > limit:
                             raise Problem("body_too_large", 413)
                         chunks.append(chunk)
                 request._body = b"".join(chunks)
@@ -328,28 +334,42 @@ def create_app(dsn=None):
             raise Problem("invalid_owner_assertion", 422) from None
 
     health_ok_until = 0.0
+    # Last version read from control.schema_migrations; reported when the
+    # database is unreachable and no newer read exists.
+    health_schema = len(MIGRATIONS)
 
     @app.get("/health")
     async def health():
         # CP-H5: unauthenticated liveness + readiness. 200 only when the
-        # control database answers and the owner bootstrap is present.
-        # Never leak DSNs, errors or gate state here.
-        nonlocal health_ok_until
+        # control database answers, the owner bootstrap is present, and the
+        # stats migration is applied. Never leak DSNs, errors or gate state.
+        nonlocal health_ok_until, health_schema
         # Public route: cache success so probe floods cannot drain the DB pool;
         # failures re-check, since an outage has no pool left to protect.
         if _health_clock() < health_ok_until:
-            return {"status": "ok", "schema": 2}
+            return {"status": "ok", "schema": health_schema}
         try:
             async with database.transaction() as conn:
                 bootstrapped = await one(
                     conn, "SELECT EXISTS(SELECT 1 FROM owner_memberships) AS ok"
                 )
+                applied = await one(
+                    conn, "SELECT MAX(version) AS version FROM schema_migrations"
+                )
         except Exception:
-            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
-        if not bootstrapped or not bootstrapped["ok"]:
-            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
+            return JSONResponse(
+                {"status": "unavailable", "schema": health_schema}, status_code=503
+            )
+        version = (
+            applied["version"] if applied and applied["version"] is not None else 0
+        )
+        health_schema = version
+        if not bootstrapped or not bootstrapped["ok"] or version < len(MIGRATIONS):
+            return JSONResponse(
+                {"status": "unavailable", "schema": version}, status_code=503
+            )
         health_ok_until = _health_clock() + 5
-        return {"status": "ok", "schema": 2}
+        return {"status": "ok", "schema": version}
 
     @app.get("/v1/openapi.json")
     async def openapi():
@@ -615,6 +635,15 @@ def create_app(dsn=None):
             )
             await conn.execute("SELECT pg_notify('cp_events','')")
             return {"revoked": True}
+
+    @app.post("/v2/stats/results")
+    async def stats_ingest(body: dict, request: Request):
+        # The producer outbox acknowledges 200/201 JSON carrying inserted and
+        # the exact eventId; anything else stays under rejected/ for review.
+        # The write path commits the completion audit in the same transaction
+        # as the insert, like site sessions.
+        result = await write(request, core.stat_ingest, body)
+        return JSONResponse(result, status_code=201 if result["inserted"] else 200)
 
     @app.post("/v2/site/sessions", status_code=201)
     async def site_session_create(body: models.SiteSessionCreate, request: Request):
