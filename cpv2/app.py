@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from cpv2 import core, delivery, models
 from cpv2.auth import Identity, Problem, audit, authenticate, challenge, verifier
-from cpv2.db import Database, one, rows
+from cpv2.db import MIGRATIONS, Database, one, rows
 from cpv2.settings import DEFINITIONS, digest
 
 # Indirection so tests can expire the /health cache without patching time.
@@ -334,28 +334,42 @@ def create_app(dsn=None):
             raise Problem("invalid_owner_assertion", 422) from None
 
     health_ok_until = 0.0
+    # Last version read from control.schema_migrations; reported when the
+    # database is unreachable and no newer read exists.
+    health_schema = len(MIGRATIONS)
 
     @app.get("/health")
     async def health():
         # CP-H5: unauthenticated liveness + readiness. 200 only when the
-        # control database answers and the owner bootstrap is present.
-        # Never leak DSNs, errors or gate state here.
-        nonlocal health_ok_until
+        # control database answers, the owner bootstrap is present, and the
+        # stats migration is applied. Never leak DSNs, errors or gate state.
+        nonlocal health_ok_until, health_schema
         # Public route: cache success so probe floods cannot drain the DB pool;
         # failures re-check, since an outage has no pool left to protect.
         if _health_clock() < health_ok_until:
-            return {"status": "ok", "schema": 3}
+            return {"status": "ok", "schema": health_schema}
         try:
             async with database.transaction() as conn:
                 bootstrapped = await one(
                     conn, "SELECT EXISTS(SELECT 1 FROM owner_memberships) AS ok"
                 )
+                applied = await one(
+                    conn, "SELECT MAX(version) AS version FROM schema_migrations"
+                )
         except Exception:
-            return JSONResponse({"status": "unavailable", "schema": 3}, status_code=503)
-        if not bootstrapped or not bootstrapped["ok"]:
-            return JSONResponse({"status": "unavailable", "schema": 3}, status_code=503)
+            return JSONResponse(
+                {"status": "unavailable", "schema": health_schema}, status_code=503
+            )
+        version = (
+            applied["version"] if applied and applied["version"] is not None else 0
+        )
+        health_schema = version
+        if not bootstrapped or not bootstrapped["ok"] or version < len(MIGRATIONS):
+            return JSONResponse(
+                {"status": "unavailable", "schema": version}, status_code=503
+            )
         health_ok_until = _health_clock() + 5
-        return {"status": "ok", "schema": 3}
+        return {"status": "ok", "schema": version}
 
     @app.get("/v1/openapi.json")
     async def openapi():

@@ -1465,6 +1465,17 @@ def _stat_require(condition):
         _stat_invalid()
 
 
+def _stat_finite(value):
+    # Python keeps arbitrary-precision JSON integers while the site parses
+    # every number as an IEEE double (a 400-digit integer is Infinity
+    # there): math.isfinite raises OverflowError on such ints, so a bad
+    # telemetry block must fail validation, never the whole request.
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _stat_int(value, limit=1000000000):
     return type(value) is int and 0 <= value <= limit
 
@@ -1530,7 +1541,13 @@ def _stat_canonical(value):
     if value is False:
         return "false"
     if isinstance(value, int):
-        return str(value)
+        # Python keeps arbitrary-precision JSON integers, but the site
+        # parses every number as an IEEE double (JSON.parse), so digest
+        # parity needs the double: 9007199254740993 becomes ...992.
+        try:
+            value = float(value)
+        except OverflowError:
+            _stat_invalid()
     if isinstance(value, float):
         return _js_number(value)
     if isinstance(value, str):
@@ -1556,13 +1573,13 @@ def _stat_telemetry(value):
         _stat_require(_stat_int(value.get("shots")))
         share = value.get("fallbackShare")
         _stat_require(
-            type(share) in (int, float) and math.isfinite(share) and 0 <= share <= 1
+            type(share) in (int, float) and _stat_finite(share) and 0 <= share <= 1
         )
         for key in ("tickMsP50", "tickMsP99"):
             amount = value.get(key)
             _stat_require(
                 type(amount) in (int, float)
-                and math.isfinite(amount)
+                and _stat_finite(amount)
                 and 0 <= amount <= 1000000
             )
         for key in ("ageTicksP50", "rewindTicksP50"):
@@ -1591,11 +1608,7 @@ def _stat_telemetry(value):
                 _stat_require(isinstance(row, dict))
                 bound, count = row.get("le"), row.get("count")
                 _stat_require(
-                    (
-                        type(bound) in (int, float)
-                        and math.isfinite(bound)
-                        and bound >= 0
-                    )
+                    (type(bound) in (int, float) and _stat_finite(bound) and bound >= 0)
                     or bound == "inf"
                 )
                 _stat_require(_stat_int(count))
@@ -1620,7 +1633,7 @@ def _stat_telemetry(value):
                         and len(entry) <= 512
                         and not re.search("[\x00-\x1f\x7f-\x9f\ud800-\udfff]", entry)
                     )
-                    or (type(entry) in (int, float) and math.isfinite(entry))
+                    or (type(entry) in (int, float) and _stat_finite(entry))
                     or type(entry) is bool
                 )
                 kept[key] = entry
@@ -1734,7 +1747,7 @@ def validate_stat_result(value, current_ms):
         _stat_require(
             participant.get("team") in STAT_TEAMS
             and type(score) in (int, float)
-            and math.isfinite(score)
+            and _stat_finite(score)
             and abs(score) <= 1000000000
         )
         _stat_require(all(_stat_int(participant.get(key)) for key in STAT_COUNTERS))

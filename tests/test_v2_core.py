@@ -5142,7 +5142,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 3}
+    assert response.json() == {"status": "ok", "schema": 4}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -5150,7 +5150,61 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 3}
+    assert broken.json() == {"status": "unavailable", "schema": 4}
+
+
+async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
+    # /health must report the applied migration, not the binary's latest:
+    # on a schema-2 database readiness stays 503 until 003 is applied.
+    name = "cp_" + uuid4().hex
+    async with await psycopg.AsyncConnection.connect(postgres, autocommit=True) as conn:
+        await conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        admin = make_conninfo(postgres, dbname=name)
+        runtime = make_conninfo(admin, user="cp_api")
+        await migrate(admin, name)
+        async with await psycopg.AsyncConnection.connect(
+            admin, autocommit=True
+        ) as conn:
+            await conn.execute("DROP TABLE control.stat_classes")
+            await conn.execute("DROP TABLE control.stat_participants")
+            await conn.execute("DROP TABLE control.stat_profiles")
+            await conn.execute("DROP TABLE control.stat_results")
+            await conn.execute("DELETE FROM control.schema_migrations WHERE version>=3")
+        async with await psycopg.AsyncConnection.connect(admin) as conn:
+            await conn.execute("GRANT cp_runtime TO cp_api")
+        key = ec.generate_private_key(ec.SECP256R1())
+        numbers = key.public_key().public_numbers()
+        cose = cbor2.dumps(
+            {
+                1: 2,
+                3: -7,
+                -1: 1,
+                -2: numbers.x.to_bytes(32, "big"),
+                -3: numbers.y.to_bytes(32, "big"),
+            }
+        )
+        credential = {
+            "id": bytes_to_base64url(b"test-credential"),
+            "publicKey": bytes_to_base64url(cose),
+            "origin": "https://control.example.test",
+            "rpId": "control.example.test",
+        }
+        await bootstrap(admin, uuid4(), "owner", credential)
+        app = create_app(runtime)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="https://control.example.test",
+            ) as client:
+                response = await client.get("/health")
+                assert response.status_code == 503, response.text
+                assert response.json() == {"status": "unavailable", "schema": 2}
+    finally:
+        async with await psycopg.AsyncConnection.connect(
+            postgres, autocommit=True
+        ) as conn:
+            await conn.execute(f'DROP DATABASE "{name}"')
 
 
 def _rooms_body(key="rooms", revision=0, value=None):
@@ -6564,6 +6618,41 @@ async def test_stats_ingest_drops_bad_telemetry_not_the_match(store):
     assert "telemetry" not in rows[0]["payload"]
 
 
+async def test_stats_ingest_drops_oversized_json_integer_telemetry(store):
+    # A 400-digit fallbackShare is Infinity on the site and overflows
+    # float() here: the block is dropped (never a 500) and the match ingests.
+    from cpv2 import core as core_module
+
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server, "stats-bigint")
+    before = core_module.telemetry_dropped
+    body = _stats_campaign_body()
+    body["eventId"] = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    body["campaignSessionId"] = body["eventId"]
+    body["telemetry"]["fallbackShare"] = int("9" * 400)
+    created = await request(store, "POST", "/v2/stats/results", body, "stats-bigint")
+    assert created.status_code == 201, created.text
+    assert core_module.telemetry_dropped == before + 1
+    rows = await sql(
+        store,
+        "SELECT payload FROM stat_results WHERE event_id=%s",
+        (body["eventId"],),
+    )
+    assert "telemetry" not in rows[0]["payload"]
+
+
+async def test_stats_ingest_rejects_oversized_json_integer_score(store):
+    # Outside telemetry there is no block to drop: a 400-digit score is a
+    # 422 validation Problem, never an unhandled OverflowError/500.
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server, "stats-score")
+    body = _stats_campaign_body()
+    body["participants"][0]["score"] = 10**400
+    response = await request(store, "POST", "/v2/stats/results", body, "stats-score")
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == "invalid_result"
+
+
 async def test_stats_ingest_ffa_winner_and_large_body(store):
     server = "22222222-2222-2222-2222-222222222222"
     await _stats_token(store, server, "stats-size")
@@ -6707,11 +6796,12 @@ def _stats_ffa_body(server="22222222-2222-2222-2222-222222222222"):
 
 def test_stats_digest_matches_site_producer_contract():
     # Digests pinned against the site's own validateResult+canonical run on
-    # origin/main (node evidence in .dev/sitedbu1-c1, not committed): a
+    # origin/main (node evidence in .dev/sitedbu1-c1 for P1/P2 and
+    # .dev/sitedbu1-c2 for the P3 large-integer bucket, not committed): a
     # dual-write reconcile can compare digests across the two stores.
     import datetime
 
-    from cpv2.core import validate_stat_result
+    from cpv2.core import _stat_canonical, validate_stat_result
 
     now = int(
         datetime.datetime(
@@ -6728,4 +6818,19 @@ def test_stats_digest_matches_site_producer_contract():
     assert ffa["winnerUuid"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
     assert ffa_digest == (
         "ade4a1e9d923746a25ef06f362a35ef90aa9b6f5c9b8879e13b81a877073e221"
+    )
+    p3 = _stats_campaign_body()
+    p3["eventId"] = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    p3["campaignSessionId"] = p3["eventId"]
+    p3["rounds"] = ["dddddddd-dddd-dddd-dddd-dddddddddddd"]
+    p3["telemetry"]["tickMsBuckets"] = [
+        {"le": 9007199254740993, "count": 90},
+        {"le": "inf", "count": 10},
+    ]
+    p3clean, p3_digest, _ = validate_stat_result(p3, now)
+    # 2**53+1 is not exactly representable: both sides canonicalize the
+    # double the site's JSON.parse produces, not the source digits.
+    assert '"le":9007199254740992' in _stat_canonical(p3clean)
+    assert p3_digest == (
+        "03c233d10842cc43553a73bc03f66552debb192ef05c5c3929c7497cad189d0b"
     )
