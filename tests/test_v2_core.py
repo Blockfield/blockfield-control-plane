@@ -5142,7 +5142,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 4}
+    assert response.json() == {"status": "ok", "schema": 5}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -5150,7 +5150,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 4}
+    assert broken.json() == {"status": "unavailable", "schema": 5}
 
 
 async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
@@ -5166,6 +5166,9 @@ async def test_health_reports_applied_schema_version_before_stats_migration(post
         async with await psycopg.AsyncConnection.connect(
             admin, autocommit=True
         ) as conn:
+            await conn.execute("DROP TABLE control.stat_result_voids")
+            await conn.execute("DROP TABLE control.stat_rating_changes")
+            await conn.execute("DROP TABLE control.stat_ratings")
             await conn.execute("DROP TABLE control.stat_classes")
             await conn.execute("DROP TABLE control.stat_participants")
             await conn.execute("DROP TABLE control.stat_profiles")
@@ -6834,3 +6837,706 @@ def test_stats_digest_matches_site_producer_contract():
     assert p3_digest == (
         "03c233d10842cc43553a73bc03f66552debb192ef05c5c3929c7497cad189d0b"
     )
+
+
+async def _stats_reader_token(store, cid="stats-reader"):
+    # Unbound service credential with stats.read (site SSR/launcher/bot path).
+    if cid not in store["tokens"]:
+        store["tokens"][cid] = await provision(
+            store["admin"],
+            {
+                "client": {"id": cid, "via": "game", "ceiling": ["stats.read"]},
+                "ceiling": ["stats.read"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+    return store["tokens"][cid]
+
+
+def _stats_u3_participant(uuid, name, team, score, kills, deaths, classes, **over):
+    counters = _stats_counter_set()
+    counters.update({"kills": kills, "deaths": deaths, **over})
+    return {
+        "uuid": uuid,
+        "name": name,
+        "team": team,
+        "score": score,
+        **counters,
+        "classes": classes,
+    }
+
+
+def _stats_u3_class(class_id, variant_id, time_seconds, kills, deaths, point_seconds=0):
+    return {
+        "classId": class_id,
+        "variantId": variant_id,
+        "timeSeconds": time_seconds,
+        "kills": kills,
+        "deaths": deaths,
+        "pointSeconds": point_seconds,
+    }
+
+
+def _stats_u3_match_body(
+    event,
+    server,
+    started,
+    ended,
+    winner,
+    participants,
+    telemetry=None,
+    mode="room",
+):
+    body = {
+        "schemaVersion": 1,
+        "eventId": event,
+        "serverId": server,
+        "kind": "match",
+        "sessionPurpose": "gameplay",
+        "modeId": mode,
+        "ranked": False,
+        "rulesetVersion": "review-v1",
+        "matchId": event,
+        "campaignSessionId": None,
+        "mapId": "fields",
+        "startedAt": started,
+        "endedAt": ended,
+        "endReason": "completed",
+        "winner": winner,
+        "participants": participants,
+        "rounds": [],
+    }
+    if telemetry is not None:
+        body["telemetry"] = telemetry
+    return body
+
+
+def _stats_u3_telemetry():
+    return {
+        "shots": 100,
+        "fallbackShare": 0.25,
+        "tickMsP50": 5,
+        "tickMsP99": 20,
+        "ageTicksP50": 2,
+        "tickMsP99Overflow": False,
+        "ageTicksP50Overflow": False,
+        "rewindTicksP50": 1,
+        "rewindTicksP50Overflow": False,
+        "counters": {"hits": 70, "shots_fired": 100},
+        "tickMsBuckets": [{"le": 10, "count": 100}],
+        "ageTickBuckets": [{"le": "inf", "count": 100}],
+        "rewindTickBuckets": [{"le": 3, "count": 100}],
+        "disputes": [{"tick": 7, "kind": "rewind"}],
+    }
+
+
+def _stats_u3_campaign_body(event, server, ended, winner, participants):
+    return {
+        "schemaVersion": 1,
+        "eventId": event,
+        "serverId": server,
+        "kind": "campaign",
+        "sessionPurpose": "gameplay",
+        "modeId": "campaign",
+        "ranked": True,
+        "rulesetVersion": "review-v1",
+        "matchId": None,
+        "campaignSessionId": event,
+        "mapId": None,
+        "startedAt": "2026-11-11T11:00:00Z",
+        "endedAt": ended,
+        "endReason": "completed",
+        "winner": winner,
+        "participants": participants,
+        "rounds": ["33333333-3333-3333-3333-333333333333"],
+    }
+
+
+_U3_SERVER = "55555555-5555-4555-8555-555555555555"
+_U3_PA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+_U3_PB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb2"
+_U3_M1 = "66666666-6666-4666-8666-666666666666"
+_U3_M2 = "77777777-7777-4777-8777-777777777777"
+_U3_C1 = "88888888-8888-4888-8888-888888888888"
+
+
+async def _stats_u3_seed(store):
+    await _stats_token(store, _U3_SERVER, "stats-u3-producer")
+    matches = [
+        _stats_u3_match_body(
+            _U3_M1,
+            _U3_SERVER,
+            "2026-11-11T09:00:00Z",
+            "2026-11-11T10:00:00Z",
+            "RED",
+            [
+                _stats_u3_participant(
+                    _U3_PA,
+                    "Игрок Альфа",
+                    "RED",
+                    10,
+                    5,
+                    0,
+                    [_stats_u3_class("assault", "0", 60, 5, 0, 10)],
+                    captures=1,
+                ),
+                _stats_u3_participant(
+                    _U3_PB,
+                    "Player Beta",
+                    "BLUE",
+                    7,
+                    2,
+                    5,
+                    [_stats_u3_class("recon", "2", 60, 2, 5, 3)],
+                ),
+            ],
+            _stats_u3_telemetry(),
+        ),
+        _stats_u3_match_body(
+            _U3_M2,
+            _U3_SERVER,
+            "2026-11-11T10:00:00Z",
+            "2026-11-11T11:00:00Z",
+            "BLUE",
+            [
+                _stats_u3_participant(
+                    _U3_PA,
+                    "Игрок Альфа",
+                    "RED",
+                    4,
+                    1,
+                    3,
+                    [
+                        _stats_u3_class("assault", "0", 30, 1, 3, 5),
+                        _stats_u3_class("medic", "1", 90, 0, 0, 20),
+                    ],
+                ),
+                _stats_u3_participant(
+                    _U3_PB,
+                    "Player Beta",
+                    "BLUE",
+                    9,
+                    6,
+                    1,
+                    [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+                    captures=1,
+                ),
+            ],
+        ),
+    ]
+    for body in matches:
+        response = await request(
+            store, "POST", "/v2/stats/results", body, "stats-u3-producer"
+        )
+        assert response.status_code == 201, response.text
+    campaign = _stats_u3_campaign_body(
+        _U3_C1,
+        _U3_SERVER,
+        "2026-11-11T12:00:00Z",
+        "RED",
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                12,
+                4,
+                1,
+                [_stats_u3_class("assault", "0", 500, 4, 1, 100)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                8,
+                2,
+                4,
+                [_stats_u3_class("recon", "2", 500, 2, 4, 50)],
+            ),
+        ],
+    )
+    response = await request(
+        store, "POST", "/v2/stats/results", campaign, "stats-u3-producer"
+    )
+    assert response.status_code == 201, response.text
+    await _stats_reader_token(store)
+
+
+def test_stats_glicko2_matches_site_algorithm():
+    # Pinned outputs of the site's own glicko2.ts (origin/next e48b327) run
+    # under node (.dev/u-sitedb-u3/parity-battery.mjs + parity-output.json):
+    # the CP port must agree bit-for-bit on the same fixture.
+    from cpv2.core import (
+        _stat_glicko_composite,
+        _stat_glicko_inflate,
+        _stat_glicko_initial,
+        _stat_glicko_soft_reset,
+        _stat_glicko_update,
+        _stat_js_round,
+        _stat_mmr,
+    )
+
+    red0, blue0 = _stat_glicko_initial(), _stat_glicko_initial()
+    red1 = _stat_glicko_update(
+        red0, [{"opponent": _stat_glicko_composite([blue0]), "score": 1}]
+    )
+    blue1 = _stat_glicko_update(
+        blue0, [{"opponent": _stat_glicko_composite([red0]), "score": 0}]
+    )
+    assert red1 == {
+        "rating": 1662.3108939062977,
+        "rd": 290.31896371798047,
+        "volatility": 0.05999967537233814,
+    }
+    assert blue1 == {
+        "rating": 1337.6891060937023,
+        "rd": 290.31896371798047,
+        "volatility": 0.05999967537233814,
+    }
+    assert _stat_mmr(
+        {"rating": red1["rating"], "rd": red1["rd"], "ratedCampaigns": 1}
+    ) == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    inflated = _stat_glicko_inflate(
+        {"rating": red1["rating"], "rd": red1["rd"], "volatility": red1["volatility"]},
+        0,
+    )
+    red2 = _stat_glicko_update(
+        inflated,
+        [
+            {
+                "opponent": _stat_glicko_composite(
+                    [{"rating": blue1["rating"], "rd": blue1["rd"]}]
+                ),
+                "score": 0.5,
+            }
+        ],
+    )
+    assert red2 == {
+        "rating": 1576.6886643068638,
+        "rd": 260.48876356402207,
+        "volatility": 0.05999914867562188,
+    }
+    assert _stat_glicko_soft_reset(
+        {"rating": 1700, "rd": 60, "volatility": 0.06}, 1
+    ) == {
+        "rating": 1600,
+        "rd": 200,
+        "volatility": 0.06,
+    }
+    assert _stat_glicko_soft_reset(
+        {"rating": 1700, "rd": 60, "volatility": 0.06}, 2
+    ) == {
+        "rating": 1550,
+        "rd": 200,
+        "volatility": 0.06,
+    }
+    assert _stat_glicko_composite(
+        [{"rating": 1600, "rd": 100}, {"rating": 1400, "rd": 200}]
+    ) == {
+        "rating": 1500,
+        "rd": 158.11388300841898,
+    }
+    assert _stat_glicko_inflate({"rating": 1600, "rd": 60, "volatility": 0.06}, 3) == {
+        "rating": 1600,
+        "rd": 62.65717069576213,
+        "volatility": 0.06,
+    }
+    assert _stat_glicko_update({"rating": 1600, "rd": 100, "volatility": 0.06}, []) == {
+        "rating": 1600,
+        "rd": 100.54173435212178,
+        "volatility": 0.06,
+    }
+    # Site Math.round is half-up; Python round() is banker's: 1500.5 -> 1501.
+    assert _stat_js_round(1500.5) == 1501
+    assert _stat_mmr({"rating": 1500.5, "rd": 150.0, "ratedCampaigns": 5}) == {
+        "rating": 1501,
+        "rd": 150,
+        "ratedCampaigns": 5,
+        "provisional": False,
+    }
+    assert _stat_mmr({"rating": None, "rd": None, "ratedCampaigns": None}) is None
+
+
+def test_stats_seasons_match_site_contract():
+    # Pinned seasons() output of the site (same node battery): s1 alpha,
+    # s2 to end of 2026, then UTC quarters.
+    from cpv2.core import stat_season_at, stat_seasons
+
+    nov = stat_seasons(1793836800000)
+    assert nov == [
+        {
+            "id": "s1",
+            "name": "Альфа Сезон",
+            "startsAt": "2026-09-14T00:00:00.000Z",
+            "endsAt": "2026-09-25T23:59:59.999Z",
+        },
+        {
+            "id": "s2",
+            "name": "Сезон 1",
+            "startsAt": "2026-09-26T00:00:00.000Z",
+            "endsAt": "2026-12-31T23:59:59.999Z",
+        },
+    ]
+    assert [s["id"] for s in stat_seasons(1805068800000)] == ["s1", "s2", "s3"]
+    assert stat_season_at(1577836800000)["id"] == "s1"
+    assert stat_season_at(1792900000000)["id"] == "s2"
+
+
+async def test_stats_seasons_route(store):
+    await _stats_reader_token(store)
+    response = await request(store, "GET", "/v2/stats/seasons", None, "stats-reader")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["schemaVersion"] == 1
+    assert body["current"] == body["seasons"][-1]["id"]
+    assert [s["id"] for s in body["seasons"][:2]] == ["s1", "s2"]
+    assert body["seasons"][0]["startsAt"] == "2026-09-14T00:00:00.000Z"
+    assert body["seasons"][1] == {
+        "id": "s2",
+        "name": "Сезон 1",
+        "startsAt": "2026-09-26T00:00:00.000Z",
+        "endsAt": "2026-12-31T23:59:59.999Z",
+    }
+
+
+async def test_stats_reads_require_stats_read_scope(store):
+    await _stats_token(store, _U3_SERVER, "stats-u3-producer")
+    await _stats_reader_token(store)
+    for path in (
+        "/v2/stats/seasons",
+        "/v2/stats/leaderboard",
+        f"/v2/stats/players/{_U3_PA}",
+        "/v2/stats/hitreg",
+    ):
+        assert (await store["client"].get(path)).status_code == 401
+        denied = await request(store, "GET", path, None, "stats-u3-producer")
+        assert denied.status_code == 403, denied.text
+        assert denied.json() == {"error": "forbidden"}
+    void = {"serverId": _U3_SERVER, "eventId": _U3_M1, "voided": True}
+    assert (
+        await store["client"].post("/v2/stats/results/void", json=void)
+    ).status_code == 401
+    denied = await request(
+        store, "POST", "/v2/stats/results/void", void, "stats-u3-producer"
+    )
+    assert denied.status_code == 403, denied.text
+    denied = await request(
+        store, "POST", "/v2/stats/results/void", void, "stats-reader"
+    )
+    assert denied.status_code == 403, denied.text
+
+
+async def test_stats_filters_reject_like_site(store):
+    await _stats_reader_token(store)
+    from cpv2.core import stat_seasons
+
+    future = f"s{len(stat_seasons()) + 1}"
+    cases = [
+        "mode=arena",
+        "period=year",
+        "sort=unknown",
+        "season=s2&period=all",
+        "season=s2&period=week",
+        "season=s99",
+        f"season={future}",
+        "limit=0",
+        "limit=101",
+        "limit=abc",
+        "limit=25.0",
+        "page=0",
+        "page=1001",
+        "page=x",
+    ]
+    for query in cases:
+        response = await request(
+            store, "GET", f"/v2/stats/leaderboard?{query}", None, "stats-reader"
+        )
+        assert response.status_code == 400, (query, response.text)
+        assert response.json() == {"error": "invalid_stats_filter"}, query
+
+
+async def test_stats_leaderboard_player_hitreg_roundtrip(store):
+    await _stats_u3_seed(store)
+    board = await request(
+        store, "GET", "/v2/stats/leaderboard?season=s2", None, "stats-reader"
+    )
+    assert board.status_code == 200, board.text
+    body = board.json()
+    assert body["schemaVersion"] == 1
+    assert body["mode"] is None
+    assert body["season"] == "s2"
+    assert body["mmrSeason"] == "s2"
+    assert body["page"] == 1 and body["limit"] == 25
+    assert body["total"] == 2
+    assert body["ratingStatus"] == "glicko2-v1"
+    assert [p["uuid"] for p in body["players"]] == [_U3_PB, _U3_PA]
+    first, second = body["players"]
+    assert (first["rank"], second["rank"]) == (1, 2)
+    assert (first["score"], second["score"]) == (16.0, 14.0)
+    assert (first["kills"], first["deaths"], first["kd"]) == (8, 6, 1.333)
+    assert (second["kills"], second["deaths"], second["kd"]) == (6, 3, 2.0)
+    assert (first["wins"], second["wins"]) == (1, 1)
+    assert (first["matches"], second["matches"]) == (2, 2)
+    assert first["mmr"] == {
+        "rating": 1338,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    assert second["mmr"] == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    # Campaign summaries never count round kills/score twice.
+    assert first["captures"] == 3 and second["captures"] == 3
+    # Sort/rank contract: ties break by uuid ascending.
+    tied = (
+        await request(
+            store,
+            "GET",
+            "/v2/stats/leaderboard?season=s2&sort=captures",
+            None,
+            "stats-reader",
+        )
+    ).json()["players"]
+    assert [(p["uuid"], p["rank"]) for p in tied] == [(_U3_PA, 1), (_U3_PB, 2)]
+    kills = (
+        await request(
+            store,
+            "GET",
+            "/v2/stats/leaderboard?season=s2&sort=kd",
+            None,
+            "stats-reader",
+        )
+    ).json()["players"]
+    assert [p["uuid"] for p in kills] == [_U3_PA, _U3_PB]
+    rated = (
+        await request(
+            store,
+            "GET",
+            "/v2/stats/leaderboard?season=s2&sort=rating",
+            None,
+            "stats-reader",
+        )
+    ).json()["players"]
+    assert [p["uuid"] for p in rated] == [_U3_PA, _U3_PB]
+    empty = (
+        await request(
+            store, "GET", "/v2/stats/leaderboard?season=s1", None, "stats-reader"
+        )
+    ).json()
+    assert empty["total"] == 0 and empty["players"] == [] and empty["mmrSeason"] == "s1"
+
+    player = await request(
+        store, "GET", f"/v2/stats/players/{_U3_PA}?season=s2", None, "stats-reader"
+    )
+    assert player.status_code == 200, player.text
+    data = player.json()
+    assert data["schemaVersion"] == 1
+    assert data["profile"] == {
+        "uuid": _U3_PA,
+        "name": "Игрок Альфа",
+        "lastSeen": 1794398400000,
+    }
+    assert data["totals"]["rank"] == 2
+    assert data["totals"]["score"] == 14.0
+    assert data["campaigns"] == {"completed": 1, "wins": 1}
+    # Classes aggregate matches only: the 500 s campaign breakdown stays out.
+    assert data["classes"] == [
+        {
+            "classId": "assault",
+            "variantId": "0",
+            "timeSeconds": 90,
+            "kills": 6,
+            "deaths": 3,
+            "pointSeconds": 15,
+        },
+        {
+            "classId": "medic",
+            "variantId": "1",
+            "timeSeconds": 90,
+            "kills": 0,
+            "deaths": 0,
+            "pointSeconds": 20,
+        },
+    ]
+    assert [(h["eventId"], h["kind"]) for h in data["history"]] == [
+        (_U3_C1, "campaign"),
+        (_U3_M2, "match"),
+        (_U3_M1, "match"),
+    ]
+    assert data["history"][0]["winner"] == "RED"
+    assert data["history"][2]["winnerUuid"] is None
+    assert data["mmr"] == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    assert data["ratingHistory"] == [
+        {
+            "campaignSessionId": _U3_C1,
+            "ratedAt": 1794398400000,
+            "team": "RED",
+            "score": 1,
+            "before": 1500,
+            "after": 1662,
+            "rd": 290,
+        }
+    ]
+    assert data["ratingStatus"] == "glicko2-v1"
+    unknown = await request(
+        store,
+        "GET",
+        "/v2/stats/players/99999999-9999-4999-8999-999999999999?season=s2",
+        None,
+        "stats-reader",
+    )
+    assert unknown.status_code == 404, unknown.text
+    malformed = await request(
+        store, "GET", "/v2/stats/players/not-a-uuid?season=s2", None, "stats-reader"
+    )
+    assert malformed.status_code == 400, malformed.text
+
+    hitreg = (
+        await request(store, "GET", "/v2/stats/hitreg?season=s2", None, "stats-reader")
+    ).json()
+    assert hitreg["schemaVersion"] == 1
+    assert hitreg["mode"] is None
+    assert hitreg["matches"] == 2
+    assert hitreg["withTelemetry"] == 1
+    assert hitreg["truncated"] is False
+    assert hitreg["shots"] == 100
+    assert hitreg["fallbackShare"] == 0.25
+    assert hitreg["disputes"] == 1
+    assert hitreg["counters"] == {"hits": 70, "shots_fired": 100}
+    assert hitreg["tickMsP50Median"] == 5.0
+    assert hitreg["tickMsP99P99"] == 20.0
+    assert hitreg["ageTicksP50Median"] == 2.0
+    assert hitreg["rewindTicksP50Median"] == 1.0
+
+
+async def test_stats_void_replays_ratings_like_site(store):
+    await _stats_u3_seed(store)
+
+    async def mmr_of(uuid):
+        player = (
+            await request(
+                store,
+                "GET",
+                f"/v2/stats/players/{uuid}?season=s2",
+                None,
+                "stats-reader",
+            )
+        ).json()
+        return player["mmr"], player["ratingHistory"]
+
+    before_a, history_a = await mmr_of(_U3_PA)
+    assert before_a == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    assert len(history_a) == 1
+    # Matches are not rated: voiding one only removes its battles.
+    match_void = {"serverId": _U3_SERVER, "eventId": _U3_M1, "voided": True}
+    response = await request(
+        store, "POST", "/v2/stats/results/void", match_void, "admin"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["rebuilt"] is None
+    board = (
+        await request(
+            store, "GET", "/v2/stats/leaderboard?season=s2", None, "stats-reader"
+        )
+    ).json()
+    assert {p["uuid"]: (p["matches"], p["score"]) for p in board["players"]} == {
+        _U3_PA: (1, 4.0),
+        _U3_PB: (1, 9.0),
+    }
+    # Voiding the rated campaign replays the season: MMR goes away.
+    campaign_void = {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True}
+    response = await request(
+        store, "POST", "/v2/stats/results/void", campaign_void, "admin"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["rebuilt"] == "s2"
+    after_a, history_after = await mmr_of(_U3_PA)
+    assert after_a is None and history_after == []
+    # Double void conflicts; restoring replays the same ratings back.
+    conflict = await request(
+        store, "POST", "/v2/stats/results/void", campaign_void, "admin"
+    )
+    assert conflict.status_code == 409, conflict.text
+    restore = {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": False}
+    response = await request(store, "POST", "/v2/stats/results/void", restore, "admin")
+    assert response.status_code == 200, response.text
+    assert response.json()["rebuilt"] == "s2"
+    restored_a, history_restored = await mmr_of(_U3_PA)
+    assert restored_a == before_a and history_restored == history_a
+    missing = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": _U3_M2, "voided": False},
+        "admin",
+    )
+    assert missing.status_code == 409, missing.text
+    gone = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {
+            "serverId": _U3_SERVER,
+            "eventId": "99999999-9999-4999-8999-999999999999",
+            "voided": True,
+        },
+        "admin",
+    )
+    assert gone.status_code == 404, gone.text
+
+
+async def test_stats_read_provision_scopes(store):
+    from cpv2.auth import STATS_READ_SCOPES
+
+    assert STATS_READ_SCOPES == {"stats.read"}
+    with pytest.raises(ValueError, match="unbound site credential"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "stats-bound",
+                    "via": "game",
+                    "ceiling": ["stats.read"],
+                },
+                "ceiling": ["stats.read"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": _U3_SERVER,
+            },
+        )
+    with pytest.raises(ValueError, match="service credential ceiling"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "stats-void-svc",
+                    "via": "game",
+                    "ceiling": ["stats.void"],
+                },
+                "ceiling": ["stats.void"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
