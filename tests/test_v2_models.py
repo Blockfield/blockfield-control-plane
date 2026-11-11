@@ -9,7 +9,6 @@ from cpv2.models import (
     ModerationAction,
     Rollback,
     SettingsChange,
-    SiteSessionCreate,
 )
 from cpv2.settings import (
     DEFINITIONS,

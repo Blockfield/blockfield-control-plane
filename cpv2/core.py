@@ -1337,8 +1337,21 @@ SITE_SESSION_USER_CAP = 20
 SITE_SESSION_MAX_AGE = timedelta(days=60)
 
 
-async def site_session_create(conn, identity, model):
+async def _site_player_lock(conn, player_uuid):
+    # One lock for every per-player session write (create incl. cap pruning,
+    # revoke-all, touch): concurrent writers for the same player wait instead
+    # of interleaving. Same pg_advisory_xact_lock pattern as operation().
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+        (player_uuid,),
+    )
+
+
+async def site_session_create(conn, identity, attempt, model):
+    # attempt is consumed by app.write's completion audit; site sessions
+    # carry no operation row.
     identity.require("site.sessions", "prod", "game", "*")
+    await _site_player_lock(conn, model.playerUuid)
     sid = secrets.token_hex(16)
     await conn.execute(
         "INSERT INTO site_sessions(id,sealed_token,player_uuid) VALUES(%s,%s,%s)",
@@ -1359,23 +1372,30 @@ async def site_session_read(conn, identity, session_id):
     identity.require("site.sessions", "prod", "game", "*")
     if not SITE_SESSION_ID.fullmatch(session_id or ""):
         raise Problem("session_not_found", 404)
+    owner = await one(
+        conn, "SELECT player_uuid FROM site_sessions WHERE id=%s", (session_id,)
+    )
+    if not owner:
+        raise Problem("session_not_found", 404)
+    await _site_player_lock(conn, owner["player_uuid"])
+    # Touch and fetch atomically: a concurrent revoke between the lookup and
+    # the touch leaves zero rows instead of returning a revoked token.
     row = await one(
         conn,
-        "SELECT sealed_token, player_uuid, last_seen FROM site_sessions WHERE id=%s",
-        (session_id,),
+        "UPDATE site_sessions SET last_seen=now() WHERE id=%s AND last_seen>%s "
+        "RETURNING sealed_token, player_uuid",
+        (session_id, now() - SITE_SESSION_MAX_AGE),
     )
-    if not row:
-        raise Problem("session_not_found", 404)
-    if row["last_seen"] <= now() - SITE_SESSION_MAX_AGE:
-        await conn.execute("DELETE FROM site_sessions WHERE id=%s", (session_id,))
-        raise Problem("session_not_found", 404)
-    await conn.execute(
-        "UPDATE site_sessions SET last_seen=now() WHERE id=%s", (session_id,)
-    )
-    return {"sealedToken": row["sealed_token"], "playerUuid": row["player_uuid"]}
+    if row:
+        return {"sealedToken": row["sealed_token"], "playerUuid": row["player_uuid"]}
+    # Expired or concurrently revoked: delete the stale row in this
+    # transaction (it commits) and report expiry without raising here, so the
+    # route returns 404 after commit instead of rolling the cleanup back.
+    await conn.execute("DELETE FROM site_sessions WHERE id=%s", (session_id,))
+    return None
 
 
-async def site_session_revoke(conn, identity, session_id):
+async def site_session_revoke(conn, identity, attempt, session_id):
     identity.require("site.sessions", "prod", "game", "*")
     if not SITE_SESSION_ID.fullmatch(session_id or ""):
         raise Problem("session_not_found", 404)
@@ -1383,10 +1403,11 @@ async def site_session_revoke(conn, identity, session_id):
     return {"revoked": deleted.rowcount > 0}
 
 
-async def site_sessions_revoke_user(conn, identity, player_uuid):
+async def site_sessions_revoke_user(conn, identity, attempt, player_uuid):
     identity.require("site.sessions", "prod", "game", "*")
     if not isinstance(player_uuid, str) or not 1 <= len(player_uuid) <= 128:
         raise Problem("invalid_player", 422)
+    await _site_player_lock(conn, player_uuid)
     deleted = await conn.execute(
         "DELETE FROM site_sessions WHERE player_uuid=%s", (player_uuid,)
     )

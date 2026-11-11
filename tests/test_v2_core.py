@@ -5985,7 +5985,7 @@ async def test_site_sessions_rbac(store):
     assert (
         await request(store, "GET", f"/v2/site/sessions/{sid}", None, "owner")
     ).status_code == 200
-    assert (await request(store, "GET", f"/v2/site/sessions/{sid}")).status_code == 401
+    assert (await store["client"].get(f"/v2/site/sessions/{sid}")).status_code == 401
 
 
 async def test_site_sessions_caps_and_expiry(store):
@@ -6045,3 +6045,208 @@ async def test_site_sessions_validation(store):
     assert (
         await request(store, "DELETE", "/v2/site/sessions/not-hex", None, "site-valid")
     ).status_code == 404
+
+
+async def test_site_sessions_touch_deleted_reports_not_found(store, monkeypatch):
+    # Finding ..391: a read that selected a session must not return its sealed
+    # token after a concurrent revoke deletes it before the touch.
+    await _site_sessions_token(store, "site-touch")
+    created = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "touch-me", "playerUuid": "player-touch"},
+        "site-touch",
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["sessionId"]
+    real_one = core.one
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def gated_one(conn, query, args=()):
+        row = await real_one(conn, query, args)
+        if "FROM site_sessions WHERE id=" in query:
+            entered.set()
+            await release.wait()
+        return row
+
+    monkeypatch.setattr(core, "one", gated_one)
+    reader = asyncio.create_task(
+        request(store, "GET", f"/v2/site/sessions/{sid}", None, "site-touch")
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    revoked = await request(
+        store, "DELETE", f"/v2/site/sessions/{sid}", None, "site-touch"
+    )
+    assert revoked.json() == {"revoked": True}
+    release.set()
+    response = await asyncio.wait_for(reader, 10)
+    assert response.status_code == 404, response.text
+    assert not await sql(store, "SELECT 1 FROM site_sessions WHERE id=%s", (sid,))
+
+
+def _site_race_identity(cid):
+    from cpv2.auth import Identity
+
+    return Identity(
+        {
+            "id": cid,
+            "ceiling": ["site.sessions"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "kind": "service",
+        },
+        {"id": cid, "ceiling": ["site.sessions"], "human": False, "via": "game"},
+        None,
+        [],
+        False,
+    )
+
+
+async def _site_race_conn(store):
+    return await psycopg.AsyncConnection.connect(
+        store["runtime"],
+        row_factory=psycopg.rows.dict_row,
+        options="-c search_path=control,pg_catalog",
+    )
+
+
+async def test_site_sessions_concurrent_create_enforces_cap(store):
+    # Finding ..414: two concurrent creates on a 19-session player must leave
+    # 20 rows, not 21. Two raw connections hold both inserts uncommitted, so
+    # the prune check overlaps deterministically.
+    from cpv2.models import SiteSessionCreate
+
+    await _site_sessions_token(store, "site-conc")
+    for index in range(19):
+        response = await request(
+            store,
+            "POST",
+            "/v2/site/sessions",
+            {"sealedToken": f"c-{index}", "playerUuid": "player-conc"},
+            "site-conc",
+        )
+        assert response.status_code == 201, response.text
+    identity = _site_race_identity("site-conc")
+    conn_a, conn_b = await _site_race_conn(store), await _site_race_conn(store)
+    try:
+        async with conn_a.transaction():
+            await core.site_session_create(
+                conn_a,
+                identity,
+                None,
+                SiteSessionCreate(sealedToken="c-A", playerUuid="player-conc"),
+            )
+
+            async def second():
+                async with conn_b.transaction():
+                    return await core.site_session_create(
+                        conn_b,
+                        identity,
+                        None,
+                        SiteSessionCreate(sealedToken="c-B", playerUuid="player-conc"),
+                    )
+
+            task = asyncio.create_task(second())
+            await asyncio.sleep(0.5)
+            blocked = not task.done()
+        result = await asyncio.wait_for(task, 10)
+        assert result["sessionId"]
+        # The second create must have waited for the first to commit so its
+        # prune sees the committed row.
+        assert blocked
+    finally:
+        await conn_a.close()
+        await conn_b.close()
+    count = await sql(
+        store,
+        "SELECT count(*) AS n FROM site_sessions WHERE player_uuid=%s",
+        ("player-conc",),
+    )
+    assert count[0]["n"] == 20
+
+
+async def test_site_sessions_create_revoke_all_serialized(store):
+    # Finding ..402: an uncommitted create must not slip past a concurrent
+    # revoke-all. The revoke blocks on the per-player lock, then deletes the
+    # committed row.
+    from cpv2.models import SiteSessionCreate
+
+    await _site_sessions_token(store, "site-race")
+    identity = _site_race_identity("site-race")
+    conn_a, conn_b = await _site_race_conn(store), await _site_race_conn(store)
+    try:
+        async with conn_a.transaction():
+            await core.site_session_create(
+                conn_a,
+                identity,
+                None,
+                SiteSessionCreate(sealedToken="r-A", playerUuid="player-race"),
+            )
+
+            async def revoke():
+                async with conn_b.transaction():
+                    return await core.site_sessions_revoke_user(
+                        conn_b, identity, None, "player-race"
+                    )
+
+            task = asyncio.create_task(revoke())
+            await asyncio.sleep(0.5)
+            assert not task.done()
+            assert (await sql(store, "SELECT 1 FROM site_sessions")) == []
+        result = await asyncio.wait_for(task, 10)
+        assert result["revoked"] == 1
+    finally:
+        await conn_a.close()
+        await conn_b.close()
+    assert not await sql(
+        store, "SELECT 1 FROM site_sessions WHERE player_uuid=%s", ("player-race",)
+    )
+
+
+async def test_site_sessions_completion_audit_atomic(store, monkeypatch):
+    # Finding ..423: the completion audit commits in the same transaction as
+    # the mutation (the app.write path). If it fails, the client gets 503 and
+    # the mutation is rolled back, not half-committed.
+    import cpv2.app as app_module
+
+    await _site_sessions_token(store, "site-audit")
+    created = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "audit-keep", "playerUuid": "player-audit"},
+        "site-audit",
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["sessionId"]
+    real_audit = app_module.audit
+
+    async def fail_completed(*args, **kwargs):
+        outcome = args[5] if len(args) > 5 else kwargs.get("outcome")
+        if outcome == "completed":
+            raise psycopg.OperationalError("synthetic completion-audit outage")
+        return await real_audit(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "audit", fail_completed)
+    failed = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "audit-lost", "playerUuid": "player-audit-2"},
+        "site-audit",
+    )
+    assert failed.status_code == 503, failed.text
+    assert not await sql(
+        store,
+        "SELECT 1 FROM site_sessions WHERE player_uuid=%s",
+        ("player-audit-2",),
+    )
+    # The delete routes share the same write wrapper: a failed completion
+    # audit rolls the revoke back, so the row is still there after the 503.
+    gone = await request(
+        store, "DELETE", f"/v2/site/sessions/{sid}", None, "site-audit"
+    )
+    assert gone.status_code == 503, gone.text
+    assert await sql(store, "SELECT 1 FROM site_sessions WHERE id=%s", (sid,))
