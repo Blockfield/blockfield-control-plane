@@ -86,6 +86,9 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     # Workshop AI keys mirror the site `ai` permission: founders only. In no
     # role, so no admin, moderator or service credential can ever hold it.
     "workshop.ai-key",
+    # Site player sessions: the site stores sealed Drasl tokens in CP and can
+    # revoke them; founders keep revocation when the site is unavailable.
+    "site.sessions",
 }
 SERVICE_SCOPES = {
     "agents.events",
@@ -111,6 +114,11 @@ STAFF_SCOPES = {"staff.read", "staff.lower.manage", "staff.admin.manage"}
 # while the token itself stays unbound (see admin.provision). Reads ride the
 # same token without an actor since they need no attribution.
 SITE_SETTINGS_SCOPES = {"settings.read", "settings.gameplay.write"}
+# Site player sessions (coordination#29): sealed Drasl tokens live in CP, the
+# site is a stateless client. Service-only like staff scopes: provisioned
+# solely on a resource="*" credential, never in a human role, so no scoped
+# consumer can mint sessions for another resource.
+SITE_SESSIONS_SCOPES = {"site.sessions"}
 
 
 class Problem(Exception):
@@ -176,11 +184,23 @@ class Identity:
             return False
         if c["kind"] == "service":
             if self.account is None:
-                return scope in SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES
+                return (
+                    scope
+                    in SERVICE_SCOPES
+                    | STAFF_SCOPES
+                    | SITE_SETTINGS_SCOPES
+                    | SITE_SESSIONS_SCOPES
+                )
             # Service-asserted actor (staff/settings writes via the site
             # principal): the service must be provisioned for the scope, and
             # the asserted actor must hold it exactly like a direct caller.
-            if scope not in SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES:
+            if (
+                scope
+                not in SERVICE_SCOPES
+                | STAFF_SCOPES
+                | SITE_SETTINGS_SCOPES
+                | SITE_SESSIONS_SCOPES
+            ):
                 return False
         if self.owner:
             return scope in OWNER_SCOPES

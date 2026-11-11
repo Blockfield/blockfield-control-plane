@@ -616,6 +616,33 @@ def create_app(dsn=None):
             await conn.execute("SELECT pg_notify('cp_events','')")
             return {"revoked": True}
 
+    @app.post("/v2/site/sessions", status_code=201)
+    async def site_session_create(body: models.SiteSessionCreate, request: Request):
+        # The write path commits the completion audit in the same transaction
+        # as the mutation, so a post-commit audit failure rolls the session
+        # back instead of losing its one-time id.
+        return await write(request, core.site_session_create, body)
+
+    @app.get("/v2/site/sessions/{session_id}")
+    async def site_session_read(session_id: str, request: Request):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            result = await core.site_session_read(conn, identity, session_id)
+        if result is None:
+            # Expired (or concurrently revoked): the cleanup above already
+            # committed, so 404 here instead of raising inside the transaction
+            # and rolling it back.
+            raise Problem("session_not_found", 404)
+        return result
+
+    @app.delete("/v2/site/sessions/{session_id}")
+    async def site_session_revoke(session_id: str, request: Request):
+        return await write(request, core.site_session_revoke, session_id)
+
+    @app.delete("/v2/site/users/{player_uuid}/sessions")
+    async def site_sessions_revoke_user(player_uuid: str, request: Request):
+        return await write(request, core.site_sessions_revoke_user, player_uuid)
+
     @app.get("/v2/operations/{operation_id}")
     async def operation(operation_id: UUID, request: Request):
         async with database.transaction() as conn:
