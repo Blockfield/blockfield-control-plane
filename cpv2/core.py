@@ -1499,6 +1499,12 @@ def _js_number(value):
     # [1e-6,1e-4) and [1e16,1e21). -0 serializes as "0" like the site.
     if value == 0:
         return "0"
+    if isinstance(value, int):
+        # Callers may pass JSON integers; the site holds every number as a double.
+        try:
+            value = float(value)
+        except OverflowError:
+            _stat_invalid()
     if not math.isfinite(value):
         _stat_invalid()
     # Below 2**53 an integral double prints its exact digits in both languages;
