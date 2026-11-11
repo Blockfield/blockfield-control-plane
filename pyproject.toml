@@ -21,7 +21,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "test_api.py"]
+testpaths = ["tests"]
 # Fail fast with a stack dump instead of hanging the CI job on a stuck test.
 timeout = 60
 

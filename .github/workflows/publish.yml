@@ -2,7 +2,7 @@ name: publish
 on:
   push:
     branches: [main]
-    paths: [api.py, 'cpv2/**', 'migrations/**', requirements.txt, Dockerfile, .github/workflows/publish.yml]
+    paths: ['cpv2/**', 'migrations/**', requirements.txt, Dockerfile, .github/workflows/publish.yml]
   workflow_dispatch:
 permissions:
   contents: read
