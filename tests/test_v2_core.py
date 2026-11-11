@@ -6955,6 +6955,37 @@ def _stats_u3_campaign_body(event, server, ended, winner, participants):
     }
 
 
+def _stats_c4_campaign_body(event, ended, winner, started="2026-11-11T11:00:00Z"):
+    body = _stats_u3_campaign_body(
+        event,
+        _U3_SERVER,
+        ended,
+        winner,
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                4,
+                1,
+                3,
+                [_stats_u3_class("assault", "0", 30, 1, 3, 5)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                9,
+                6,
+                1,
+                [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+            ),
+        ],
+    )
+    body["startedAt"] = started
+    return body
+
+
 _U3_SERVER = "55555555-5555-4555-8555-555555555555"
 _U3_PA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
 _U3_PB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb2"
@@ -8056,6 +8087,392 @@ async def test_stats_c3_gap_scan_heals_old_path_campaign(store):
     ).json()
     assert player["mmr"]["ratedCampaigns"] == 2
     assert player["ratingsRebuilding"] is False
+
+
+async def test_stats_c4_reenqueue_restarts_for_late_campaign(store, monkeypatch):
+    # Round 4A: a re-enqueue carries its from-point. A late campaign ingested
+    # behind the replay cursor restarts the replay (NULL cursor) so the worker
+    # replays it; a later campaign keeps the cursor. Fail-before: the old bump
+    # kept the cursor and the queue cleared with the late rating missing.
+    from datetime import datetime, timezone
+
+    from cpv2.core import stat_gap_scan
+
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    extra = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999981-9999-4999-8999-999999999999", "2026-11-11T13:00:00Z", "BLUE"
+        ),
+        "stats-u3-producer",
+    )
+    assert extra.status_code == 201, extra.text
+    voided = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+        "admin",
+    )
+    assert voided.status_code == 200, voided.text
+    await drain_once()
+    assert await sql(
+        store,
+        "SELECT last_ended_at IS NOT NULL AS progressed FROM stat_rating_rebuilds",
+    ) == [{"progressed": True}]
+    # A later campaign keeps the cursor: the replay reaches it on its own.
+    later = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999982-9999-4999-8999-999999999999", "2026-11-11T14:00:00Z", "RED"
+        ),
+        "stats-u3-producer",
+    )
+    assert later.status_code == 201, later.text
+    assert await sql(
+        store,
+        "SELECT last_ended_at AT TIME ZONE 'UTC' AS cursor FROM stat_rating_rebuilds",
+    ) == [{"cursor": datetime(2026, 11, 11, 13, 0)}]
+    # The gap scan defers to the progressing replay instead of restarting it.
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        autocommit=True,
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        assert await stat_gap_scan(conn) is None
+    # A late campaign behind the cursor restarts the replay from the start.
+    late = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999983-9999-4999-8999-999999999999", "2026-11-11T11:30:00Z", "RED"
+        ),
+        "stats-u3-producer",
+    )
+    assert late.status_code == 201, late.text
+    assert await sql(
+        store,
+        "SELECT last_ended_at,last_server_id,last_event_id FROM stat_rating_rebuilds",
+    ) == [{"last_ended_at": None, "last_server_id": None, "last_event_id": None}]
+    monkeypatch.undo()
+    await _stats_wait_idle(store)
+    for event in (
+        "99999981-9999-4999-8999-999999999999",
+        "99999982-9999-4999-8999-999999999999",
+        "99999983-9999-4999-8999-999999999999",
+    ):
+        assert await sql(
+            store,
+            "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+            (event,),
+        ) == [{"n": 2}], event
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    # Upsert matrix: new rows start over; a later from-point keeps the cursor;
+    # an earlier one and season start (NULL) restart it.
+    from cpv2.core import _stat_enqueue_rebuild
+
+    utc = timezone.utc
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+
+            async def cursor():
+                row = await (
+                    await conn.execute(
+                        "SELECT last_ended_at,last_server_id,last_event_id"
+                        " FROM stat_rating_rebuilds WHERE season_id='s2'"
+                    )
+                ).fetchone()
+                return (
+                    row["last_ended_at"],
+                    row["last_server_id"],
+                    row["last_event_id"],
+                )
+
+            await _stat_enqueue_rebuild(
+                conn,
+                "s2",
+                _U3_SERVER,
+                "99999981-9999-4999-8999-999999999999",
+                datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+            )
+            assert await cursor() == (None, None, None)
+            await conn.execute(
+                "UPDATE stat_rating_rebuilds SET last_ended_at=%s,last_server_id=%s,last_event_id=%s"
+                " WHERE season_id='s2'",
+                (
+                    datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+                    _U3_SERVER,
+                    "99999981-9999-4999-8999-999999999999",
+                ),
+            )
+            await _stat_enqueue_rebuild(
+                conn,
+                "s2",
+                _U3_SERVER,
+                "99999982-9999-4999-8999-999999999999",
+                datetime(2026, 11, 11, 14, 0, tzinfo=utc),
+            )
+            assert await cursor() == (
+                datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+                _U3_SERVER,
+                "99999981-9999-4999-8999-999999999999",
+            )
+            await _stat_enqueue_rebuild(
+                conn,
+                "s2",
+                _U3_SERVER,
+                "99999983-9999-4999-8999-999999999999",
+                datetime(2026, 11, 11, 11, 30, tzinfo=utc),
+            )
+            assert await cursor() == (None, None, None)
+            await conn.execute(
+                "UPDATE stat_rating_rebuilds SET last_ended_at=%s,last_server_id=%s,last_event_id=%s"
+                " WHERE season_id='s2'",
+                (
+                    datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+                    _U3_SERVER,
+                    "99999981-9999-4999-8999-999999999999",
+                ),
+            )
+            await _stat_enqueue_rebuild(
+                conn, "s2", _U3_SERVER, "99999981-9999-4999-8999-999999999999", None
+            )
+            assert await cursor() == (None, None, None)
+
+
+async def test_stats_c4_earliest_season_first_and_matches_full_replay(
+    store, monkeypatch
+):
+    # Round 4B: the worker serves the earliest queued season first, so an s1
+    # rebuild runs while a mid-replay s2 row waits (its stale cursor resets
+    # when s1 restarts from scratch), and the final ratings equal a full
+    # replay. Fail-before: the old requested_at order served s2 first.
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    first = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999985-9999-4999-8999-999999999999",
+            "2026-09-20T12:00:00Z",
+            "RED",
+            started="2026-09-20T11:00:00Z",
+        ),
+        "stats-u3-producer",
+    )
+    assert first.status_code == 201, first.text
+    for event, hour in (
+        ("99999986-9999-4999-8999-999999999999", "13"),
+        ("99999987-9999-4999-8999-999999999999", "14"),
+    ):
+        created = await request(
+            store,
+            "POST",
+            "/v2/stats/results",
+            _stats_c4_campaign_body(event, f"2026-11-11T{hour}:00:00Z", "BLUE"),
+            "stats-u3-producer",
+        )
+        assert created.status_code == 201, created.text
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+            "admin",
+        )
+    ).status_code == 200
+    await drain_once()
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {
+                "serverId": _U3_SERVER,
+                "eventId": "99999985-9999-4999-8999-999999999999",
+                "voided": True,
+            },
+            "admin",
+        )
+    ).status_code == 200
+    before = await sql(
+        store,
+        "SELECT season_id,requested_at,last_ended_at IS NOT NULL AS progressed"
+        " FROM stat_rating_rebuilds ORDER BY season_id",
+    )
+    assert [(row["season_id"], row["progressed"]) for row in before] == [
+        ("s1", False),
+        ("s2", True),
+    ]
+    s2_requested = next(
+        row["requested_at"] for row in before if row["season_id"] == "s2"
+    )
+    await drain_once()
+    after = await sql(
+        store,
+        "SELECT season_id,requested_at,last_ended_at IS NOT NULL AS progressed"
+        " FROM stat_rating_rebuilds ORDER BY season_id",
+    )
+    assert [(row["season_id"], row["progressed"]) for row in after] == [
+        ("s1", True),
+        ("s2", False),
+    ]
+    assert (
+        next(row["requested_at"] for row in after if row["season_id"] == "s2")
+        == s2_requested
+    )
+    monkeypatch.undo()
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    deadline = time.monotonic() + 30
+    while True:
+        if await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+            {"n": 0}
+        ]:
+            break
+        assert time.monotonic() < deadline, "rating rebuild did not finish"
+        await asyncio.sleep(0.2)
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    season = next(s for s in core.stat_seasons() if s["id"] == "s1")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await core._stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c4_resume_race_aborts_pass(store, monkeypatch):
+    # Own scan hole: a keep-cursor bump landing mid-batch makes the cursor
+    # save miss; the pass aborts (rolling its batch back) so the next pass
+    # replays from the saved cursor instead of rating twice (PK collision).
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    for event, hour in (
+        ("99999991-9999-4999-8999-999999999999", "13"),
+        ("99999992-9999-4999-8999-999999999999", "14"),
+        ("99999993-9999-4999-8999-999999999999", "15"),
+    ):
+        created = await request(
+            store,
+            "POST",
+            "/v2/stats/results",
+            _stats_c4_campaign_body(event, f"2026-11-11T{hour}:00:00Z", "BLUE"),
+            "stats-u3-producer",
+        )
+        assert created.status_code == 201, created.text
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+            "admin",
+        )
+    ).status_code == 200
+    await drain_once()
+    real_rate = core._stat_rate
+
+    async def bumping_rate(conn, clean, ended_ms):
+        await sql(
+            store,
+            "UPDATE stat_rating_rebuilds SET requested_at=now() WHERE season_id='s2'",
+        )
+        return await real_rate(conn, clean, ended_ms)
+
+    monkeypatch.setattr(core, "_stat_rate", bumping_rate)
+    with pytest.raises(core._StatRebuildRace):
+        await drain_once()
+    monkeypatch.undo()
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+    for _ in range(4):
+        await drain_once()
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    for event in (
+        "99999991-9999-4999-8999-999999999999",
+        "99999992-9999-4999-8999-999999999999",
+        "99999993-9999-4999-8999-999999999999",
+    ):
+        assert await sql(
+            store,
+            "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+            (event,),
+        ) == [{"n": 2}], event
 
 
 async def test_stats_read_provision_scopes(store):

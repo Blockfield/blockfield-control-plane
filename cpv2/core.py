@@ -1955,11 +1955,7 @@ async def stat_ingest(conn, identity, attempt, body):
     if _stat_rated(clean):
         season_id = stat_season_at(ended_ms)["id"]
         if await _stat_rebuilding(conn, season_id):
-            await conn.execute(
-                "INSERT INTO stat_rating_rebuilds(season_id,server_id,event_id) VALUES(%s,%s,%s)"
-                " ON CONFLICT(season_id) DO UPDATE SET requested_at=now()",
-                (season_id, server_id, event_id),
-            )
+            await _stat_enqueue_rebuild(conn, season_id, server_id, event_id, ended_at)
         else:
             await _stat_rate(conn, clean, ended_ms)
     return {"inserted": True, "eventId": event_id}
@@ -2414,6 +2410,48 @@ async def stat_backfill_ratings(conn):
 STAT_REBUILD_BATCH = 200
 
 
+async def _stat_enqueue_rebuild(conn, season_id, server_id, event_id, from_at):
+    # Every rebuild enqueue carries its from-point: the triggering campaign's
+    # endedAt, or None for season start (gap scan). A re-enqueue never moves
+    # the cursor forward past unrated work: an earlier from-point restarts the
+    # replay from the season start (NULL cursor), otherwise the in-progress
+    # cursor is kept and the replay reaches the new campaign on its own.
+    # Restart (not resume-from-point) is required: re-rating committed
+    # campaigns collides with the stat_rating_changes primary key, and a
+    # Glicko-2 suffix replay without its prefix state rates wrong.
+    await conn.execute(
+        "INSERT INTO stat_rating_rebuilds(season_id,server_id,event_id) VALUES(%s,%s,%s)"
+        " ON CONFLICT(season_id) DO UPDATE SET server_id=excluded.server_id,"
+        " event_id=excluded.event_id,requested_at=now(),"
+        " last_ended_at=CASE WHEN stat_rating_rebuilds.last_ended_at IS NULL OR %s::timestamptz IS NULL"
+        " OR (%s,%s,%s)<(stat_rating_rebuilds.last_ended_at,stat_rating_rebuilds.last_server_id,stat_rating_rebuilds.last_event_id)"
+        " THEN NULL ELSE stat_rating_rebuilds.last_ended_at END,"
+        " last_server_id=CASE WHEN stat_rating_rebuilds.last_ended_at IS NULL OR %s::timestamptz IS NULL"
+        " OR (%s,%s,%s)<(stat_rating_rebuilds.last_ended_at,stat_rating_rebuilds.last_server_id,stat_rating_rebuilds.last_event_id)"
+        " THEN NULL ELSE stat_rating_rebuilds.last_server_id END,"
+        " last_event_id=CASE WHEN stat_rating_rebuilds.last_ended_at IS NULL OR %s::timestamptz IS NULL"
+        " OR (%s,%s,%s)<(stat_rating_rebuilds.last_ended_at,stat_rating_rebuilds.last_server_id,stat_rating_rebuilds.last_event_id)"
+        " THEN NULL ELSE stat_rating_rebuilds.last_event_id END",
+        (
+            season_id,
+            server_id,
+            event_id,
+            from_at,
+            from_at,
+            server_id,
+            event_id,
+            from_at,
+            from_at,
+            server_id,
+            event_id,
+            from_at,
+            from_at,
+            server_id,
+            event_id,
+        ),
+    )
+
+
 async def _stat_rebuilding(conn, season_id):
     # A rebuild of an earlier season replays every later season too, so any
     # queued season at or before the requested one means stale ratings.
@@ -2440,6 +2478,14 @@ async def _stat_rebuild_batch(conn, season, cursor):
         )
         await conn.execute(
             "DELETE FROM stat_ratings WHERE CAST(substr(season_id,2) AS INTEGER)>=%s",
+            (number,),
+        )
+        # The wipe covers every later season too, so later queued rows restart
+        # as well: resuming one from its stale cursor would skip its already
+        # replayed prefix and miss ratings.
+        await conn.execute(
+            "UPDATE stat_rating_rebuilds SET last_ended_at=NULL,last_server_id=NULL,last_event_id=NULL"
+            " WHERE season_id~'^s[0-9]+$' AND CAST(substr(season_id,2) AS INTEGER)>%s",
             (number,),
         )
     where = (
@@ -2469,16 +2515,32 @@ async def _stat_rebuild_batch(conn, season, cursor):
     return (last["ended_at"], last["server_id"], last["event_id"])
 
 
+class _StatRebuildRace(Exception):
+    """A concurrent enqueue bumped requested_at during a RESUME batch.
+
+    The pass aborts so the next poll replays from the saved cursor instead
+    of rating the committed batch twice (stat_rating_changes PK collision).
+    A batch restarting from NULL needs no abort: its next pass restarts.
+    """
+
+
 async def stat_rebuild_drain(conn):
     # One bounded batch per call, inside the caller's transaction. The queue
     # row is read without locking it, so a concurrent void/ingest enqueue
     # never waits on the replay; the guarded write below turns a concurrent
     # enqueue into another pass instead of losing it. Returns the rebuilt
-    # season id, or None when idle.
+    # season id, or None when idle. The worker always serves the earliest
+    # queued season first: a later season's ratings carry over from the
+    # earlier one, so a later row waits while an earlier replay is pending.
+    # requested_at only guards the writes below: a missed cursor save after
+    # a RESUME batch means a concurrent enqueue, so the pass aborts (rolling
+    # its batch back) instead of committing ratings the next pass would rate
+    # again. A NULL-start batch needs no abort: its next pass restarts anyway.
     row = await one(
         conn,
         "SELECT season_id,requested_at,last_ended_at,last_server_id,last_event_id"
-        " FROM stat_rating_rebuilds ORDER BY requested_at LIMIT 1",
+        " FROM stat_rating_rebuilds ORDER BY CASE WHEN season_id~'^s[0-9]+$'"
+        " THEN CAST(substr(season_id,2) AS INTEGER) ELSE 2147483647 END,requested_at LIMIT 1",
     )
     if row is None:
         return None
@@ -2503,11 +2565,13 @@ async def stat_rebuild_drain(conn):
             (row["season_id"], row["requested_at"]),
         )
     else:
-        await conn.execute(
+        saved = await conn.execute(
             "UPDATE stat_rating_rebuilds SET last_ended_at=%s,last_server_id=%s,last_event_id=%s"
             " WHERE season_id=%s AND requested_at=%s",
             (*advanced, row["season_id"], row["requested_at"]),
         )
+        if saved.rowcount == 0 and cursor != (None, None, None):
+            raise _StatRebuildRace()
     return season["id"]
 
 
@@ -2529,10 +2593,21 @@ async def stat_gap_scan(conn):
     if gap is None:
         return None
     season = stat_season_at(_stat_ms(gap["ended_at"]))
-    await conn.execute(
-        "INSERT INTO stat_rating_rebuilds(season_id,server_id,event_id) VALUES(%s,%s,%s)"
-        " ON CONFLICT(season_id) DO NOTHING",
-        (season["id"], gap["server_id"], gap["event_id"]),
+    busy = await one(
+        conn,
+        "SELECT 1 AS busy FROM stat_rating_rebuilds"
+        " WHERE season_id~'^s[0-9]+$' AND CAST(substr(season_id,2) AS INTEGER)<=%s"
+        " AND last_ended_at IS NOT NULL",
+        (int(season["id"][1:]),),
+    )
+    if busy is not None:
+        # An earlier-or-equal replay is already progressing: it covers the gap
+        # when committed before its cursor passes, and a later scan heals the
+        # rest. Enqueuing here would restart the in-flight replay, so the
+        # periodic scan would churn replays longer than its own interval.
+        return None
+    await _stat_enqueue_rebuild(
+        conn, season["id"], gap["server_id"], gap["event_id"], None
     )
     return season["id"]
 
@@ -2918,8 +2993,8 @@ async def stat_void(conn, identity, attempt, model):
     # replays its season and every later season from scratch, which also folds
     # in any earlier late results — the site setVoided contract. The replay
     # must not run inside the 10 s request, nor may the request wait on it:
-    # it only commits the void row and enqueues the season (cursor reset for
-    # a full replay, no rating lock), and the background loop replays it in
+    # it only commits the void row and enqueues the season (cursor restarts
+    # only when the voided campaign sits behind it, no rating lock), and the background loop replays it in
     # bounded batches; reads report ratingsRebuilding until it lands.
     identity.require("stats.void", "prod", "game", "*")
     server_id, event_id = str(model.serverId), str(model.eventId)
@@ -2960,13 +3035,8 @@ async def stat_void(conn, identity, attempt, model):
         and match["reason"] in ("completed", "draw")
     ):
         season = stat_season_at(_stat_ms(match["ended_at"]))
-        await conn.execute(
-            "INSERT INTO stat_rating_rebuilds(season_id,server_id,event_id,requested_at,last_ended_at,last_server_id,last_event_id)"
-            " VALUES(%s,%s,%s,now(),NULL,NULL,NULL)"
-            " ON CONFLICT(season_id) DO UPDATE SET server_id=excluded.server_id,"
-            " event_id=excluded.event_id,requested_at=now(),"
-            " last_ended_at=NULL,last_server_id=NULL,last_event_id=NULL",
-            (season["id"], server_id, event_id),
+        await _stat_enqueue_rebuild(
+            conn, season["id"], server_id, event_id, match["ended_at"]
         )
         rebuilt = season["id"]
     return {
