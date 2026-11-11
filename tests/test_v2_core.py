@@ -1,15 +1,18 @@
 """Real PostgreSQL + ASGI tests; no production services or executor effects."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
 import random
+import secrets
 import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -25,7 +28,6 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
 from webauthn.helpers import bytes_to_base64url
 
-import api
 from cpv2 import app as cpv2_app
 from cpv2 import core, delivery
 from cpv2.admin import (
@@ -48,6 +50,125 @@ from cpv2.auth import (
 from cpv2.db import migrate, one
 from cpv2.legacy import import_u1
 from cpv2.settings import canonical, digest
+
+# Frozen U1 fixture builder (replaces the deleted api.py): creates the same
+# legacy SQLite tables the v2 import path reads, with no U1 server code.
+_U1_DDL = """
+CREATE TABLE IF NOT EXISTS tokens(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+  verifier_hash TEXT NOT NULL, scopes TEXT NOT NULL,
+  created_at INTEGER NOT NULL, expires_at INTEGER,
+  revoked_at INTEGER, last_used_at INTEGER);
+CREATE TABLE IF NOT EXISTS gate_state(
+  revision INTEGER NOT NULL, mode TEXT NOT NULL,
+  message TEXT NOT NULL, since INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS gate_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL, revision INTEGER NOT NULL,
+  mode TEXT NOT NULL, message TEXT NOT NULL,
+  actor_id TEXT NOT NULL, actor_role TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS audit(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL,
+  actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
+"""
+
+
+def _u1_now_ms():
+    return int(time.time() * 1000)
+
+
+def _u1_derive_token(secret, name):
+    raw = hashlib.sha256(secret.encode() + b"\n" + name.encode()).digest()
+    return "cp_" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+class _U1:
+    """Minimal legacy-DB writer: bootstrap + one gate write, same rows as U1."""
+
+    def __init__(self, path):
+        self.db = sqlite3.connect(str(path))
+        self.db.executescript(_U1_DDL)
+        if self.db.execute("SELECT COUNT(*) FROM gate_state").fetchone()[0] == 0:
+            t = _u1_now_ms()
+            self.db.execute("INSERT INTO gate_state VALUES (0,'open','',?,?)", (t, t))
+        self.db.commit()
+
+    def bootstrap(self, secret):
+        if self.db.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]:
+            return {}
+        seeds = {"proxy": "gate:read", "site": "gate:read,gate:write"}
+        out, t = {}, _u1_now_ms()
+        for name, scopes in seeds.items():
+            token = _u1_derive_token(secret, name)
+            self.db.execute(
+                "INSERT INTO tokens VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    secrets.token_hex(8),
+                    name,
+                    hashlib.sha256(token.encode()).hexdigest(),
+                    scopes,
+                    t,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            out[name] = token
+        self.db.commit()
+        return out
+
+    def set_gate(self, mode, message, actor_id, actor_role, expected, key):
+        message = message.strip()[:500]
+        rev, cur, _, since, _ = self.db.execute("SELECT * FROM gate_state").fetchone()
+        if expected != rev:
+            raise ValueError(f"revision conflict: have {rev}")
+        t, op, new_rev = _u1_now_ms(), secrets.token_hex(12), rev + 1
+        self.db.execute(
+            "INSERT INTO gate_log(operation_id,idempotency_key,revision,mode,"
+            "message,actor_id,actor_role,at) VALUES (?,?,?,?,?,?,?,?)",
+            (op, key, new_rev, mode, message, actor_id, actor_role, t),
+        )
+        self.db.execute(
+            "UPDATE gate_state SET revision=?,mode=?,message=?,since=?,updated_at=?",
+            (new_rev, mode, message, t if mode != cur else since, t),
+        )
+        self.db.execute(
+            "INSERT INTO audit(at,actor,action,detail) VALUES (?,?,?,?)",
+            (
+                t,
+                actor_id + ":" + actor_role,
+                "gate:set",
+                json.dumps({"revision": new_rev, "mode": mode})[:500],
+            ),
+        )
+        self.db.commit()
+        return {"operationId": op, "revision": new_rev}
+
+    def gate(self):
+        rev, mode, message, since, _ = self.db.execute(
+            "SELECT * FROM gate_state"
+        ).fetchone()
+        return {
+            "schema": 1,
+            "revision": rev,
+            "mode": mode,
+            "message": message,
+            "since": since,
+            "observedAt": _u1_now_ms(),
+        }
+
+
+def _docker_default_runs_cpv2():
+    root = Path(__file__).resolve().parents[1] / "Dockerfile"
+    text = root.read_text()
+    assert 'CMD ["python", "-m", "cpv2"]' in text, (
+        "image default must be python -m cpv2"
+    )
+    assert "api.py" not in text, "U1 api.py must not ship in the image"
+
+
+def test_docker_default_runs_cpv2():
+    _docker_default_runs_cpv2()
 
 
 @pytest.fixture(scope="session")
@@ -1501,7 +1622,7 @@ async def test_import_preserves_counts_hashes_gate_revision_and_read_only_tokens
     store, tmp_path
 ):
     path = tmp_path / "u1.sqlite"
-    legacy = api.Store(str(path))
+    legacy = _U1(str(path))
     tokens = legacy.bootstrap("legacy-test")
     legacy.set_gate("maintenance", "migration", "forwarded-owner", "owner", 0, "one")
     legacy.db.close()
@@ -2105,7 +2226,7 @@ async def test_c3_factual_effect_receipts_survive_later_policy_changes(
 @pytest.mark.parametrize("revision", [0, 1])
 async def test_c3_imported_gate_is_in_the_consumer_snapshot(store, tmp_path, revision):
     path = tmp_path / "imported-gate.sqlite"
-    legacy = api.Store(str(path))
+    legacy = _U1(str(path))
     if revision:
         legacy.set_gate(
             "maintenance", "imported gate", "legacy-admin", "admin", 0, "legacy-change"
@@ -2143,7 +2264,7 @@ async def test_c3_gate_initialization_is_explicit_at_imported_revision_zero(
         await request(store, "GET", "/v1/gate", role="game-agent")
     ).status_code == 503
     path = tmp_path / "revision-zero.sqlite"
-    legacy = api.Store(str(path))
+    legacy = _U1(str(path))
     legacy.db.execute("UPDATE gate_state SET mode='maintenance'")
     legacy.db.commit()
     legacy.db.close()
@@ -2497,7 +2618,7 @@ async def test_c7_scoped_consumer_receives_global_settings_and_snapshot(store):
 async def test_c7_scoped_consumer_gets_imported_global_gate(store, tmp_path):
     await arena_agent(store)
     path = tmp_path / "arena-gate.sqlite"
-    legacy = api.Store(str(path))
+    legacy = _U1(str(path))
     legacy.db.execute("UPDATE gate_state SET mode='maintenance'")
     legacy.db.commit()
     expected = legacy.gate()
@@ -2722,7 +2843,7 @@ async def test_c8_gate_fallback_never_leaks_across_environments(store, tmp_path)
     )
     store["tokens"]["qa-agent"] = token
     path = tmp_path / "qa-gate.sqlite"
-    legacy = api.Store(str(path))
+    legacy = _U1(str(path))
     legacy.db.execute("UPDATE gate_state SET mode='maintenance'")
     legacy.db.commit()
     legacy.db.close()
@@ -3476,7 +3597,7 @@ async def test_c12_import_refuses_a_first_write_committed_during_probe(
     store, tmp_path, monkeypatch
 ):
     path = tmp_path / "u1.sqlite"
-    legacy = api.Store(str(path))
+    legacy = _U1(str(path))
     legacy.bootstrap("legacy-test")
     legacy.set_gate("maintenance", "migration", "forwarded-owner", "owner", 0, "one")
     legacy.db.close()

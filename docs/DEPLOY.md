@@ -18,8 +18,7 @@ registry). Канал `:main` (его двигает `publish.yml` на кажд
    все задачи служат его, окно мониторинга swarm закрыто.
    Несоответствие running digest релизному валит job.
 3. Проверка после деплоя: та же, что внутри скрипта, плюс `GET /v1/gate` из приватной
-   сети отвечает со state, который был до деплоя (SQLite на volume `bf-control-state`
-   пережил редеплой).
+   сети отвечает со state, который был до деплоя (PostgreSQL пережил редеплой).
 
 ## Откат
 
@@ -43,9 +42,8 @@ API-ключа Dokploy в Actions нет: деплой идёт через webho
 
 ## Health probe and lease policy (CP-H5, issue #5)
 
-Probe: unauthenticated `GET /health` on the CP port. U1 and v2 share the
-contract - `200 status-ok` when the store answers (v2 also requires the owner
-bootstrap), `503` when not, plus the `schema` marker. It never returns gate
+Probe: unauthenticated `GET /health` on the CP port. `200 status-ok` when the store
+answers (requires the owner bootstrap), `503` when not, plus the `schema` marker. It never returns gate
 state, errors or credentials, and the image carries a `HEALTHCHECK` on it.
 Suggested Dokploy check: `GET /health` expecting 200 (the owner wires it in
 Dokploy; no unit touches prod).
