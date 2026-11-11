@@ -1327,3 +1327,67 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
             },
         },
     )
+
+
+# Site player sessions (coordination#29 U1): sealed Drasl tokens live in CP,
+# the site is a stateless client. Mirrors site `account.ts` caps: 20 sessions
+# per player, 60-day idle expiry, pruning on create.
+SITE_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
+SITE_SESSION_USER_CAP = 20
+SITE_SESSION_MAX_AGE = timedelta(days=60)
+
+
+async def site_session_create(conn, identity, model):
+    identity.require("site.sessions", "prod", "game", "*")
+    sid = secrets.token_hex(16)
+    await conn.execute(
+        "INSERT INTO site_sessions(id,sealed_token,player_uuid) VALUES(%s,%s,%s)",
+        (sid, model.sealedToken, model.playerUuid),
+    )
+    cutoff = now() - SITE_SESSION_MAX_AGE
+    await conn.execute("DELETE FROM site_sessions WHERE last_seen<%s", (cutoff,))
+    await conn.execute(
+        "DELETE FROM site_sessions WHERE player_uuid=%s AND id NOT IN "
+        "(SELECT id FROM site_sessions WHERE player_uuid=%s "
+        "ORDER BY created_at DESC, id DESC LIMIT %s)",
+        (model.playerUuid, model.playerUuid, SITE_SESSION_USER_CAP),
+    )
+    return {"sessionId": sid}
+
+
+async def site_session_read(conn, identity, session_id):
+    identity.require("site.sessions", "prod", "game", "*")
+    if not SITE_SESSION_ID.fullmatch(session_id or ""):
+        raise Problem("session_not_found", 404)
+    row = await one(
+        conn,
+        "SELECT sealed_token, player_uuid, last_seen FROM site_sessions WHERE id=%s",
+        (session_id,),
+    )
+    if not row:
+        raise Problem("session_not_found", 404)
+    if row["last_seen"] <= now() - SITE_SESSION_MAX_AGE:
+        await conn.execute("DELETE FROM site_sessions WHERE id=%s", (session_id,))
+        raise Problem("session_not_found", 404)
+    await conn.execute(
+        "UPDATE site_sessions SET last_seen=now() WHERE id=%s", (session_id,)
+    )
+    return {"sealedToken": row["sealed_token"], "playerUuid": row["player_uuid"]}
+
+
+async def site_session_revoke(conn, identity, session_id):
+    identity.require("site.sessions", "prod", "game", "*")
+    if not SITE_SESSION_ID.fullmatch(session_id or ""):
+        raise Problem("session_not_found", 404)
+    deleted = await conn.execute("DELETE FROM site_sessions WHERE id=%s", (session_id,))
+    return {"revoked": deleted.rowcount > 0}
+
+
+async def site_sessions_revoke_user(conn, identity, player_uuid):
+    identity.require("site.sessions", "prod", "game", "*")
+    if not isinstance(player_uuid, str) or not 1 <= len(player_uuid) <= 128:
+        raise Problem("invalid_player", 422)
+    deleted = await conn.execute(
+        "DELETE FROM site_sessions WHERE player_uuid=%s", (player_uuid,)
+    )
+    return {"revoked": deleted.rowcount}

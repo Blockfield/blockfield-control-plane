@@ -70,8 +70,11 @@ async def rows(conn, query, args=()):
 
 
 async def migrate(dsn, expected_database):
-    source = (ROOT / "migrations/001_core.sql").read_bytes()
-    checksum = hashlib.sha256(source).hexdigest()
+    migrations = ["001_core.sql", "002_site_sessions.sql"]
+    checksums = {
+        name: hashlib.sha256((ROOT / "migrations" / name).read_bytes()).hexdigest()
+        for name in migrations
+    }
     async with await psycopg.AsyncConnection.connect(dsn, row_factory=dict_row) as conn:
         actual = await one(conn, "SELECT current_database() AS name")
         if actual["name"] != expected_database:
@@ -83,15 +86,30 @@ async def migrate(dsn, expected_database):
             conn, "SELECT to_regclass('control.schema_migrations') AS name"
         )
         if exists["name"]:
-            record = await one(
-                conn, "SELECT checksum FROM control.schema_migrations WHERE version=1"
-            )
-            if not record or record["checksum"] != checksum:
-                raise RuntimeError("migration checksum mismatch")
+            for version, name in enumerate(migrations, start=1):
+                record = await one(
+                    conn,
+                    "SELECT checksum FROM control.schema_migrations WHERE version=%s",
+                    (version,),
+                )
+                if record:
+                    if record["checksum"] != checksums[name]:
+                        raise RuntimeError("migration checksum mismatch")
+                    continue
+                await conn.execute(
+                    (ROOT / "migrations" / name).read_bytes().decode(), prepare=False
+                )
+                await conn.execute(
+                    "INSERT INTO control.schema_migrations VALUES(%s,%s)",
+                    (version, checksums[name]),
+                )
             return
-        await conn.execute(source.decode(), prepare=False)
         await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(1,%s)", (checksum,)
+            (ROOT / "migrations/001_core.sql").read_bytes().decode(), prepare=False
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(1,%s)",
+            (checksums["001_core.sql"],),
         )
         from cpv2.settings import DEFINITIONS
         from psycopg.types.json import Jsonb
@@ -110,3 +128,11 @@ async def migrate(dsn, expected_database):
                     definition.sensitivity,
                 ),
             )
+        await conn.execute(
+            (ROOT / "migrations/002_site_sessions.sql").read_bytes().decode(),
+            prepare=False,
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(2,%s)",
+            (checksums["002_site_sessions.sql"],),
+        )

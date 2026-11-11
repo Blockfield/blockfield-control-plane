@@ -616,6 +616,30 @@ def create_app(dsn=None):
             await conn.execute("SELECT pg_notify('cp_events','')")
             return {"revoked": True}
 
+    @app.post("/v2/site/sessions", status_code=201)
+    async def site_session_create(body: models.SiteSessionCreate, request: Request):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            return await core.site_session_create(conn, identity, body)
+
+    @app.get("/v2/site/sessions/{session_id}")
+    async def site_session_read(session_id: str, request: Request):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            return await core.site_session_read(conn, identity, session_id)
+
+    @app.delete("/v2/site/sessions/{session_id}")
+    async def site_session_revoke(session_id: str, request: Request):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            return await core.site_session_revoke(conn, identity, session_id)
+
+    @app.delete("/v2/site/users/{player_uuid}/sessions")
+    async def site_sessions_revoke_user(player_uuid: str, request: Request):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            return await core.site_sessions_revoke_user(conn, identity, player_uuid)
+
     @app.get("/v2/operations/{operation_id}")
     async def operation(operation_id: UUID, request: Request):
         async with database.transaction() as conn:

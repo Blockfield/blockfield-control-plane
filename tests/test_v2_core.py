@@ -5858,3 +5858,190 @@ async def test_cpp1r2_service_workshop_op_fenced_at_delivery(store):
     frame = next(item for item in frames if item["operationId"] == operation_id)
     assert not frame["executable"]
     assert frame["payload"] is None
+
+
+async def _site_sessions_token(store, cid="site-sessions"):
+    if cid not in store["tokens"]:
+        store["tokens"][cid] = await provision(
+            store["admin"],
+            {
+                "client": {"id": cid, "via": "game", "ceiling": ["site.sessions"]},
+                "ceiling": ["site.sessions"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+    return store["tokens"][cid]
+
+
+async def test_site_sessions_provision_requires_unbound_credential(store):
+    from cpv2.auth import SERVICE_SCOPES, SITE_SESSIONS_SCOPES
+
+    assert not SITE_SESSIONS_SCOPES & SERVICE_SCOPES
+    with pytest.raises(ValueError, match="unbound site credential"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "bound-sessions",
+                    "via": "game",
+                    "ceiling": ["site.sessions"],
+                },
+                "ceiling": ["site.sessions"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "arena",
+            },
+        )
+    with pytest.raises(ValueError, match="service credential ceiling"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "human-sessions",
+                    "via": "game",
+                    "ceiling": ["site.sessions"],
+                    "human": True,
+                },
+                "ceiling": ["site.sessions"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+
+
+async def test_site_sessions_crud_and_revoke_all(store):
+    await _site_sessions_token(store)
+    created = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "sealed-one", "playerUuid": "player-1"},
+        "site-sessions",
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["sessionId"]
+    assert len(sid) == 32 and all(c in "0123456789abcdef" for c in sid)
+    fetched = await request(
+        store, "GET", f"/v2/site/sessions/{sid}", None, "site-sessions"
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json() == {"sealedToken": "sealed-one", "playerUuid": "player-1"}
+    second = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "sealed-two", "playerUuid": "player-1"},
+        "site-sessions",
+    )
+    assert second.status_code == 201, second.text
+    revoked_all = await request(
+        store,
+        "DELETE",
+        "/v2/site/users/player-1/sessions",
+        None,
+        "site-sessions",
+    )
+    assert revoked_all.status_code == 200, revoked_all.text
+    assert revoked_all.json()["revoked"] == 2
+    assert (
+        await request(store, "GET", f"/v2/site/sessions/{sid}", None, "site-sessions")
+    ).status_code == 404
+    single = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "sealed-three", "playerUuid": "player-1"},
+        "site-sessions",
+    )
+    one_id = single.json()["sessionId"]
+    first_delete = await request(
+        store, "DELETE", f"/v2/site/sessions/{one_id}", None, "site-sessions"
+    )
+    assert first_delete.json() == {"revoked": True}
+    second_delete = await request(
+        store, "DELETE", f"/v2/site/sessions/{one_id}", None, "site-sessions"
+    )
+    assert second_delete.json() == {"revoked": False}
+
+
+async def test_site_sessions_rbac(store):
+    await _site_sessions_token(store)
+    body = {"sealedToken": "tok", "playerUuid": "player-rbac"}
+    for role in ("ordinary", "builder", "moderator", "admin", "game-agent"):
+        response = await request(store, "POST", "/v2/site/sessions", body, role)
+        assert response.status_code == 403, (role, response.text)
+    assert (
+        await request(store, "POST", "/v2/site/sessions", body, "owner")
+    ).status_code == 201
+    created = await request(store, "POST", "/v2/site/sessions", body, "site-sessions")
+    sid = created.json()["sessionId"]
+    for role in ("ordinary", "admin"):
+        assert (
+            await request(store, "GET", f"/v2/site/sessions/{sid}", None, role)
+        ).status_code == 403
+    assert (
+        await request(store, "GET", f"/v2/site/sessions/{sid}", None, "owner")
+    ).status_code == 200
+    assert (await request(store, "GET", f"/v2/site/sessions/{sid}")).status_code == 401
+
+
+async def test_site_sessions_caps_and_expiry(store):
+    await _site_sessions_token(store, "site-caps")
+    ids = []
+    for index in range(21):
+        response = await request(
+            store,
+            "POST",
+            "/v2/site/sessions",
+            {"sealedToken": f"tok-{index}", "playerUuid": "player-caps"},
+            "site-caps",
+        )
+        assert response.status_code == 201, response.text
+        ids.append(response.json()["sessionId"])
+    rows = await sql(
+        store,
+        "SELECT count(*) AS n FROM site_sessions WHERE player_uuid=%s",
+        ("player-caps",),
+    )
+    assert rows[0]["n"] == 20
+    assert (
+        await request(store, "GET", f"/v2/site/sessions/{ids[0]}", None, "site-caps")
+    ).status_code == 404
+    stale = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "stale", "playerUuid": "player-stale"},
+        "site-caps",
+    )
+    stale_id = stale.json()["sessionId"]
+    await sql(
+        store,
+        "UPDATE site_sessions SET last_seen=now()-interval '61 days' WHERE id=%s",
+        (stale_id,),
+    )
+    assert (
+        await request(store, "GET", f"/v2/site/sessions/{stale_id}", None, "site-caps")
+    ).status_code == 404
+    assert not await sql(store, "SELECT 1 FROM site_sessions WHERE id=%s", (stale_id,))
+
+
+async def test_site_sessions_validation(store):
+    await _site_sessions_token(store, "site-valid")
+    bad = await request(
+        store,
+        "POST",
+        "/v2/site/sessions",
+        {"sealedToken": "", "playerUuid": "p"},
+        "site-valid",
+    )
+    assert bad.status_code == 422, bad.text
+    assert (
+        await request(store, "GET", "/v2/site/sessions/not-hex", None, "site-valid")
+    ).status_code == 404
+    assert (
+        await request(store, "DELETE", "/v2/site/sessions/not-hex", None, "site-valid")
+    ).status_code == 404
