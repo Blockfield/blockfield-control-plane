@@ -8399,9 +8399,12 @@ async def test_stats_c4_earliest_season_first_and_matches_full_replay(
 
 
 async def test_stats_c4_resume_race_aborts_pass(store, monkeypatch):
-    # Own scan hole: a keep-cursor bump landing mid-batch makes the cursor
-    # save miss; the pass aborts (rolling its batch back) so the next pass
-    # replays from the saved cursor instead of rating twice (PK collision).
+    # Round 4 scenario, round-5 mechanism: a reset landing between a batch's
+    # read and its commit bumps generation, so the guarded write misses and
+    # the batch rolls back to its savepoint (no raise): the pass drops its
+    # work instead of committing ratings the next pass would rate twice
+    # (stat_rating_changes PK collision). Fail-before: the old
+    # requested_at guard raised _StatRebuildRace here.
     monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
     real_drain = core.stat_rebuild_drain
 
@@ -8444,17 +8447,49 @@ async def test_stats_c4_resume_race_aborts_pass(store, monkeypatch):
     ).status_code == 200
     await drain_once()
     real_rate = core._stat_rate
+    reset_done = False
 
-    async def bumping_rate(conn, clean, ended_ms):
-        await sql(
-            store,
-            "UPDATE stat_rating_rebuilds SET requested_at=now() WHERE season_id='s2'",
-        )
+    async def resetting_rate(conn, clean, ended_ms):
+        nonlocal reset_done
+        if not reset_done:
+            reset_done = True
+            async with await psycopg.AsyncConnection.connect(
+                store["admin"],
+                options="-c search_path=control,pg_catalog",
+                row_factory=psycopg.rows.dict_row,
+            ) as reset_conn:
+                async with reset_conn.transaction():
+                    # A reset behind the cursor lands mid-batch: it restarts
+                    # the replay and bumps generation via the real path.
+                    from datetime import datetime, timezone
+
+                    await core._stat_enqueue_rebuild(
+                        reset_conn,
+                        "s2",
+                        _U3_SERVER,
+                        _U3_C1,
+                        datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc),
+                    )
         return await real_rate(conn, clean, ended_ms)
 
-    monkeypatch.setattr(core, "_stat_rate", bumping_rate)
-    with pytest.raises(core._StatRebuildRace):
-        await drain_once()
+    monkeypatch.setattr(core, "_stat_rate", resetting_rate)
+    before = await sql(
+        store, "SELECT generation FROM stat_rating_rebuilds WHERE season_id='s2'"
+    )
+    await drain_once()
+    assert reset_done
+    # No raise: the batch rolled back, so its campaign has no ratings, and
+    # the queue row kept the reset (NULL cursor, bumped generation).
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        ("99999992-9999-4999-8999-999999999999",),
+    ) == [{"n": 0}]
+    after = await sql(
+        store,
+        "SELECT generation,last_ended_at FROM stat_rating_rebuilds WHERE season_id='s2'",
+    )
+    assert after == [{"generation": before[0]["generation"] + 1, "last_ended_at": None}]
     monkeypatch.undo()
     monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
     monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
@@ -8473,6 +8508,169 @@ async def test_stats_c4_resume_race_aborts_pass(store, monkeypatch):
             "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
             (event,),
         ) == [{"n": 2}], event
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    season = next(s for s in core.stat_seasons() if s["id"] == "s2")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await core._stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c5_equal_cursor_void_restarts_replay(store, monkeypatch):
+    # Round 5 / bot 4544506235: a re-enqueue whose from-point EQUALS the
+    # cursor restarts the replay (<=), so voiding exactly the last replayed
+    # campaign re-rates it away. Fail-before: strict < kept the cursor, the
+    # next batch selected >(cursor) = nothing, and the voided campaign kept
+    # its rating forever.
+    from datetime import datetime
+
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    for event, hour in (
+        ("99999961-9999-4999-8999-999999999999", "13"),
+        ("99999962-9999-4999-8999-999999999999", "14"),
+    ):
+        created = await request(
+            store,
+            "POST",
+            "/v2/stats/results",
+            _stats_c4_campaign_body(event, f"2026-11-11T{hour}:00:00Z", "BLUE"),
+            "stats-u3-producer",
+        )
+        assert created.status_code == 201, created.text
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+            "admin",
+        )
+    ).status_code == 200
+    await drain_once()
+    assert await sql(
+        store,
+        "SELECT last_ended_at AT TIME ZONE 'UTC' AS cursor,last_server_id,last_event_id"
+        " FROM stat_rating_rebuilds WHERE season_id='s2'",
+    ) == [
+        {
+            "cursor": datetime(2026, 11, 11, 14, 0),
+            "last_server_id": _U3_SERVER,
+            "last_event_id": "99999962-9999-4999-8999-999999999999",
+        }
+    ]
+    # Void exactly the cursor campaign: the cursor must restart, not stick.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {
+                "serverId": _U3_SERVER,
+                "eventId": "99999962-9999-4999-8999-999999999999",
+                "voided": True,
+            },
+            "admin",
+        )
+    ).status_code == 200
+    assert await sql(
+        store,
+        "SELECT last_ended_at,last_server_id,last_event_id FROM stat_rating_rebuilds WHERE season_id='s2'",
+    ) == [{"last_ended_at": None, "last_server_id": None, "last_event_id": None}]
+    monkeypatch.undo()
+    await _stats_wait_idle(store)
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        ("99999962-9999-4999-8999-999999999999",),
+    ) == [{"n": 0}]
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        ("99999961-9999-4999-8999-999999999999",),
+    ) == [{"n": 2}]
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    season = next(s for s in core.stat_seasons() if s["id"] == "s2")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await core._stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c5_single_worker_lock_excludes_second_replica(store):
+    # Round 5 / bot 4544506243: exactly one rebuild worker runs across CP
+    # replicas. The loop holds _stat_try_worker_lock for its whole life, so
+    # while it runs a second replica's try-lock fails instead of replaying
+    # concurrently from a stale cursor.
+    from cpv2.core import _stat_try_worker_lock
+
+    async def open_conn():
+        return await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        )
+
+    probe = await open_conn()
+    second = await open_conn()
+    try:
+        deadline = time.monotonic() + 15
+        while await _stat_try_worker_lock(probe):
+            # We beat the app worker to the lock: hand it back and wait
+            # until it holds the lock for its whole life.
+            await probe.execute(
+                "SELECT pg_advisory_unlock(hashtext('stats-rebuild-worker'),1)"
+            )
+            assert time.monotonic() < deadline, "app worker never took the lock"
+            await asyncio.sleep(0.05)
+        assert await _stat_try_worker_lock(second) is False
+    finally:
+        await probe.close()
+        await second.close()
 
 
 async def test_stats_read_provision_scopes(store):
