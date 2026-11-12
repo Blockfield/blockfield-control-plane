@@ -7834,6 +7834,8 @@ async def test_stats_migration_005_backfills_pre_005_results(store):
         await conn.execute("DROP TABLE control.stat_result_voids")
         await conn.execute("DROP TABLE control.stat_rating_changes")
         await conn.execute("DROP TABLE control.stat_ratings")
+        await conn.execute("DROP TABLE control.stat_events")
+        await conn.execute("DROP TABLE control.stat_samples")
         await conn.execute("DELETE FROM control.schema_migrations WHERE version>=5")
     await migrate(store["admin"], dbname)
     assert await sql(store, ratings_query) == before
