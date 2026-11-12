@@ -2111,7 +2111,9 @@ def _diag_line(value, limit):
 
 def _diag_validate(body, now_ms):
     _diag_require(isinstance(body, dict))
-    _diag_require(type(body.get("schemaVersion")) is int and body.get("schemaVersion") == 1)
+    _diag_require(
+        type(body.get("schemaVersion")) is int and body.get("schemaVersion") == 1
+    )
     server_id = body.get("serverId")
     _diag_require(isinstance(server_id, str) and STAT_UUID.match(server_id))
     samples, events = body.get("samples", []), body.get("events", [])
@@ -2126,7 +2128,11 @@ def _diag_validate(body, now_ms):
             "msptP95": _diag_number(entry.get("msptP95"), 0, 3600000),
             "msptMax": _diag_number(entry.get("msptMax"), 0, 3600000),
         }
-        _diag_require(numbers["tps"] is not None and numbers["msptAvg"] is not None and numbers["msptMax"] is not None)
+        _diag_require(
+            numbers["tps"] is not None
+            and numbers["msptAvg"] is not None
+            and numbers["msptMax"] is not None
+        )
         if numbers["msptP95"] is None and entry.get("msptP95") is not None:
             _diag_invalid()
         for name, limit in (
@@ -2217,7 +2223,9 @@ async def stat_diag_ingest(conn, identity, attempt, body):
                 sample["heapUsedMb"],
                 sample["heapMaxMb"],
                 sample["gcPauseMs"],
-                _diag_ts(clean["startedAt"]) if clean["startedAt"] is not None else None,
+                _diag_ts(clean["startedAt"])
+                if clean["startedAt"] is not None
+                else None,
             ),
         )
     for event in clean["events"]:
@@ -2289,7 +2297,9 @@ async def stat_diag_read(conn, hours=24, now_ms=None):
             "heapUsedMb": row["heapUsedMb"],
             "heapMaxMb": row["heapMaxMb"],
             "gcPauseMs": row["gcPauseMs"],
-            "startedAt": _diag_ms(row["startedAt"]) if row["startedAt"] is not None else None,
+            "startedAt": _diag_ms(row["startedAt"])
+            if row["startedAt"] is not None
+            else None,
         }
         for row in sample_rows
     ]
@@ -2314,6 +2324,8 @@ async def stat_diag_read(conn, hours=24, now_ms=None):
         "samples": samples,
         "events": events,
     }
+
+
 # (`src/lib/stats.ts` seasons/filters/leaderboard/player/hitreg/rate at the
 # site ref in .dev/u-sitedb-u3): same filter/sort/rank semantics, same
 # Glicko-2, same per-season replay rule. Ratings are never recomputed in two

@@ -22,7 +22,10 @@ _health_clock = time.monotonic
 # Mutation body caps by path. Everything else stays at 32 KiB; the stats
 # ingest route honors the producer outbox contract (1 MiB/event, same as the
 # site MAX_BODY) so a full 512-player result is never a 413.
-BODY_LIMITS = {"/v2/stats/results": core.STAT_MAX_BODY, "/v2/stats/diagnostics": core.DIAG_MAX_BODY}
+BODY_LIMITS = {
+    "/v2/stats/results": core.STAT_MAX_BODY,
+    "/v2/stats/diagnostics": core.DIAG_MAX_BODY,
+}
 
 
 class Limits:

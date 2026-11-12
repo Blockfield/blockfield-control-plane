@@ -9003,13 +9003,21 @@ async def test_stats_diag_ingest_roundtrip_idempotent_and_redacted(store):
     created = await request(store, "POST", "/v2/stats/diagnostics", body, "stats-diag")
     assert created.status_code == 200, created.text
     assert created.json() == {"samples": 1, "events": 1}
-    samples = await sql(store, "SELECT tps,mspt_p95,players,started_at FROM stat_samples")
+    samples = await sql(
+        store, "SELECT tps,mspt_p95,players,started_at FROM stat_samples"
+    )
     assert len(samples) == 1
     assert samples[0]["tps"] == 19.5
-    stored = await sql(store, "SELECT kind,duration_ms,source,message,repeats FROM stat_events")
+    stored = await sql(
+        store, "SELECT kind,duration_ms,source,message,repeats FROM stat_events"
+    )
     assert len(stored) == 1
     assert stored[0]["message"] == "tick stuck, see [url]", stored
-    assert (stored[0]["kind"], stored[0]["duration_ms"], stored[0]["repeats"]) == ("freeze", 3400, 2)
+    assert (stored[0]["kind"], stored[0]["duration_ms"], stored[0]["repeats"]) == (
+        "freeze",
+        3400,
+        2,
+    )
     replayed = await request(store, "POST", "/v2/stats/diagnostics", body, "stats-diag")
     assert replayed.status_code == 200, replayed.text
     assert replayed.json() == {"samples": 1, "events": 1}
@@ -9027,16 +9035,34 @@ async def test_stats_diag_ingest_validation(store):
         {"samples": "nope"},
         {"samples": [{"at": now_ms}] * 121},
         {"samples": [{"at": now_ms, "tps": -1, "msptAvg": 1, "msptMax": 1}]},
-        {"samples": [{"at": now_ms, "tps": 20, "msptAvg": 1, "msptMax": 1, "players": 1.5}]},
+        {
+            "samples": [
+                {"at": now_ms, "tps": 20, "msptAvg": 1, "msptMax": 1, "players": 1.5}
+            ]
+        },
         {"events": [{"id": _DIAG_EVENT, "at": now_ms, "kind": "oops", "message": "x"}]},
-        {"events": [{"id": _DIAG_EVENT, "at": now_ms, "kind": "error", "message": "   "}]},
-        {"events": [{"id": _DIAG_EVENT, "at": now_ms, "kind": "freeze", "message": "x"}]},
+        {
+            "events": [
+                {"id": _DIAG_EVENT, "at": now_ms, "kind": "error", "message": "   "}
+            ]
+        },
+        {
+            "events": [
+                {"id": _DIAG_EVENT, "at": now_ms, "kind": "freeze", "message": "x"}
+            ]
+        },
         {"events": [{"id": "nope", "at": now_ms, "kind": "error", "message": "x"}]},
-        {"samples": [{"at": now_ms + 10 * 60000, "tps": 20, "msptAvg": 1, "msptMax": 1}]},
+        {
+            "samples": [
+                {"at": now_ms + 10 * 60000, "tps": 20, "msptAvg": 1, "msptMax": 1}
+            ]
+        },
     ]
     for patch in cases:
         body = _diag_body(now_ms, **patch)
-        response = await request(store, "POST", "/v2/stats/diagnostics", body, "stats-diag-valid")
+        response = await request(
+            store, "POST", "/v2/stats/diagnostics", body, "stats-diag-valid"
+        )
         assert response.status_code == 400, (patch, response.text)
         assert response.json() == {"error": "invalid_diagnostics"}, response.text
     # Out-of-retention items are dropped, not refused (like the site).
@@ -9044,7 +9070,9 @@ async def test_stats_diag_ingest_validation(store):
         store,
         "POST",
         "/v2/stats/diagnostics",
-        _diag_body(now_ms, samples=[{"at": old, "tps": 20, "msptAvg": 1, "msptMax": 1}]),
+        _diag_body(
+            now_ms, samples=[{"at": old, "tps": 20, "msptAvg": 1, "msptMax": 1}]
+        ),
         "stats-diag-valid",
     )
     assert dropped.status_code == 200, dropped.text
@@ -9058,11 +9086,17 @@ async def test_stats_diag_ingest_rbac(store):
     for role in ("ordinary", "builder", "moderator", "admin", "game-agent"):
         response = await request(store, "POST", "/v2/stats/diagnostics", body, role)
         assert response.status_code == 403, (role, response.text)
-    assert (await request(store, "POST", "/v2/stats/diagnostics", body, "owner")).status_code == 403
-    assert (await store["client"].post("/v2/stats/diagnostics", json=body)).status_code == 401
+    assert (
+        await request(store, "POST", "/v2/stats/diagnostics", body, "owner")
+    ).status_code == 403
+    assert (
+        await store["client"].post("/v2/stats/diagnostics", json=body)
+    ).status_code == 401
     other = "33333333-3333-3333-3333-333333333333"
     await _stats_token(store, other, "stats-diag-other")
-    forged = await request(store, "POST", "/v2/stats/diagnostics", body, "stats-diag-other")
+    forged = await request(
+        store, "POST", "/v2/stats/diagnostics", body, "stats-diag-other"
+    )
     assert forged.status_code == 403, forged.text
 
 
@@ -9079,10 +9113,16 @@ async def test_stats_diag_retention_prunes_by_age_and_severity(store, monkeypatc
         )
         await conn.execute(
             "INSERT INTO control.stat_events(server_id,event_id,at,kind,message,repeats) VALUES(%s,%s,%s,'error','old',1)",
-            (_DIAG_SERVER, "00000000-0000-0000-0000-000000000000", datetime.fromtimestamp(old_event / 1000, tz=timezone.utc)),
+            (
+                _DIAG_SERVER,
+                "00000000-0000-0000-0000-000000000000",
+                datetime.fromtimestamp(old_event / 1000, tz=timezone.utc),
+            ),
         )
         await conn.commit()
-    response = await request(store, "POST", "/v2/stats/diagnostics", _diag_body(now_ms), "stats-diag-retain")
+    response = await request(
+        store, "POST", "/v2/stats/diagnostics", _diag_body(now_ms), "stats-diag-retain"
+    )
     assert response.status_code == 200, response.text
     assert await sql(store, "SELECT count(*) AS n FROM stat_samples") == [{"n": 1}]
     events = await sql(store, "SELECT message FROM stat_events")
@@ -9099,7 +9139,9 @@ async def test_stats_diag_retention_prunes_by_age_and_severity(store, monkeypatc
                 (
                     _DIAG_SERVER,
                     f"22222222-2222-2222-2222-22222222222{index}",
-                    datetime.fromtimestamp((now_ms - (index + 1) * 1000) / 1000, tz=timezone.utc),
+                    datetime.fromtimestamp(
+                        (now_ms - (index + 1) * 1000) / 1000, tz=timezone.utc
+                    ),
                     kind,
                 ),
             )
@@ -9126,7 +9168,9 @@ async def test_stats_diag_read_matches_site_contract(store):
         "/v2/stats/diagnostics",
         _diag_body(
             now_ms,
-            samples=[{"at": now_ms - 2 * 3600000, "tps": 20, "msptAvg": 10, "msptMax": 100}],
+            samples=[
+                {"at": now_ms - 2 * 3600000, "tps": 20, "msptAvg": 10, "msptMax": 100}
+            ],
             events=[],
         ),
         "stats-diag-read",
@@ -9150,10 +9194,19 @@ async def test_stats_diag_read_matches_site_contract(store):
         21.0,
         30.0,
     )
-    assert (sample["players"], sample["heapUsedMb"], sample["heapMaxMb"], sample["gcPauseMs"]) == (12, 1800, 3072, 5)
+    assert (
+        sample["players"],
+        sample["heapUsedMb"],
+        sample["heapMaxMb"],
+        sample["gcPauseMs"],
+    ) == (12, 1800, 3072, 5)
     assert sample["startedAt"] == now_ms - 3600000
     event = data["events"][0]
-    assert (event["id"], event["kind"], event["durationMs"]) == (_DIAG_EVENT, "freeze", 3400)
+    assert (event["id"], event["kind"], event["durationMs"]) == (
+        _DIAG_EVENT,
+        "freeze",
+        3400,
+    )
     assert event["message"] == "tick stuck, see [url]"
     assert (event["source"], event["repeats"]) == ("Server thread", 2)
     # The hours window filters samples only; the journal and the last-sample
@@ -9165,7 +9218,9 @@ async def test_stats_diag_read_matches_site_contract(store):
     assert [row["at"] for row in narrow.json()["samples"]] == [now_ms - 60000]
     assert len(narrow.json()["events"]) == 1
     assert narrow.json()["lastSampleAt"] == now_ms - 60000
-    wide = await request(store, "GET", "/v2/stats/diagnostics?hours=168", None, "stats-reader")
+    wide = await request(
+        store, "GET", "/v2/stats/diagnostics?hours=168", None, "stats-reader"
+    )
     assert wide.status_code == 200, wide.text
     for bad in ("abc", "0", "169"):
         rejected = await request(
@@ -9174,9 +9229,15 @@ async def test_stats_diag_read_matches_site_contract(store):
         assert rejected.status_code == 400, (bad, rejected.text)
     # Reads ride the unbound stats.read credential or a staff role; the
     # per-server producer credential and unrelated roles stay rejected.
-    assert (await request(store, "GET", "/v2/stats/diagnostics", None, "stats-diag-read")).status_code == 403
-    assert (await request(store, "GET", "/v2/stats/diagnostics", None, "admin")).status_code == 200
-    assert (await request(store, "GET", "/v2/stats/diagnostics", None, "ordinary")).status_code == 403
+    assert (
+        await request(store, "GET", "/v2/stats/diagnostics", None, "stats-diag-read")
+    ).status_code == 403
+    assert (
+        await request(store, "GET", "/v2/stats/diagnostics", None, "admin")
+    ).status_code == 200
+    assert (
+        await request(store, "GET", "/v2/stats/diagnostics", None, "ordinary")
+    ).status_code == 403
 
 
 async def test_stats_diag_ingest_accepts_full_size_report(store):
@@ -9200,6 +9261,8 @@ async def test_stats_diag_ingest_accepts_full_size_report(store):
             for i in range(200)
         ],
     )
-    response = await request(store, "POST", "/v2/stats/diagnostics", body, "stats-diag-full")
+    response = await request(
+        store, "POST", "/v2/stats/diagnostics", body, "stats-diag-full"
+    )
     assert response.status_code == 200, response.text
     assert response.json() == {"samples": 120, "events": 200}
