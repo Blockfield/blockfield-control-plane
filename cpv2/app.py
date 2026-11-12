@@ -22,7 +22,10 @@ _health_clock = time.monotonic
 # Mutation body caps by path. Everything else stays at 32 KiB; the stats
 # ingest route honors the producer outbox contract (1 MiB/event, same as the
 # site MAX_BODY) so a full 512-player result is never a 413.
-BODY_LIMITS = {"/v2/stats/results": core.STAT_MAX_BODY}
+BODY_LIMITS = {
+    "/v2/stats/results": core.STAT_MAX_BODY,
+    "/v2/stats/diagnostics": core.DIAG_MAX_BODY,
+}
 
 
 class Limits:
@@ -712,6 +715,24 @@ def create_app(dsn=None):
     @app.post("/v2/stats/results/void")
     async def stats_void(body: models.StatVoid, request: Request):
         return await write(request, core.stat_void, body)
+
+    @app.post("/v2/stats/diagnostics")
+    async def stats_diag_ingest(body: dict, request: Request):
+        # Producer diagnostics (coordination#29 U4): same bytes as the site
+        # POST /api/stats/diagnostics; the site admin health view reads them
+        # back below. Always 200: resends are idempotent, like the site.
+        return await write(request, core.stat_diag_ingest, body)
+
+    @app.get("/v2/stats/diagnostics")
+    async def stats_diag_read(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        raw = request.query_params.get("hours")
+        try:
+            hours = 24 if raw is None else int(raw, 10)
+        except ValueError:
+            raise Problem("invalid_diagnostics", 400)
+        async with database.transaction() as conn:
+            return await core.stat_diag_read(conn, hours)
 
     @app.post("/v2/site/sessions", status_code=201)
     async def site_session_create(body: models.SiteSessionCreate, request: Request):

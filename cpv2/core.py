@@ -2026,7 +2026,309 @@ async def stat_ingest(conn, identity, attempt, body):
     return {"inserted": True, "eventId": event_id}
 
 
-# Stats reads + MMR (coordination#29 U3). Mirrors the site read contracts
+# Game-server diagnostics (coordination#29 U4). Mirrors the site
+# `src/lib/diagnostics.ts` contract (validation, idempotency, retention caps)
+# so the producer cuts over with the same bytes; the site admin health view
+# becomes a client of the read route below.
+DIAG_SAMPLE_DAYS = 7
+DIAG_EVENT_DAYS = 14
+DIAG_MAX_SAMPLES = 50000
+DIAG_MAX_EVENTS = 5000
+DIAG_KINDS = {"freeze", "error", "warning", "crash"}
+DIAG_MAX_REPORT_SAMPLES = 120
+DIAG_MAX_REPORT_EVENTS = 200
+# Producer outbox contract: 1 MiB/report, same as the site MAX_BODY.
+DIAG_MAX_BODY = 1048576
+DIAG_SKEW_MS = 5 * 60000
+_DIAG_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
+_DIAG_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_DIAG_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b")
+_DIAG_IPV6_FULL = re.compile(
+    r"\[?\b(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}\b\]?(?::\d{1,5})?",
+    re.IGNORECASE,
+)
+_DIAG_IPV6_COMP = re.compile(
+    r"(?<![\w:])(?:\[?(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?\]?(?::\d{1,5})?)(?![\w:])",
+    re.IGNORECASE,
+)
+_DIAG_BEARER = re.compile(r"\b(bearer)\s+[^\s\"',;\}\]]+", re.IGNORECASE)
+_DIAG_SECRET_KV = re.compile(
+    r"\b([a-z0-9_-]*(?:authorization|token|password|passwd|secret|api[_-]?key|access[_-]?key))([\"']?\s*[:=]\s*)(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;\}\]]+)",
+    re.IGNORECASE,
+)
+_DIAG_TOKEN_RUN = re.compile(
+    r"\b(?![0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b)(?=[\w-]*\d)(?=[\w-]*[A-Za-z])[\w-]{32,}"
+)
+
+
+def _diag_invalid():
+    raise Problem("invalid_diagnostics", 400)
+
+
+def _diag_require(condition):
+    if not condition:
+        _diag_invalid()
+
+
+def _diag_redact(text):
+    # Log text may carry IPs/URLs/secrets; none of it is stored. Same
+    # patterns as the site redact(), so proxied messages stay byte-shaped.
+    text = re.sub(r"[^\S\n]*[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f][^\S\n]*", " ", text)
+    text = _DIAG_URL.sub("[url]", text)
+    text = _DIAG_EMAIL.sub("[email]", text)
+    text = _DIAG_IPV4.sub("[ip]", text)
+    text = _DIAG_IPV6_FULL.sub("[ip]", text)
+    text = _DIAG_IPV6_COMP.sub("[ip]", text)
+    text = _DIAG_BEARER.sub(r"\1 [secret]", text)
+    text = _DIAG_SECRET_KV.sub(r"\1\2[secret]", text)
+    return _DIAG_TOKEN_RUN.sub("[secret]", text)
+
+
+def _diag_number(value, low, high, whole=False):
+    if isinstance(value, bool):
+        return None
+    if whole:
+        if type(value) is not int or not low <= value <= high:
+            return None
+        return value
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return None
+    if not low <= value <= high:
+        return None
+    return value
+
+
+def _diag_at(value, now_ms):
+    at = _diag_number(value, 0, now_ms + DIAG_SKEW_MS, whole=True)
+    _diag_require(at is not None)
+    return at
+
+
+def _diag_line(value, limit):
+    if value is None:
+        return None
+    _diag_require(isinstance(value, str))
+    text = _diag_redact(value).strip()
+    return text[:limit] or None
+
+
+def _diag_validate(body, now_ms):
+    _diag_require(isinstance(body, dict))
+    _diag_require(
+        type(body.get("schemaVersion")) is int and body.get("schemaVersion") == 1
+    )
+    server_id = body.get("serverId")
+    _diag_require(isinstance(server_id, str) and STAT_UUID.match(server_id))
+    samples, events = body.get("samples", []), body.get("events", [])
+    _diag_require(isinstance(samples, list) and len(samples) <= DIAG_MAX_REPORT_SAMPLES)
+    _diag_require(isinstance(events, list) and len(events) <= DIAG_MAX_REPORT_EVENTS)
+    clean_samples = []
+    for entry in samples:
+        _diag_require(isinstance(entry, dict))
+        numbers = {
+            "tps": _diag_number(entry.get("tps"), 0, 1000),
+            "msptAvg": _diag_number(entry.get("msptAvg"), 0, 3600000),
+            "msptP95": _diag_number(entry.get("msptP95"), 0, 3600000),
+            "msptMax": _diag_number(entry.get("msptMax"), 0, 3600000),
+        }
+        _diag_require(
+            numbers["tps"] is not None
+            and numbers["msptAvg"] is not None
+            and numbers["msptMax"] is not None
+        )
+        if numbers["msptP95"] is None and entry.get("msptP95") is not None:
+            _diag_invalid()
+        for name, limit in (
+            ("players", 10000),
+            ("heapUsedMb", 1048576),
+            ("heapMaxMb", 1048576),
+            ("gcPauseMs", 3600000),
+        ):
+            value = _diag_number(entry.get(name), 0, limit, whole=True)
+            if value is None and entry.get(name) is not None:
+                _diag_invalid()
+            numbers[name] = value
+        at = _diag_at(entry.get("at"), now_ms)
+        if at >= now_ms - DIAG_SAMPLE_DAYS * 86400000:
+            clean_samples.append({"at": at, **numbers})
+    clean_events = []
+    for entry in events:
+        _diag_require(isinstance(entry, dict))
+        event_id = entry.get("id")
+        _diag_require(isinstance(event_id, str) and STAT_UUID.match(event_id))
+        _diag_require(entry.get("kind") in DIAG_KINDS)
+        message = _diag_line(entry.get("message"), 4000)
+        _diag_require(message)
+        if entry.get("kind") == "freeze":
+            duration = _diag_number(entry.get("durationMs"), 0, 3600000, whole=True)
+            _diag_require(duration is not None)
+        else:
+            duration = _diag_number(entry.get("durationMs"), 0, 3600000, whole=True)
+            if duration is None and entry.get("durationMs") is not None:
+                _diag_invalid()
+        repeats = entry.get("repeats", 1)
+        if type(repeats) is not int or repeats < 1:
+            repeats = 1
+        at = _diag_at(entry.get("at"), now_ms)
+        if at >= now_ms - DIAG_EVENT_DAYS * 86400000:
+            clean_events.append(
+                {
+                    "id": event_id,
+                    "at": at,
+                    "kind": entry.get("kind"),
+                    "durationMs": duration,
+                    "source": _diag_line(entry.get("source"), 120),
+                    "message": message,
+                    "repeats": repeats,
+                }
+            )
+    started = body.get("startedAt")
+    started_at = None
+    if started is not None:
+        started_at = _diag_number(started, 0, now_ms + DIAG_SKEW_MS, whole=True)
+        _diag_require(started_at is not None)
+    return {
+        "serverId": server_id,
+        "startedAt": started_at,
+        "samples": clean_samples,
+        "events": clean_events,
+    }
+
+
+def _diag_ts(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
+async def stat_diag_ingest(conn, identity, attempt, body):
+    # attempt is consumed by app.write's completion audit, like stat_ingest.
+    current_ms = int(now().timestamp() * 1000)
+    clean = _diag_validate(body, current_ms)
+    server_id = clean["serverId"]
+    # The credential is bound to its server resource at provision; requiring
+    # the scope on the body's server keeps one server from submitting
+    # another server's diagnostics, like the site 403 rule.
+    identity.require("stats.ingest", "prod", "game", server_id)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+        (server_id + "/diagnostics",),
+    )
+    for sample in clean["samples"]:
+        await conn.execute(
+            "INSERT INTO stat_samples(server_id,at,tps,mspt_avg,mspt_p95,mspt_max,players,heap_used_mb,heap_max_mb,gc_pause_ms,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (
+                server_id,
+                _diag_ts(sample["at"]),
+                sample["tps"],
+                sample["msptAvg"],
+                sample["msptP95"],
+                sample["msptMax"],
+                sample["players"],
+                sample["heapUsedMb"],
+                sample["heapMaxMb"],
+                sample["gcPauseMs"],
+                _diag_ts(clean["startedAt"])
+                if clean["startedAt"] is not None
+                else None,
+            ),
+        )
+    for event in clean["events"]:
+        await conn.execute(
+            "INSERT INTO stat_events(server_id,event_id,at,kind,duration_ms,source,message,repeats) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (
+                server_id,
+                event["id"],
+                _diag_ts(event["at"]),
+                event["kind"],
+                event["durationMs"],
+                event["source"],
+                event["message"],
+                event["repeats"],
+            ),
+        )
+    # Retention mirrors the site saveReport prune (same age caps and the
+    # same row-count windows), so the two stores stay comparable.
+    await conn.execute(
+        "DELETE FROM stat_samples WHERE at < now() - make_interval(days=>%s)",
+        (DIAG_SAMPLE_DAYS,),
+    )
+    await conn.execute(
+        "DELETE FROM stat_events WHERE at < now() - make_interval(days=>%s)",
+        (DIAG_EVENT_DAYS,),
+    )
+    await conn.execute(
+        "DELETE FROM stat_samples WHERE at < (SELECT at FROM stat_samples ORDER BY at DESC LIMIT 1 OFFSET %s)",
+        (DIAG_MAX_SAMPLES,),
+    )
+    await conn.execute(
+        "DELETE FROM stat_events WHERE (server_id,event_id) NOT IN (SELECT server_id,event_id FROM stat_events ORDER BY CASE kind WHEN 'crash' THEN 0 WHEN 'error' THEN 0 WHEN 'freeze' THEN 1 ELSE 2 END, at DESC, server_id, event_id LIMIT %s)",
+        (DIAG_MAX_EVENTS,),
+    )
+    return {"samples": len(clean["samples"]), "events": len(clean["events"])}
+
+
+def _diag_ms(value):
+    return int(value.timestamp() * 1000)
+
+
+async def stat_diag_read(conn, hours=24, now_ms=None):
+    # Same shape as the site readDiagnostics view, so the site admin health
+    # page renders CP rows unchanged.
+    if now_ms is None:
+        now_ms = int(now().timestamp() * 1000)
+    if type(hours) is not int or not 1 <= hours <= DIAG_SAMPLE_DAYS * 24:
+        raise Problem("invalid_diagnostics", 400)
+    cutoff = _diag_ts(now_ms - hours * 3600000)
+    sample_rows = await rows(
+        conn,
+        'SELECT server_id "serverId", at, tps, mspt_avg "msptAvg", mspt_p95 "msptP95", mspt_max "msptMax", players, heap_used_mb "heapUsedMb", heap_max_mb "heapMaxMb", gc_pause_ms "gcPauseMs", started_at "startedAt" FROM stat_samples WHERE at >= %s ORDER BY at LIMIT 5000',
+        (cutoff,),
+    )
+    event_rows = await rows(
+        conn,
+        'SELECT server_id "serverId", event_id id, at, kind, duration_ms "durationMs", source, message, repeats FROM stat_events ORDER BY at DESC LIMIT 500',
+    )
+    last = await one(conn, 'SELECT max(at) "last" FROM stat_samples')
+    samples = [
+        {
+            "serverId": row["serverId"],
+            "at": _diag_ms(row["at"]),
+            "tps": row["tps"],
+            "msptAvg": row["msptAvg"],
+            "msptP95": row["msptP95"],
+            "msptMax": row["msptMax"],
+            "players": row["players"],
+            "heapUsedMb": row["heapUsedMb"],
+            "heapMaxMb": row["heapMaxMb"],
+            "gcPauseMs": row["gcPauseMs"],
+            "startedAt": _diag_ms(row["startedAt"])
+            if row["startedAt"] is not None
+            else None,
+        }
+        for row in sample_rows
+    ]
+    events = [
+        {
+            "serverId": row["serverId"],
+            "id": row["id"],
+            "at": _diag_ms(row["at"]),
+            "kind": row["kind"],
+            "durationMs": row["durationMs"],
+            "source": row["source"],
+            "message": row["message"],
+            "repeats": row["repeats"],
+        }
+        for row in event_rows
+    ]
+    return {
+        "schemaVersion": 1,
+        "now": now_ms,
+        "hours": hours,
+        "lastSampleAt": _diag_ms(last["last"]) if last["last"] is not None else None,
+        "samples": samples,
+        "events": events,
+    }
+
+
 # (`src/lib/stats.ts` seasons/filters/leaderboard/player/hitreg/rate at the
 # site ref in .dev/u-sitedb-u3): same filter/sort/rank semantics, same
 # Glicko-2, same per-season replay rule. Ratings are never recomputed in two
