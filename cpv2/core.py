@@ -326,6 +326,10 @@ async def settings_change(
             raise Problem("revision_not_found", 404)
         candidate = old["value"]
     else:
+        # gameplay.ai was removed (coordination#56): the model silently drops it
+        # from legacy rows, so an explicit write must be refused, not ignored.
+        if namespace == "gameplay" and (data["patch"] or {}).get("ai") is not None:
+            raise Problem("invalid_settings", 422)
         candidate = merge(before["value"], data["patch"])
     try:
         after = (

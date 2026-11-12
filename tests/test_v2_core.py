@@ -5714,6 +5714,13 @@ async def test_settings_patch_null_deletes_rollback_restores_and_replays(store):
     assert set(value["value"]["kits"]) == {"alpha", "beta"}
 
 
+async def test_gameplay_explicit_ai_write_is_rejected(store):
+    path = "/v2/settings/gameplay/arena"
+    body = patch("ai-write", 0, {"ai": {"hardLimit": 200}})
+    assert (await request(store, "PATCH", path, body)).status_code == 422
+    assert (await request(store, "GET", path)).json()["revision"] == 0
+
+
 async def test_settings_patch_nested_delete_reset_and_invalid_change(store):
     path = "/v2/settings/campaign/arena"
     seed = patch(
