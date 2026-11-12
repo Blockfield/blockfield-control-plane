@@ -9121,6 +9121,18 @@ async def test_stats_diag_read_matches_site_contract(store):
     await _stats_reader_token(store)
     now_ms = int(time.time() * 1000)
     posted = await request(
+        store,
+        "POST",
+        "/v2/stats/diagnostics",
+        _diag_body(
+            now_ms,
+            samples=[{"at": now_ms - 2 * 3600000, "tps": 20, "msptAvg": 10, "msptMax": 100}],
+            events=[],
+        ),
+        "stats-diag-read",
+    )
+    assert posted.status_code == 200, posted.text
+    posted = await request(
         store, "POST", "/v2/stats/diagnostics", _diag_body(now_ms), "stats-diag-read"
     )
     assert posted.status_code == 200, posted.text
@@ -9129,8 +9141,8 @@ async def test_stats_diag_read_matches_site_contract(store):
     data = view.json()
     assert data["schemaVersion"] == 1 and data["hours"] == 24
     assert data["lastSampleAt"] == now_ms - 60000
-    assert len(data["samples"]) == 1 and len(data["events"]) == 1
-    sample = data["samples"][0]
+    assert len(data["samples"]) == 2 and len(data["events"]) == 1
+    sample = data["samples"][1]
     assert sample["serverId"] == _DIAG_SERVER
     assert (sample["at"], sample["tps"], sample["msptAvg"], sample["msptP95"]) == (
         now_ms - 60000,
@@ -9150,7 +9162,8 @@ async def test_stats_diag_read_matches_site_contract(store):
         store, "GET", "/v2/stats/diagnostics?hours=1", None, "stats-reader"
     )
     assert narrow.status_code == 200, narrow.text
-    assert narrow.json()["samples"] == [] and len(narrow.json()["events"]) == 1
+    assert [row["at"] for row in narrow.json()["samples"]] == [now_ms - 60000]
+    assert len(narrow.json()["events"]) == 1
     assert narrow.json()["lastSampleAt"] == now_ms - 60000
     wide = await request(store, "GET", "/v2/stats/diagnostics?hours=168", None, "stats-reader")
     assert wide.status_code == 200, wide.text
