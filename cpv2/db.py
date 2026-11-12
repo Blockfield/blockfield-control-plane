@@ -19,6 +19,7 @@ MIGRATIONS = [
     "006_stat_rating_rebuilds.sql",
     "007_site_diagnostics.sql",
     "008_consumer_rotation.sql",
+    "009_credential_renewals.sql",
 ]
 
 
@@ -204,4 +205,12 @@ async def migrate(dsn, expected_database):
         await conn.execute(
             "INSERT INTO control.schema_migrations VALUES(8,%s)",
             (checksums["008_consumer_rotation.sql"],),
+        )
+        await conn.execute(
+            (ROOT / "migrations/009_credential_renewals.sql").read_bytes().decode(),
+            prepare=False,
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(9,%s)",
+            (checksums["009_credential_renewals.sql"],),
         )
