@@ -166,6 +166,14 @@ class SiteSessionCreate(Strict):
     playerUuid: str = Field(min_length=1, max_length=128)
 
 
+class StatVoid(Strict):
+    # Void/restore one ingested result (site setVoided contract): voiding a
+    # rated campaign enqueues its season for the background rebuild loop.
+    serverId: ID
+    eventId: ID
+    voided: bool
+
+
 class OperationReceipt(Strict):
     operationId: ID
     revision: int | None

@@ -15,6 +15,8 @@ MIGRATIONS = [
     "002_site_sessions.sql",
     "003_site_stats.sql",
     "004_schema_migrations_read.sql",
+    "005_site_stats_reads.sql",
+    "006_stat_rating_rebuilds.sql",
 ]
 
 
@@ -93,6 +95,7 @@ async def migrate(dsn, expected_database):
             conn, "SELECT to_regclass('control.schema_migrations') AS name"
         )
         if exists["name"]:
+            backfill_005 = False
             for version, name in enumerate(migrations, start=1):
                 record = await one(
                     conn,
@@ -110,6 +113,15 @@ async def migrate(dsn, expected_database):
                     "INSERT INTO control.schema_migrations VALUES(%s,%s)",
                     (version, checksums[name]),
                 )
+                if name == "005_site_stats_reads.sql":
+                    backfill_005 = True
+            if backfill_005:
+                # One-time replay of results ingested before 005 existed (no
+                # ratings store then): idempotent, under the ingest rating
+                # lock, so a concurrent ingest serializes behind it.
+                from cpv2.core import stat_backfill_ratings
+
+                await stat_backfill_ratings(conn)
             return
         await conn.execute(
             (ROOT / "migrations/001_core.sql").read_bytes().decode(), prepare=False
@@ -158,4 +170,20 @@ async def migrate(dsn, expected_database):
         await conn.execute(
             "INSERT INTO control.schema_migrations VALUES(4,%s)",
             (checksums["004_schema_migrations_read.sql"],),
+        )
+        await conn.execute(
+            (ROOT / "migrations/005_site_stats_reads.sql").read_bytes().decode(),
+            prepare=False,
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(5,%s)",
+            (checksums["005_site_stats_reads.sql"],),
+        )
+        await conn.execute(
+            (ROOT / "migrations/006_stat_rating_rebuilds.sql").read_bytes().decode(),
+            prepare=False,
+        )
+        await conn.execute(
+            "INSERT INTO control.schema_migrations VALUES(6,%s)",
+            (checksums["006_stat_rating_rebuilds.sql"],),
         )

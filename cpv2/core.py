@@ -1946,4 +1946,1134 @@ async def stat_ingest(conn, identity, attempt, body):
                     entry["pointSeconds"],
                 ),
             )
+    # Only a fresh insert rates: outbox replays return above, so one campaign
+    # changes MMR at most once, like the site ingest. While a rebuild is
+    # pending for this season or an earlier one, the result is stored but not
+    # rated inline: the worker's replay covers it to the end of history, and
+    # inline rating would wait on the replay's lock. The bump forces a worker
+    # re-pass so a campaign committed mid-replay is never lost.
+    if _stat_rated(clean):
+        season_id = stat_season_at(ended_ms)["id"]
+        if await _stat_rebuilding(conn, season_id):
+            await _stat_enqueue_rebuild(conn, season_id, server_id, event_id, ended_at)
+        else:
+            await _stat_rate(conn, clean, ended_ms)
     return {"inserted": True, "eventId": event_id}
+
+
+# Stats reads + MMR (coordination#29 U3). Mirrors the site read contracts
+# (`src/lib/stats.ts` seasons/filters/leaderboard/player/hitreg/rate at the
+# site ref in .dev/u-sitedb-u3): same filter/sort/rank semantics, same
+# Glicko-2, same per-season replay rule. Ratings are never recomputed in two
+# places: the site read API becomes a client of these routes.
+STAT_RULES_VERSION = "glicko2-v1"
+STAT_RATING_PERIOD_MS = 7 * 86400000
+STAT_SEASON_ONE_START_MS = int(
+    datetime(2026, 9, 14, tzinfo=timezone.utc).timestamp() * 1000
+)
+STAT_ALPHA_END_MS = int(datetime(2026, 9, 26, tzinfo=timezone.utc).timestamp() * 1000)
+STAT_SEASON_THREE_START_MS = int(
+    datetime(2027, 1, 1, tzinfo=timezone.utc).timestamp() * 1000
+)
+STAT_SORTS = {
+    "score": "score",
+    "kills": "kills",
+    "captures": "captures",
+    # The aggregates are aliased with camelCase quotes, not snake_case
+    # columns: sort by the quoted aliases the GROUP BY actually selects.
+    "pointSeconds": '"pointSeconds"',
+    "playSeconds": '"playSeconds"',
+    "wins": "wins",
+    "kd": "kd",
+    "rating": "COALESCE(rating,-1)",
+}
+STAT_HITREG_SCAN_CAP = 5000
+STAT_UNKNOWN_PLAYER = "Неизвестный игрок"
+STAT_DISPLAY_UUID_LIKE = re.compile(
+    r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+# Glicko-2 constants (site `src/lib/glicko2.ts` GLICKO2).
+_STAT_G_RATING = 1500.0
+_STAT_G_RD = 350.0
+_STAT_G_VOLATILITY = 0.06
+_STAT_G_TAU = 0.5
+_STAT_G_EPSILON = 1e-6
+_STAT_G_SCALE = 173.7178
+
+
+def _stat_iso(ms):
+    # Site `Date.toISOString()`: millis + Z, so proxied rows stay byte-shaped.
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
+
+
+def _stat_parse_iso(value):
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+
+def _stat_dt(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def stat_seasons(now_ms=None):
+    # Site seasons(): s1 is the alpha, s2 runs to end of 2026, then UTC
+    # calendar quarters. IDs stay numeric; endsAt is inclusive.
+    if now_ms is None:
+        now_ms = int(now().timestamp() * 1000)
+    out, start, n = [], STAT_SEASON_ONE_START_MS, 1
+    while start <= now_ms:
+        if n == 1:
+            following = STAT_ALPHA_END_MS
+        elif n == 2:
+            following = STAT_SEASON_THREE_START_MS
+        else:
+            head = datetime.fromtimestamp(start / 1000, tz=timezone.utc)
+            month, year = head.month + 3, head.year
+            if month > 12:
+                month, year = month - 12, year + 1
+            following = int(
+                datetime(year, month, 1, tzinfo=timezone.utc).timestamp() * 1000
+            )
+        out.append(
+            {
+                "id": f"s{n}",
+                "name": "Альфа Сезон" if n == 1 else f"Сезон {n - 1}",
+                "startsAt": _stat_iso(start),
+                "endsAt": _stat_iso(following - 1),
+            }
+        )
+        start, n = following, n + 1
+    return out
+
+
+def stat_season_at(time_ms):
+    # Anything before season 1 belongs to season 1, like the site seasonAt.
+    return stat_seasons(max(time_ms, STAT_SEASON_ONE_START_MS))[-1]
+
+
+def _stat_filter_invalid():
+    raise Problem("invalid_stats_filter", 400)
+
+
+def stat_filters(params, now_ms=None):
+    # Site filters(): mode/season/period/sort/limit/page with the same 400s.
+    if now_ms is None:
+        now_ms = int(now().timestamp() * 1000)
+    mode, season = params.get("mode"), params.get("season")
+    period = params.get("period", "all")
+    sort = params.get("sort", "score")
+    if mode is not None and mode not in STAT_MODES:
+        _stat_filter_invalid()
+    if period not in ("all", "week", "month") or sort not in STAT_SORTS:
+        _stat_filter_invalid()
+    if season is not None and "period" in params:
+        _stat_filter_invalid()
+    selected = None
+    if season is not None:
+        selected = next((s for s in stat_seasons(now_ms) if s["id"] == season), None)
+        if selected is None:
+            _stat_filter_invalid()
+    limit_text, page_text = params.get("limit", "25"), params.get("page", "1")
+    if not re.fullmatch(r"\d+", limit_text or "") or not re.fullmatch(
+        r"\d+", page_text or ""
+    ):
+        _stat_filter_invalid()
+    try:
+        limit, page = int(limit_text), int(page_text)
+    except ValueError:
+        _stat_filter_invalid()
+    if not 1 <= limit <= 100 or not 1 <= page <= 1000:
+        _stat_filter_invalid()
+    mmr_season = season if season is not None else stat_season_at(now_ms)["id"]
+    if selected is not None:
+        since = _stat_parse_iso(selected["startsAt"])
+        until = _stat_parse_iso(selected["endsAt"])
+    else:
+        since = (
+            0
+            if period == "all"
+            else now_ms - (7 if period == "week" else 30) * 86400000
+        )
+        until = now_ms + 300000
+    return {
+        "mode": mode,
+        "season": season,
+        "mmrSeason": mmr_season,
+        "since": since,
+        "until": until,
+        "sort": sort,
+        "limit": limit,
+        "page": page,
+    }
+
+
+def _stat_display_name(name):
+    # Site displayName: a UUID-like stored name renders as unknown, never raw.
+    if not name or STAT_DISPLAY_UUID_LIKE.match(name.strip()):
+        return STAT_UNKNOWN_PLAYER
+    return name
+
+
+def _stat_js_round(value):
+    # Site Math.round (half up; values here are non-negative): Python round()
+    # is banker's rounding and would differ on .5 ratings.
+    return math.floor(value + 0.5)
+
+
+def _stat_num(value):
+    # Site JSON has no int/float split (node-pg parses numerics to Number):
+    # whole doubles render as ints so proxied bodies stay byte-shaped.
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _stat_mmr(row):
+    if row is None or row["rating"] is None:
+        return None
+    return {
+        "rating": _stat_js_round(row["rating"]),
+        "rd": _stat_js_round(row["rd"]),
+        "ratedCampaigns": row["ratedCampaigns"],
+        "provisional": row["ratedCampaigns"] < 5 or row["rd"] > 150,
+    }
+
+
+def _stat_glicko_g(phi):
+    return 1 / math.sqrt(1 + (3 * phi * phi) / (math.pi * math.pi))
+
+
+def _stat_glicko_expected(mu, muj, phij):
+    return 1 / (1 + math.exp(-_stat_glicko_g(phij) * (mu - muj)))
+
+
+def _stat_glicko_initial():
+    return {
+        "rating": _STAT_G_RATING,
+        "rd": _STAT_G_RD,
+        "volatility": _STAT_G_VOLATILITY,
+    }
+
+
+def _stat_glicko_inflate(player, periods):
+    phi = player["rd"] / _STAT_G_SCALE
+    for _ in range(periods):
+        if phi * _STAT_G_SCALE >= _STAT_G_RD:
+            break
+        phi = math.sqrt(phi * phi + player["volatility"] * player["volatility"])
+    return {**player, "rd": min(_STAT_G_RD, phi * _STAT_G_SCALE)}
+
+
+def _stat_glicko_soft_reset(player, seasons=1):
+    # Half the distance to the initial rating per boundary crossed, RD at
+    # least 200, volatility kept — site softReset.
+    return {
+        "rating": _STAT_G_RATING + 0.5**seasons * (player["rating"] - _STAT_G_RATING),
+        "rd": max(player["rd"], 200),
+        "volatility": player["volatility"],
+    }
+
+
+def _stat_glicko_composite(opponents):
+    # One game against a virtual opponent: mean rating, RMS deviation.
+    _stat_require(len(opponents) > 0)
+    rating = sum(o["rating"] for o in opponents) / len(opponents)
+    rd = math.sqrt(sum(o["rd"] * o["rd"] for o in opponents) / len(opponents))
+    return {"rating": rating, "rd": rd}
+
+
+def _stat_glicko_update(player, games, tau=_STAT_G_TAU):
+    # Site glicko2.ts update, one rating period. IEEE doubles on both sides.
+    scale, epsilon = _STAT_G_SCALE, _STAT_G_EPSILON
+    mu = (player["rating"] - _STAT_G_RATING) / scale
+    phi = player["rd"] / scale
+    sigma = player["volatility"]
+    if not games:
+        return _stat_glicko_inflate(player, 1)
+    inv_v, total = 0.0, 0.0
+    for game in games:
+        muj = (game["opponent"]["rating"] - _STAT_G_RATING) / scale
+        phij = game["opponent"]["rd"] / scale
+        gj = _stat_glicko_g(phij)
+        expect = _stat_glicko_expected(mu, muj, phij)
+        inv_v += gj * gj * expect * (1 - expect)
+        total += gj * (game["score"] - expect)
+    variance = 1 / inv_v
+    delta = variance * total
+    a = math.log(sigma * sigma)
+
+    def f(x):
+        return (math.exp(x) * (delta * delta - phi * phi - variance - math.exp(x))) / (
+            2 * (phi * phi + variance + math.exp(x)) ** 2
+        ) - (x - a) / (tau * tau)
+
+    low = a
+    if delta * delta > phi * phi + variance:
+        high = math.log(delta * delta - phi * phi - variance)
+    else:
+        k = 1
+        while f(a - k * tau) < 0:
+            k += 1
+        high = a - k * tau
+    f_low, f_high = f(low), f(high)
+    while abs(high - low) > epsilon:
+        mid = low + ((low - high) * f_low) / (f_high - f_low)
+        f_mid = f(mid)
+        if f_mid * f_high <= 0:
+            low, f_low = high, f_high
+        else:
+            f_low /= 2
+        high, f_high = mid, f_mid
+    sigma_new = math.exp(low / 2)
+    phi_star = math.sqrt(phi * phi + sigma_new * sigma_new)
+    phi_new = 1 / math.sqrt(1 / (phi_star * phi_star) + 1 / variance)
+    mu_new = mu + phi_new * phi_new * total
+    return {
+        "rating": _STAT_G_RATING + scale * mu_new,
+        "rd": min(_STAT_G_RD, scale * phi_new),
+        "volatility": sigma_new,
+    }
+
+
+def _stat_rated(clean):
+    # Unlike site `src/lib/stats.ts:1590`, a completed campaign without a
+    # winner is stored but not rated: the site scored it as a loss for both
+    # sides. Keep in sync with the SQL selections of rated campaigns below.
+    return (
+        clean["kind"] == "campaign"
+        and clean["modeId"] == "campaign"
+        and (
+            clean["endReason"] == "draw"
+            or (
+                clean["endReason"] == "completed" and clean["winner"] in ("RED", "BLUE")
+            )
+        )
+    )
+
+
+def _stat_ms(moment):
+    return int(moment.timestamp() * 1000)
+
+
+async def _stat_rate(conn, clean, ended_ms):
+    # One Glicko-2 period per rated player against the composite other side.
+    # The season comes from endedAt; late results rate only their own season.
+    reds = [p for p in clean["participants"] if p["team"] == "RED"]
+    blues = [p for p in clean["participants"] if p["team"] == "BLUE"]
+    if not reds or not blues:
+        return None
+    season = stat_season_at(ended_ms)
+    season_number = int(season["id"][1:])
+    # Rating updates and rebuilds serialize across replicas, like the site
+    # transaction lock (`src/lib/database.ts` pg_advisory_xact_lock(782344, 1)).
+    await conn.execute("SELECT pg_advisory_xact_lock(782344, 1)")
+    season_start_ms = _stat_parse_iso(season["startsAt"])
+    before = {}
+    for participant in reds + blues:
+        uuid = participant["uuid"]
+        row = await one(
+            conn,
+            "SELECT rating,rd,volatility,rated_campaigns,last_rated_at FROM stat_ratings WHERE season_id=%s AND uuid=%s",
+            (season["id"], uuid),
+        )
+        if row is not None:
+            rating = _stat_glicko_inflate(
+                {
+                    "rating": row["rating"],
+                    "rd": row["rd"],
+                    "volatility": row["volatility"],
+                },
+                max(0, ended_ms - _stat_ms(row["last_rated_at"]))
+                // STAT_RATING_PERIOD_MS,
+            )
+            campaigns = row["rated_campaigns"]
+        else:
+            previous = await one(
+                conn,
+                "SELECT rating,rd,volatility,CAST(substr(season_id,2) AS INTEGER) AS season_number FROM stat_ratings"
+                " WHERE uuid=%s AND CAST(substr(season_id,2) AS INTEGER)<%s ORDER BY season_number DESC LIMIT 1",
+                (uuid, season_number),
+            )
+            if previous is not None:
+                rating = _stat_glicko_inflate(
+                    _stat_glicko_soft_reset(
+                        {
+                            "rating": previous["rating"],
+                            "rd": previous["rd"],
+                            "volatility": previous["volatility"],
+                        },
+                        season_number - previous["season_number"],
+                    ),
+                    max(0, ended_ms - season_start_ms) // STAT_RATING_PERIOD_MS,
+                )
+            else:
+                rating = _stat_glicko_initial()
+            campaigns = 0
+        before[uuid] = (rating, campaigns)
+    ended_at = datetime.fromtimestamp(ended_ms / 1000, tz=timezone.utc)
+    for team, own, foes in (("RED", reds, blues), ("BLUE", blues, reds)):
+        opponent = _stat_glicko_composite([before[o["uuid"]][0] for o in foes])
+        # Site `src/lib/stats.ts:908`: a draw splits the point, otherwise the
+        # winning team takes it (winner-NONE completions are never rated).
+        score = (
+            0.5
+            if clean["endReason"] == "draw"
+            else (1 if clean["winner"] == team else 0)
+        )
+        for participant in own:
+            source, campaigns = before[participant["uuid"]]
+            target = _stat_glicko_update(
+                source, [{"opponent": opponent, "score": score}]
+            )
+            await conn.execute(
+                "INSERT INTO stat_ratings(season_id,uuid,rating,rd,volatility,rated_campaigns,last_rated_at) VALUES(%s,%s,%s,%s,%s,%s,%s)"
+                " ON CONFLICT(season_id,uuid) DO UPDATE SET rating=excluded.rating,rd=excluded.rd,"
+                " volatility=excluded.volatility,rated_campaigns=excluded.rated_campaigns,"
+                " last_rated_at=GREATEST(stat_ratings.last_rated_at,excluded.last_rated_at)",
+                (
+                    season["id"],
+                    participant["uuid"],
+                    target["rating"],
+                    target["rd"],
+                    target["volatility"],
+                    campaigns + 1,
+                    ended_at,
+                ),
+            )
+            await conn.execute(
+                "INSERT INTO stat_rating_changes(server_id,event_id,uuid,rules_version,team,score,opp_rating,opp_rd,"
+                "before_rating,before_rd,before_volatility,after_rating,after_rd,after_volatility,rated_at,season_id)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    clean["serverId"],
+                    clean["eventId"],
+                    participant["uuid"],
+                    STAT_RULES_VERSION,
+                    team,
+                    score,
+                    opponent["rating"],
+                    opponent["rd"],
+                    source["rating"],
+                    source["rd"],
+                    source["volatility"],
+                    target["rating"],
+                    target["rd"],
+                    target["volatility"],
+                    ended_at,
+                    season["id"],
+                ),
+            )
+    return season["id"]
+
+
+async def _stat_rebuild_ratings(conn, season):
+    # Deterministic replay of every non-voided rated campaign from the season
+    # on, in endedAt/serverId/eventId order; earlier seasons (the carry-over
+    # source) stay untouched. Call inside a transaction.
+    number = int(season["id"][1:])
+    await conn.execute("SELECT pg_advisory_xact_lock(782344, 1)")
+    await conn.execute(
+        "DELETE FROM stat_rating_changes WHERE CAST(substr(season_id,2) AS INTEGER)>=%s",
+        (number,),
+    )
+    await conn.execute(
+        "DELETE FROM stat_ratings WHERE CAST(substr(season_id,2) AS INTEGER)>=%s",
+        (number,),
+    )
+    args: tuple = () if number == 1 else (_stat_dt(season["startsAt"]),)
+    matches = await rows(
+        conn,
+        "SELECT payload,ended_at FROM stat_results WHERE kind='campaign' AND mode='campaign' AND (reason='draw' OR (reason='completed' AND winner IN ('RED','BLUE')))"
+        + ("" if number == 1 else " AND ended_at>=%s")
+        + " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=stat_results.server_id AND v.event_id=stat_results.event_id)"
+        + " ORDER BY ended_at,server_id,event_id",
+        args,
+    )
+    for match in matches:
+        await _stat_rate(conn, match["payload"], _stat_ms(match["ended_at"]))
+
+
+async def stat_backfill_ratings(conn):
+    # One-time replay for results ingested before 005 created the ratings
+    # store. Idempotent (the rebuild deletes before replaying); under the same
+    # advisory lock ingest uses, so a concurrent ingest serializes behind it.
+    first = await one(
+        conn,
+        "SELECT MIN(ended_at) AS first FROM stat_results WHERE kind='campaign' AND mode='campaign' AND (reason='draw' OR (reason='completed' AND winner IN ('RED','BLUE')))"
+        " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=stat_results.server_id AND v.event_id=stat_results.event_id)",
+    )
+    if first is None or first["first"] is None:
+        return None
+    season = stat_season_at(_stat_ms(first["first"]))
+    await _stat_rebuild_ratings(conn, season)
+    return season["id"]
+
+
+# At most this many campaigns per rebuild batch: the rating-lock hold is
+# bounded by the batch, never by history length.
+STAT_REBUILD_BATCH = 200
+
+
+async def _stat_enqueue_rebuild(conn, season_id, server_id, event_id, from_at):
+    # Every rebuild enqueue carries its from-point: the triggering campaign's
+    # endedAt, or None for season start (gap scan). Each enqueue also bumps
+    # the generation counter, so a worker batch that read the row earlier
+    # cannot commit over it (compare-and-swap in stat_rebuild_drain). A
+    # re-enqueue never moves the cursor forward past unrated work: a
+    # from-point at or behind the cursor restarts the replay from the season
+    # start (NULL cursor), otherwise the in-progress cursor is kept and the
+    # replay reaches the new campaign on its own. The <= (not <) matters: a
+    # void of exactly the cursor campaign must re-rate it, not skip it.
+    # Restart (not resume-from-point) is required: re-rating committed
+    # campaigns collides with the stat_rating_changes primary key, and a
+    # Glicko-2 suffix replay without its prefix state rates wrong.
+    await conn.execute(
+        "INSERT INTO stat_rating_rebuilds(season_id,server_id,event_id) VALUES(%s,%s,%s)"
+        " ON CONFLICT(season_id) DO UPDATE SET server_id=excluded.server_id,"
+        " event_id=excluded.event_id,requested_at=now(),"
+        " generation=stat_rating_rebuilds.generation+1,"
+        " last_ended_at=CASE WHEN stat_rating_rebuilds.last_ended_at IS NULL OR %s::timestamptz IS NULL"
+        " OR (%s,%s,%s)<=(stat_rating_rebuilds.last_ended_at,stat_rating_rebuilds.last_server_id,stat_rating_rebuilds.last_event_id)"
+        " THEN NULL ELSE stat_rating_rebuilds.last_ended_at END,"
+        " last_server_id=CASE WHEN stat_rating_rebuilds.last_ended_at IS NULL OR %s::timestamptz IS NULL"
+        " OR (%s,%s,%s)<=(stat_rating_rebuilds.last_ended_at,stat_rating_rebuilds.last_server_id,stat_rating_rebuilds.last_event_id)"
+        " THEN NULL ELSE stat_rating_rebuilds.last_server_id END,"
+        " last_event_id=CASE WHEN stat_rating_rebuilds.last_ended_at IS NULL OR %s::timestamptz IS NULL"
+        " OR (%s,%s,%s)<=(stat_rating_rebuilds.last_ended_at,stat_rating_rebuilds.last_server_id,stat_rating_rebuilds.last_event_id)"
+        " THEN NULL ELSE stat_rating_rebuilds.last_event_id END",
+        (
+            season_id,
+            server_id,
+            event_id,
+            from_at,
+            from_at,
+            server_id,
+            event_id,
+            from_at,
+            from_at,
+            server_id,
+            event_id,
+            from_at,
+            from_at,
+            server_id,
+            event_id,
+        ),
+    )
+
+
+async def _stat_rebuilding(conn, season_id):
+    # A rebuild of an earlier season replays every later season too, so any
+    # queued season at or before the requested one means stale ratings.
+    row = await one(
+        conn,
+        "SELECT 1 AS pending FROM stat_rating_rebuilds"
+        " WHERE season_id~'^s[0-9]+$' AND CAST(substr(season_id,2) AS INTEGER)<=%s",
+        (int(season_id[1:]),),
+    )
+    return row is not None
+
+
+async def _stat_rebuild_batch(conn, season, cursor):
+    # One bounded batch of the season replay inside the caller's transaction.
+    # Returns the new cursor, or None when the replay reached the end of
+    # history. A NULL cursor starts over: earlier seasons (the carry-over
+    # source) stay untouched, like _stat_rebuild_ratings.
+    number = int(season["id"][1:])
+    await conn.execute("SELECT pg_advisory_xact_lock(782344, 1)")
+    if cursor == (None, None, None):
+        await conn.execute(
+            "DELETE FROM stat_rating_changes WHERE CAST(substr(season_id,2) AS INTEGER)>=%s",
+            (number,),
+        )
+        await conn.execute(
+            "DELETE FROM stat_ratings WHERE CAST(substr(season_id,2) AS INTEGER)>=%s",
+            (number,),
+        )
+        # The wipe covers every later season too, so later queued rows restart
+        # as well: resuming one from its stale cursor would skip its already
+        # replayed prefix and miss ratings. The reset bumps their generation,
+        # so no batch that read a later row earlier can commit over it.
+        await conn.execute(
+            "UPDATE stat_rating_rebuilds SET last_ended_at=NULL,last_server_id=NULL,last_event_id=NULL,"
+            "generation=generation+1"
+            " WHERE season_id~'^s[0-9]+$' AND CAST(substr(season_id,2) AS INTEGER)>%s",
+            (number,),
+        )
+    where = (
+        "kind='campaign' AND mode='campaign' AND (reason='draw' OR (reason='completed' AND winner IN ('RED','BLUE')))"
+        " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=stat_results.server_id AND v.event_id=stat_results.event_id)"
+    )
+    args: tuple = ()
+    if number != 1 and cursor == (None, None, None):
+        where += " AND ended_at>=%s"
+        args = (_stat_dt(season["startsAt"]),)
+    elif cursor != (None, None, None):
+        where += " AND (ended_at,server_id,event_id)>(%s,%s,%s)"
+        args = cursor
+    matches = await rows(
+        conn,
+        "SELECT payload,ended_at,server_id,event_id FROM stat_results WHERE "
+        + where
+        + " ORDER BY ended_at,server_id,event_id LIMIT "
+        + str(STAT_REBUILD_BATCH),
+        args,
+    )
+    for match in matches:
+        await _stat_rate(conn, match["payload"], _stat_ms(match["ended_at"]))
+    if not matches:
+        return None
+    last = matches[-1]
+    return (last["ended_at"], last["server_id"], last["event_id"])
+
+
+async def stat_rebuild_drain(conn):
+    # One bounded batch per call, inside the caller's transaction. The queue
+    # row is read without locking it, so a concurrent void/ingest enqueue
+    # never waits on the replay; the generation compare-and-swap below turns
+    # a concurrent enqueue into another pass instead of losing it. Returns
+    # the rebuilt season id, or None when idle. The worker always serves the
+    # earliest queued season first: a later season's ratings carry over from
+    # the earlier one, so a later row waits while an earlier replay is
+    # pending. The batch commits only when its guarded write hits: the
+    # rating writes and the cursor advance share one transaction, and a
+    # generation bump by any concurrent enqueue/reset makes the write miss,
+    # so the batch rolls back to the savepoint and the next pass re-reads
+    # the fresh row instead of committing stale ratings or a stale cursor.
+    row = await one(
+        conn,
+        "SELECT season_id,generation,last_ended_at,last_server_id,last_event_id"
+        " FROM stat_rating_rebuilds ORDER BY CASE WHEN season_id~'^s[0-9]+$'"
+        " THEN CAST(substr(season_id,2) AS INTEGER) ELSE 2147483647 END,requested_at LIMIT 1",
+    )
+    if row is None:
+        return None
+    season = next((s for s in stat_seasons() if s["id"] == row["season_id"]), None)
+    if season is None:
+        await conn.execute(
+            "DELETE FROM stat_rating_rebuilds WHERE season_id=%s",
+            (row["season_id"],),
+        )
+        return None
+    cursor = (
+        (None, None, None)
+        if row["last_ended_at"] is None
+        else (row["last_ended_at"], row["last_server_id"], row["last_event_id"])
+    )
+    await conn.execute("SAVEPOINT stat_rebuild_batch")
+    advanced = await _stat_rebuild_batch(conn, season, cursor)
+    if advanced is None:
+        # End of history: drop the row only if nobody re-enqueued during the
+        # batch, otherwise the new request gets its own pass.
+        done = await conn.execute(
+            "DELETE FROM stat_rating_rebuilds WHERE season_id=%s AND generation=%s",
+            (row["season_id"], row["generation"]),
+        )
+    else:
+        done = await conn.execute(
+            "UPDATE stat_rating_rebuilds SET last_ended_at=%s,last_server_id=%s,last_event_id=%s"
+            " WHERE season_id=%s AND generation=%s",
+            (*advanced, row["season_id"], row["generation"]),
+        )
+    if done.rowcount == 0:
+        await conn.execute("ROLLBACK TO SAVEPOINT stat_rebuild_batch")
+    return season["id"]
+
+
+async def stat_gap_scan(conn):
+    # Self-healing gap detection: the earliest rated campaign with no
+    # stat_rating_changes row was committed by a path that never rated it
+    # (pre-005 rows, an old instance during rollout, or a lost race). Enqueue
+    # a rebuild from its season; idempotent, never a duplicate row.
+    gap = await one(
+        conn,
+        "SELECT r.server_id,r.event_id,r.ended_at FROM stat_results r"
+        " WHERE r.kind='campaign' AND r.mode='campaign' AND (r.reason='draw' OR (r.reason='completed' AND r.winner IN ('RED','BLUE')))"
+        " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=r.server_id AND v.event_id=r.event_id)"
+        " AND NOT EXISTS(SELECT 1 FROM stat_rating_changes c WHERE c.server_id=r.server_id AND c.event_id=r.event_id)"
+        " AND EXISTS(SELECT 1 FROM stat_participants p WHERE p.server_id=r.server_id AND p.event_id=r.event_id AND p.team='RED')"
+        " AND EXISTS(SELECT 1 FROM stat_participants p WHERE p.server_id=r.server_id AND p.event_id=r.event_id AND p.team='BLUE')"
+        " ORDER BY r.ended_at,r.server_id,r.event_id LIMIT 1",
+    )
+    if gap is None:
+        return None
+    season = stat_season_at(_stat_ms(gap["ended_at"]))
+    busy = await one(
+        conn,
+        "SELECT 1 AS busy FROM stat_rating_rebuilds"
+        " WHERE season_id~'^s[0-9]+$' AND CAST(substr(season_id,2) AS INTEGER)<=%s"
+        " AND last_ended_at IS NOT NULL",
+        (int(season["id"][1:]),),
+    )
+    if busy is not None:
+        # An earlier-or-equal replay is already progressing: it covers the gap
+        # when committed before its cursor passes, and a later scan heals the
+        # rest. Enqueuing here would restart the in-flight replay, so the
+        # periodic scan would churn replays longer than its own interval.
+        return None
+    await _stat_enqueue_rebuild(
+        conn, season["id"], gap["server_id"], gap["event_id"], None
+    )
+    return season["id"]
+
+
+async def _stat_try_worker_lock(conn):
+    # One rebuild worker across all CP replicas: the loop holds this
+    # session-level lock for its whole life; a replica that cannot take it
+    # just sleeps and retries instead of replaying concurrently. Call inside
+    # a committing transaction (the session lock survives the commit).
+    row = await one(
+        conn,
+        "SELECT pg_try_advisory_lock(hashtext('stats-rebuild-worker'),1) AS held",
+    )
+    return bool(row["held"])
+
+
+async def stat_rebuild_loop(db, interval=0.5, gap_interval=300.0):
+    # Background worker: the void request only enqueues (fast commit), this
+    # loop replays one bounded batch per poll. A crash between enqueue and
+    # replay just leaves the row for the next poll; an unknown season id is
+    # dropped, never retried forever. The gap scan on start and every
+    # gap_interval heals campaigns committed by paths that never rated them.
+    # The loop holds one checked-out connection for its whole life so the
+    # session worker lock above survives across batch transactions.
+    import asyncio
+    import time
+
+    async with db.pool.connection() as conn:
+        # The try-lock SELECT must run inside a committing transaction: a
+        # bare SELECT would leave an implicit transaction open, and every
+        # later batch would nest inside it and never durably commit. The
+        # session lock itself survives the commit.
+        while True:
+            async with conn.transaction():
+                if await _stat_try_worker_lock(conn):
+                    break
+            await asyncio.sleep(interval)
+        last_gap = 0.0
+        while True:
+            try:
+                if time.monotonic() - last_gap >= gap_interval:
+                    async with conn.transaction():
+                        await stat_gap_scan(conn)
+                    last_gap = time.monotonic()
+                async with conn.transaction():
+                    await stat_rebuild_drain(conn)
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+
+
+def _stat_window(query):
+    return (
+        datetime.fromtimestamp(query["since"] / 1000, tz=timezone.utc),
+        datetime.fromtimestamp(query["until"] / 1000, tz=timezone.utc),
+    )
+
+
+def _stat_alive():
+    return "NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=r.server_id AND v.event_id=r.event_id)"
+
+
+async def stat_leaderboard(conn, query, uuid=None):
+    # Campaign summaries never count twice: combat metrics come from matches
+    # only. Rank is numbered over the whole filtered aggregate before the
+    # uuid/page cut, so a player's rank matches the board.
+    since, until = _stat_window(query)
+    where = (
+        "r.kind='match' AND " + _stat_alive() + " AND r.ended_at>=%s AND r.ended_at<=%s"
+        " AND (%s::text IS NULL OR r.mode=%s)"
+    )
+    args = [since, until, query["mode"], query["mode"]]
+    found = await rows(
+        conn,
+        "SELECT * FROM (SELECT *,ROW_NUMBER() OVER (ORDER BY "
+        + STAT_SORTS[query["sort"]]
+        + ' DESC,uuid ASC) AS "rank" FROM ('
+        "SELECT p.uuid,pr.name,SUM(p.score) AS score,SUM(p.kills) AS kills,SUM(p.deaths) AS deaths,"
+        "SUM(p.captures) AS captures,SUM(p.neutralizations) AS neutralizations,"
+        'SUM(p.point_seconds) AS "pointSeconds",SUM(p.play_seconds) AS "playSeconds",'
+        'SUM(p.suicides) AS suicides,SUM(p.team_kills) AS "teamKills",MAX(p.max_streak) AS "maxKillstreak",'
+        "COUNT(*) AS matches,SUM(CASE WHEN r.reason='completed' AND ("
+        "(r.mode='deathmatch' AND (r.payload->>'winnerUuid')=p.uuid) OR "
+        "(r.mode!='deathmatch' AND p.team!='NONE' AND r.winner=p.team)"
+        ") THEN 1 ELSE 0 END) AS wins,"
+        "ROUND(CAST(SUM(p.kills)*1.0/greatest(1,SUM(p.deaths)) AS NUMERIC),3) AS kd,"
+        'MAX(rt.rating) AS rating,MAX(rt.rd) AS rd,MAX(rt.rated_campaigns) AS "ratedCampaigns"'
+        " FROM stat_participants p JOIN stat_results r USING(server_id,event_id)"
+        " JOIN stat_profiles pr ON pr.uuid=p.uuid"
+        " LEFT JOIN stat_ratings rt ON rt.season_id=%s AND rt.uuid=p.uuid"
+        " WHERE " + where + " GROUP BY p.uuid,pr.name) aggregate_rows) ranked_rows"
+        ' WHERE (%s::text IS NULL OR uuid=%s) ORDER BY "rank" LIMIT %s OFFSET %s',
+        (
+            query["mmrSeason"],
+            *args,
+            uuid,
+            uuid,
+            query["limit"],
+            (query["page"] - 1) * query["limit"],
+        ),
+    )
+    total = await one(
+        conn,
+        "SELECT COUNT(DISTINCT p.uuid) AS total FROM stat_participants p"
+        " JOIN stat_results r USING(server_id,event_id) WHERE " + where,
+        args,
+    )
+    players = []
+    for row in found:
+        players.append(
+            {
+                "uuid": row["uuid"],
+                "name": _stat_display_name(row["name"]),
+                "rank": row["rank"],
+                "score": _stat_num(float(row["score"])),
+                "kills": int(row["kills"]),
+                "deaths": int(row["deaths"]),
+                "kd": _stat_num(float(row["kd"])),
+                "captures": int(row["captures"]),
+                "neutralizations": int(row["neutralizations"]),
+                "pointSeconds": int(row["pointSeconds"]),
+                "playSeconds": int(row["playSeconds"]),
+                "suicides": int(row["suicides"]),
+                "teamKills": int(row["teamKills"]),
+                "maxKillstreak": int(row["maxKillstreak"]),
+                "matches": row["matches"],
+                "wins": int(row["wins"]),
+                "mmr": _stat_mmr(
+                    {
+                        "rating": row["rating"],
+                        "rd": row["rd"],
+                        "ratedCampaigns": row["ratedCampaigns"],
+                    }
+                    if row["rating"] is not None
+                    else None
+                ),
+            }
+        )
+    return {
+        "schemaVersion": 1,
+        "checkedAt": _stat_iso(int(now().timestamp() * 1000)),
+        "mode": query["mode"],
+        "season": query["season"],
+        "mmrSeason": query["mmrSeason"],
+        "page": query["page"],
+        "limit": query["limit"],
+        "total": total["total"],
+        "ratingStatus": STAT_RULES_VERSION,
+        "ratingsRebuilding": await _stat_rebuilding(conn, query["mmrSeason"]),
+        "players": players,
+    }
+
+
+async def stat_player(conn, query, player_uuid):
+    if not STAT_UUID.match(player_uuid or ""):
+        raise Problem("invalid_player", 400)
+    profile = await one(
+        conn,
+        "SELECT uuid,name,last_seen FROM stat_profiles WHERE uuid=%s",
+        (player_uuid,),
+    )
+    if profile is None:
+        raise Problem("player_not_found", 404)
+    since, until = _stat_window(query)
+    totals = (
+        await stat_leaderboard(conn, {**query, "page": 1, "limit": 1}, player_uuid)
+    )["players"]
+    history = await rows(
+        conn,
+        'SELECT r.event_id AS "eventId",r.server_id AS "serverId",r.kind,r.mode,'
+        'r.campaign_id AS "campaignSessionId",r.ended_at,r.reason,r.winner,'
+        "(r.payload->>'winnerUuid') AS \"winnerUuid\",p.team,p.score,p.kills,p.deaths"
+        " FROM stat_participants p JOIN stat_results r USING(server_id,event_id)"
+        " WHERE p.uuid=%s AND "
+        + _stat_alive()
+        + " AND r.ended_at>=%s AND r.ended_at<=%s"
+        " AND (%s::text IS NULL OR r.mode=%s)"
+        " ORDER BY r.ended_at DESC,r.server_id,r.event_id LIMIT %s OFFSET %s",
+        (
+            player_uuid,
+            since,
+            until,
+            query["mode"],
+            query["mode"],
+            query["limit"],
+            (query["page"] - 1) * query["limit"],
+        ),
+    )
+    classes = await rows(
+        conn,
+        'SELECT c.class_id AS "classId",c.variant_id AS "variantId",'
+        'SUM(c.time_seconds) AS "timeSeconds",SUM(c.kills) AS kills,'
+        'SUM(c.deaths) AS deaths,SUM(c.point_seconds) AS "pointSeconds"'
+        " FROM stat_classes c JOIN stat_results r USING(server_id,event_id)"
+        " WHERE r.kind='match' AND " + _stat_alive() + " AND c.uuid=%s"
+        " AND r.ended_at>=%s AND r.ended_at<=%s AND (%s::text IS NULL OR r.mode=%s)"
+        " GROUP BY c.class_id,c.variant_id"
+        ' ORDER BY "timeSeconds" DESC,c.class_id,c.variant_id',
+        (player_uuid, since, until, query["mode"], query["mode"]),
+    )
+    campaigns = await one(
+        conn,
+        "SELECT COUNT(*) AS completed,COALESCE(SUM(CASE WHEN r.winner=p.team AND p.team!='NONE' THEN 1 ELSE 0 END),0) AS wins"
+        " FROM stat_participants p JOIN stat_results r USING(server_id,event_id)"
+        " WHERE r.kind='campaign' AND "
+        + _stat_alive()
+        + " AND r.reason IN ('completed','draw') AND p.uuid=%s"
+        " AND r.ended_at>=%s AND r.ended_at<=%s AND (%s::text IS NULL OR r.mode=%s)",
+        (player_uuid, since, until, query["mode"], query["mode"]),
+    )
+    rating = await one(
+        conn,
+        'SELECT rating,rd,rated_campaigns AS "ratedCampaigns" FROM stat_ratings WHERE season_id=%s AND uuid=%s',
+        (query["mmrSeason"], player_uuid),
+    )
+    changes = await rows(
+        conn,
+        'SELECT event_id AS "campaignSessionId",rated_at,team,score,'
+        "ROUND(before_rating) AS before,ROUND(after_rating) AS after,ROUND(after_rd) AS rd"
+        " FROM stat_rating_changes WHERE uuid=%s AND season_id=%s AND rated_at>=%s AND rated_at<=%s"
+        " AND (%s::text IS NULL OR %s::text='campaign') ORDER BY rated_at DESC,event_id LIMIT 20",
+        (player_uuid, query["mmrSeason"], since, until, query["mode"], query["mode"]),
+    )
+    return {
+        "schemaVersion": 1,
+        "checkedAt": _stat_iso(int(now().timestamp() * 1000)),
+        "season": query["season"],
+        "mmrSeason": query["mmrSeason"],
+        "profile": {
+            "uuid": profile["uuid"],
+            "name": _stat_display_name(profile["name"]),
+            "lastSeen": _stat_ms(profile["last_seen"]),
+        },
+        "totals": totals[0] if totals else None,
+        "classes": [
+            {
+                "classId": row["classId"],
+                "variantId": row["variantId"],
+                "timeSeconds": int(row["timeSeconds"]),
+                "kills": int(row["kills"]),
+                "deaths": int(row["deaths"]),
+                "pointSeconds": int(row["pointSeconds"]),
+            }
+            for row in classes
+        ],
+        "campaigns": {
+            "completed": campaigns["completed"],
+            "wins": int(campaigns["wins"]),
+        },
+        "history": [
+            {
+                "eventId": row["eventId"],
+                "serverId": row["serverId"],
+                "kind": row["kind"],
+                "mode": row["mode"],
+                "campaignSessionId": row["campaignSessionId"],
+                "endedAt": _stat_ms(row["ended_at"]),
+                "reason": row["reason"],
+                "winner": row["winner"],
+                "winnerUuid": row["winnerUuid"],
+                "team": row["team"],
+                "score": _stat_num(float(row["score"])),
+                "kills": row["kills"],
+                "deaths": row["deaths"],
+            }
+            for row in history
+        ],
+        "page": query["page"],
+        "limit": query["limit"],
+        "mmr": _stat_mmr(
+            {
+                "rating": rating["rating"],
+                "rd": rating["rd"],
+                "ratedCampaigns": rating["ratedCampaigns"],
+            }
+            if rating is not None
+            else None
+        ),
+        "ratingHistory": [
+            {
+                "campaignSessionId": row["campaignSessionId"],
+                "ratedAt": _stat_ms(row["rated_at"]),
+                "team": row["team"],
+                "score": _stat_num(float(row["score"])),
+                "before": int(row["before"]),
+                "after": int(row["after"]),
+                "rd": int(row["rd"]),
+            }
+            for row in changes
+        ],
+        "ratingStatus": STAT_RULES_VERSION,
+        "ratingsRebuilding": await _stat_rebuilding(conn, query["mmrSeason"]),
+    }
+
+
+async def stat_hitreg(conn, query):
+    # Hit-reg telemetry aggregated over a window, straight from PostgreSQL;
+    # per-row telemetry is never parsed in Python. The scan stops at the
+    # newest STAT_HITREG_SCAN_CAP matches (`truncated` says so).
+    if query["mode"] is not None and query["mode"] not in STAT_MODES:
+        _stat_filter_invalid()
+    since, until = _stat_window(query)
+    scan = (
+        "SELECT (payload->'telemetry') AS t,"
+        "row_number() OVER (ORDER BY ended_at DESC,server_id,event_id) AS rn FROM stat_results r"
+        " WHERE kind='match' AND "
+        + _stat_alive()
+        + " AND ended_at>=%s AND ended_at<=%s"
+        " AND (%s::text IS NULL OR mode=%s) LIMIT " + str(STAT_HITREG_SCAN_CAP + 1)
+    )
+    args = (since, until, query["mode"], query["mode"])
+
+    def tele(expr):
+        return "(SELECT " + expr + " FROM tele)"
+
+    def mid(field):
+        return (
+            "percentile_cont(0.5) WITHIN GROUP (ORDER BY (t->>'"
+            + field
+            + "')::double precision)"
+        )
+
+    def p99(field):
+        return (
+            "percentile_cont(0.99) WITHIN GROUP (ORDER BY (t->>'"
+            + field
+            + "')::double precision)"
+        )
+
+    agg = await one(
+        conn,
+        "WITH scan AS (" + scan + "),"
+        "capped AS (SELECT t FROM scan WHERE rn<=" + str(STAT_HITREG_SCAN_CAP) + "),"
+        "tele AS (SELECT t FROM capped WHERE jsonb_typeof(t)='object')"
+        " SELECT (SELECT COUNT(*) FROM capped) AS matches,"
+        "(SELECT COUNT(*) FROM scan)>" + str(STAT_HITREG_SCAN_CAP) + " AS truncated,"
+        '(SELECT COUNT(*) FROM tele) AS "withTelemetry",'
+        + tele("COALESCE(SUM((t->>'shots')::bigint),0)")
+        + " AS shots,"
+        + tele(
+            "COALESCE(SUM((t->>'fallbackShare')::double precision*(t->>'shots')::bigint),0)"
+        )
+        + ' AS "fallbackShots",'
+        + tele("COALESCE(SUM(jsonb_array_length(t->'disputes')),0)")
+        + " AS disputes,"
+        + tele(mid("tickMsP50"))
+        + ' AS "tickMsP50Median",'
+        + tele(p99("tickMsP50"))
+        + ' AS "tickMsP50P99",'
+        + tele(mid("tickMsP99"))
+        + ' AS "tickMsP99Median",'
+        + tele(p99("tickMsP99"))
+        + ' AS "tickMsP99P99",'
+        + tele(mid("ageTicksP50"))
+        + ' AS "ageTicksP50Median",'
+        + tele(p99("ageTicksP50"))
+        + ' AS "ageTicksP50P99",'
+        + tele(mid("rewindTicksP50"))
+        + ' AS "rewindTicksP50Median",'
+        + tele(p99("rewindTicksP50"))
+        + ' AS "rewindTicksP50P99"',
+        args,
+    )
+    counter_rows = await rows(
+        conn,
+        "WITH scan AS (" + scan + "),"
+        "capped AS (SELECT t FROM scan WHERE rn<="
+        + str(STAT_HITREG_SCAN_CAP)
+        + " AND jsonb_typeof(t)='object')"
+        " SELECT name,SUM(value::bigint) AS total FROM capped"
+        " CROSS JOIN LATERAL jsonb_each_text("
+        "CASE WHEN jsonb_typeof(t->'counters')='object' THEN t->'counters' ELSE '{}'::jsonb END"
+        ") c(name,value) GROUP BY name",
+        args,
+    )
+    shots = int(agg["shots"])
+
+    def median(value):
+        return None if value is None else _stat_num(float(value))
+
+    return {
+        "schemaVersion": 1,
+        "checkedAt": _stat_iso(int(now().timestamp() * 1000)),
+        "mode": query["mode"],
+        "matches": agg["matches"],
+        "withTelemetry": agg["withTelemetry"],
+        "telemetryDropped": telemetry_dropped,
+        "truncated": agg["truncated"],
+        "shots": shots,
+        "fallbackShare": _stat_num(float(agg["fallbackShots"]) / shots if shots else 0),
+        "disputes": int(agg["disputes"]),
+        "counters": {row["name"]: int(row["total"]) for row in counter_rows},
+        "tickMsP50Median": median(agg["tickMsP50Median"]),
+        "tickMsP50P99": median(agg["tickMsP50P99"]),
+        "tickMsP99Median": median(agg["tickMsP99Median"]),
+        "tickMsP99P99": median(agg["tickMsP99P99"]),
+        "ageTicksP50Median": median(agg["ageTicksP50Median"]),
+        "ageTicksP50P99": median(agg["ageTicksP50P99"]),
+        "rewindTicksP50Median": median(agg["rewindTicksP50Median"]),
+        "rewindTicksP50P99": median(agg["rewindTicksP50P99"]),
+    }
+
+
+async def stat_void(conn, identity, attempt, model):
+    # attempt is consumed by app.write's completion audit; voids carry no
+    # operation row, like site sessions. Voiding or restoring a rated campaign
+    # replays its season and every later season from scratch, which also folds
+    # in any earlier late results — the site setVoided contract. The replay
+    # must not run inside the 10 s request, nor may the request wait on it:
+    # it only commits the void row and enqueues the season (cursor restarts
+    # only when the voided campaign sits at or behind it, no rating lock), and the background loop replays it in
+    # bounded batches; reads report ratingsRebuilding until it lands.
+    identity.require("stats.void", "prod", "game", "*")
+    server_id, event_id = str(model.serverId), str(model.eventId)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+        (server_id + "/" + event_id,),
+    )
+    match = await one(
+        conn,
+        "SELECT kind,mode,reason,ended_at FROM stat_results WHERE server_id=%s AND event_id=%s",
+        (server_id, event_id),
+    )
+    if match is None:
+        raise Problem("result_not_found", 404)
+    voided = await one(
+        conn,
+        "SELECT 1 FROM stat_result_voids WHERE server_id=%s AND event_id=%s",
+        (server_id, event_id),
+    )
+    if model.voided:
+        if voided is not None:
+            raise Problem("result_void_conflict", 409)
+        await conn.execute(
+            "INSERT INTO stat_result_voids(server_id,event_id,voided_by) VALUES(%s,%s,%s)",
+            (server_id, event_id, str(identity.actor)),
+        )
+    else:
+        if voided is None:
+            raise Problem("result_void_conflict", 409)
+        await conn.execute(
+            "DELETE FROM stat_result_voids WHERE server_id=%s AND event_id=%s",
+            (server_id, event_id),
+        )
+    rebuilt = None
+    if (
+        match["kind"] == "campaign"
+        and match["mode"] == "campaign"
+        and match["reason"] in ("completed", "draw")
+    ):
+        season = stat_season_at(_stat_ms(match["ended_at"]))
+        await _stat_enqueue_rebuild(
+            conn, season["id"], server_id, event_id, match["ended_at"]
+        )
+        rebuilt = season["id"]
+    return {
+        "rebuilt": rebuilt,
+        "match": {
+            "kind": match["kind"],
+            "mode": match["mode"],
+            "mapId": None,
+            "endedAt": _stat_ms(match["ended_at"]),
+        },
+    }

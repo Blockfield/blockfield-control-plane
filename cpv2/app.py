@@ -3,7 +3,7 @@ import json
 import os
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from uuid import UUID, uuid4
 
 import psycopg
@@ -58,6 +58,7 @@ def create_app(dsn=None):
     @asynccontextmanager
     async def lifespan(app):
         await database.open()
+        rebuild_task = None
         try:
             async with database.transaction() as conn:
                 role = await one(
@@ -105,8 +106,15 @@ def create_app(dsn=None):
                 if not await one(conn, "SELECT 1 FROM owner_memberships LIMIT 1"):
                     raise RuntimeError("offline owner bootstrap required")
             await wakeups.start()
+            # Rating replays run here, not in the void request: the request
+            # only enqueues the season, this loop drains it.
+            rebuild_task = asyncio.create_task(core.stat_rebuild_loop(database))
             yield
         finally:
+            if rebuild_task is not None:
+                rebuild_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await rebuild_task
             await wakeups.close()
             await database.close()
 
@@ -644,6 +652,60 @@ def create_app(dsn=None):
         # as the insert, like site sessions.
         result = await write(request, core.stat_ingest, body)
         return JSONResponse(result, status_code=201 if result["inserted"] else 200)
+
+    def stats_query(request, default_period=None):
+        # The site read contracts parse raw query strings (limit "007" is
+        # valid, "25.0" is a 400): keep them strings and let core.stat_filters
+        # apply the same validation.
+        params = {}
+        for key in ("mode", "season", "period", "sort", "limit", "page"):
+            value = request.query_params.get(key)
+            if value is not None:
+                params[key] = value
+        if (
+            default_period is not None
+            and "season" not in params
+            and "period" not in params
+        ):
+            params["period"] = default_period
+        return params
+
+    @app.get("/v2/stats/seasons")
+    async def stats_seasons(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        seasons = core.stat_seasons()
+        return {
+            "schemaVersion": 1,
+            "current": seasons[-1]["id"] if seasons else None,
+            "seasons": seasons,
+        }
+
+    @app.get("/v2/stats/leaderboard")
+    async def stats_leaderboard(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        query = core.stat_filters(stats_query(request))
+        async with database.transaction() as conn:
+            return await core.stat_leaderboard(conn, query)
+
+    @app.get("/v2/stats/players/{player_uuid}")
+    async def stats_player(player_uuid: str, request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        query = core.stat_filters(stats_query(request))
+        async with database.transaction() as conn:
+            return await core.stat_player(conn, query, player_uuid)
+
+    @app.get("/v2/stats/hitreg")
+    async def stats_hitreg(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        # Staff-only window like the site admin hit-reg report: the last
+        # 7 days unless a season or period is given.
+        query = core.stat_filters(stats_query(request, "week"))
+        async with database.transaction() as conn:
+            return await core.stat_hitreg(conn, query)
+
+    @app.post("/v2/stats/results/void")
+    async def stats_void(body: models.StatVoid, request: Request):
+        return await write(request, core.stat_void, body)
 
     @app.post("/v2/site/sessions", status_code=201)
     async def site_session_create(body: models.SiteSessionCreate, request: Request):

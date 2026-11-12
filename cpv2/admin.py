@@ -24,6 +24,7 @@ from cpv2.auth import (
     SITE_SESSIONS_SCOPES,
     SITE_SETTINGS_SCOPES,
     STAFF_SCOPES,
+    STATS_READ_SCOPES,
     STATS_SCOPES,
     invalidate,
     now,
@@ -286,11 +287,15 @@ async def _provision(dsn, spec, bearer_sink=None):
                 | SITE_SETTINGS_SCOPES
                 | SITE_SESSIONS_SCOPES
                 | STATS_SCOPES
+                | STATS_READ_SCOPES
             ) or client.get("human"):
                 raise ValueError("service credential ceiling")
-            if (STAFF_SCOPES | SITE_SETTINGS_SCOPES | SITE_SESSIONS_SCOPES) & set(
-                spec["ceiling"]
-            ) and spec["resource"] != "*":
+            if (
+                STAFF_SCOPES
+                | SITE_SETTINGS_SCOPES
+                | SITE_SESSIONS_SCOPES
+                | STATS_READ_SCOPES
+            ) & set(spec["ceiling"]) and spec["resource"] != "*":
                 raise ValueError("site scopes need an unbound site credential")
             if STATS_SCOPES & set(spec["ceiling"]) and spec["resource"] == "*":
                 raise ValueError("stats.ingest needs a bound producer credential")
@@ -309,6 +314,7 @@ async def _provision(dsn, spec, bearer_sink=None):
             | SITE_SETTINGS_SCOPES
             | SITE_SESSIONS_SCOPES
             | STATS_SCOPES
+            | STATS_READ_SCOPES
         ):
             raise ValueError("unknown scope")
         ttl = spec.get("expiresInSeconds", 3600)

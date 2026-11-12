@@ -69,6 +69,11 @@ ROLE_SCOPES = {
         "settings.gameplay.write",
         "staff.lower.manage",
         "audit.read",
+        # Stats reads mirror the site leaderboard/player/hit-reg contracts;
+        # voids replay MMR like the site admin void. Admins and owners hold
+        # both directly; services hold reads only (see STATS_READ_SCOPES).
+        "stats.read",
+        "stats.void",
         *MODERATION_SCOPES,
         *MODERATION_ADMIN_SCOPES,
         *WORKSHOP_WRITE_SCOPES,
@@ -126,6 +131,12 @@ SITE_SESSIONS_SCOPES = {"site.sessions"}
 # never submit another server's results; the runtime requires the scope on
 # the body's serverId (see core.stat_ingest).
 STATS_SCOPES = {"stats.ingest"}
+# Stats reads (coordination#29 U3): leaderboard, player, hit-reg and seasons
+# with the site's filter/sort/rank contracts. Service-holdable on an unbound
+# (resource "*") credential only — the site SSR, launcher and bot read with
+# it — never in a human role; admins and owners hold it via their role (see
+# ROLE_SCOPES). The public-exposure unit adds domain/rate-limit policy later.
+STATS_READ_SCOPES = {"stats.read"}
 
 
 class Problem(Exception):
@@ -198,6 +209,7 @@ class Identity:
                     | SITE_SETTINGS_SCOPES
                     | SITE_SESSIONS_SCOPES
                     | STATS_SCOPES
+                    | STATS_READ_SCOPES
                 )
             # Service-asserted actor (staff/settings writes via the site
             # principal): the service must be provisioned for the scope, and
@@ -209,6 +221,7 @@ class Identity:
                 | SITE_SETTINGS_SCOPES
                 | SITE_SESSIONS_SCOPES
                 | STATS_SCOPES
+                | STATS_READ_SCOPES
             ):
                 return False
         if self.owner:

@@ -5142,7 +5142,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 4}
+    assert response.json() == {"status": "ok", "schema": 6}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -5150,7 +5150,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 4}
+    assert broken.json() == {"status": "unavailable", "schema": 6}
 
 
 async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
@@ -5166,6 +5166,10 @@ async def test_health_reports_applied_schema_version_before_stats_migration(post
         async with await psycopg.AsyncConnection.connect(
             admin, autocommit=True
         ) as conn:
+            await conn.execute("DROP TABLE control.stat_rating_rebuilds")
+            await conn.execute("DROP TABLE control.stat_result_voids")
+            await conn.execute("DROP TABLE control.stat_rating_changes")
+            await conn.execute("DROP TABLE control.stat_ratings")
             await conn.execute("DROP TABLE control.stat_classes")
             await conn.execute("DROP TABLE control.stat_participants")
             await conn.execute("DROP TABLE control.stat_profiles")
@@ -6834,3 +6838,1872 @@ def test_stats_digest_matches_site_producer_contract():
     assert p3_digest == (
         "03c233d10842cc43553a73bc03f66552debb192ef05c5c3929c7497cad189d0b"
     )
+
+
+async def _stats_reader_token(store, cid="stats-reader"):
+    # Unbound service credential with stats.read (site SSR/launcher/bot path).
+    if cid not in store["tokens"]:
+        store["tokens"][cid] = await provision(
+            store["admin"],
+            {
+                "client": {"id": cid, "via": "game", "ceiling": ["stats.read"]},
+                "ceiling": ["stats.read"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
+    return store["tokens"][cid]
+
+
+def _stats_u3_participant(uuid, name, team, score, kills, deaths, classes, **over):
+    counters = _stats_counter_set()
+    counters.update({"kills": kills, "deaths": deaths, **over})
+    return {
+        "uuid": uuid,
+        "name": name,
+        "team": team,
+        "score": score,
+        **counters,
+        "classes": classes,
+    }
+
+
+def _stats_u3_class(class_id, variant_id, time_seconds, kills, deaths, point_seconds=0):
+    return {
+        "classId": class_id,
+        "variantId": variant_id,
+        "timeSeconds": time_seconds,
+        "kills": kills,
+        "deaths": deaths,
+        "pointSeconds": point_seconds,
+    }
+
+
+def _stats_u3_match_body(
+    event,
+    server,
+    started,
+    ended,
+    winner,
+    participants,
+    telemetry=None,
+    mode="room",
+):
+    body = {
+        "schemaVersion": 1,
+        "eventId": event,
+        "serverId": server,
+        "kind": "match",
+        "sessionPurpose": "gameplay",
+        "modeId": mode,
+        "ranked": False,
+        "rulesetVersion": "review-v1",
+        "matchId": event,
+        "campaignSessionId": None,
+        "mapId": "fields",
+        "startedAt": started,
+        "endedAt": ended,
+        "endReason": "completed",
+        "winner": winner,
+        "participants": participants,
+        "rounds": [],
+    }
+    if telemetry is not None:
+        body["telemetry"] = telemetry
+    return body
+
+
+def _stats_u3_telemetry():
+    return {
+        "shots": 100,
+        "fallbackShare": 0.25,
+        "tickMsP50": 5,
+        "tickMsP99": 20,
+        "ageTicksP50": 2,
+        "tickMsP99Overflow": False,
+        "ageTicksP50Overflow": False,
+        "rewindTicksP50": 1,
+        "rewindTicksP50Overflow": False,
+        "counters": {"hits": 70, "shots_fired": 100},
+        "tickMsBuckets": [{"le": 10, "count": 100}],
+        "ageTickBuckets": [{"le": "inf", "count": 100}],
+        "rewindTickBuckets": [{"le": 3, "count": 100}],
+        "disputes": [{"tick": 7, "kind": "rewind"}],
+    }
+
+
+def _stats_u3_campaign_body(event, server, ended, winner, participants):
+    return {
+        "schemaVersion": 1,
+        "eventId": event,
+        "serverId": server,
+        "kind": "campaign",
+        "sessionPurpose": "gameplay",
+        "modeId": "campaign",
+        "ranked": True,
+        "rulesetVersion": "review-v1",
+        "matchId": None,
+        "campaignSessionId": event,
+        "mapId": None,
+        "startedAt": "2026-11-11T11:00:00Z",
+        "endedAt": ended,
+        "endReason": "completed",
+        "winner": winner,
+        "participants": participants,
+        "rounds": ["33333333-3333-3333-3333-333333333333"],
+    }
+
+
+def _stats_c4_campaign_body(event, ended, winner, started="2026-11-11T11:00:00Z"):
+    body = _stats_u3_campaign_body(
+        event,
+        _U3_SERVER,
+        ended,
+        winner,
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                4,
+                1,
+                3,
+                [_stats_u3_class("assault", "0", 30, 1, 3, 5)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                9,
+                6,
+                1,
+                [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+            ),
+        ],
+    )
+    body["startedAt"] = started
+    return body
+
+
+_U3_SERVER = "55555555-5555-4555-8555-555555555555"
+_U3_PA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+_U3_PB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb2"
+_U3_M1 = "66666666-6666-4666-8666-666666666666"
+_U3_M2 = "77777777-7777-4777-8777-777777777777"
+_U3_C1 = "88888888-8888-4888-8888-888888888888"
+
+
+async def _stats_u3_seed(store):
+    await _stats_token(store, _U3_SERVER, "stats-u3-producer")
+    matches = [
+        _stats_u3_match_body(
+            _U3_M1,
+            _U3_SERVER,
+            "2026-11-11T09:00:00Z",
+            "2026-11-11T10:00:00Z",
+            "RED",
+            [
+                _stats_u3_participant(
+                    _U3_PA,
+                    "Игрок Альфа",
+                    "RED",
+                    10,
+                    5,
+                    0,
+                    [_stats_u3_class("assault", "0", 60, 5, 0, 10)],
+                    captures=1,
+                ),
+                _stats_u3_participant(
+                    _U3_PB,
+                    "Player Beta",
+                    "BLUE",
+                    7,
+                    2,
+                    5,
+                    [_stats_u3_class("recon", "2", 60, 2, 5, 3)],
+                ),
+            ],
+            _stats_u3_telemetry(),
+        ),
+        _stats_u3_match_body(
+            _U3_M2,
+            _U3_SERVER,
+            "2026-11-11T10:00:00Z",
+            "2026-11-11T11:00:00Z",
+            "BLUE",
+            [
+                _stats_u3_participant(
+                    _U3_PA,
+                    "Игрок Альфа",
+                    "RED",
+                    4,
+                    1,
+                    3,
+                    [
+                        _stats_u3_class("assault", "0", 30, 1, 3, 5),
+                        _stats_u3_class("medic", "1", 90, 0, 0, 20),
+                    ],
+                ),
+                _stats_u3_participant(
+                    _U3_PB,
+                    "Player Beta",
+                    "BLUE",
+                    9,
+                    6,
+                    1,
+                    [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+                    captures=1,
+                ),
+            ],
+        ),
+    ]
+    for body in matches:
+        response = await request(
+            store, "POST", "/v2/stats/results", body, "stats-u3-producer"
+        )
+        assert response.status_code == 201, response.text
+    campaign = _stats_u3_campaign_body(
+        _U3_C1,
+        _U3_SERVER,
+        "2026-11-11T12:00:00Z",
+        "RED",
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                12,
+                4,
+                1,
+                [_stats_u3_class("assault", "0", 500, 4, 1, 100)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                8,
+                2,
+                4,
+                [_stats_u3_class("recon", "2", 500, 2, 4, 50)],
+            ),
+        ],
+    )
+    response = await request(
+        store, "POST", "/v2/stats/results", campaign, "stats-u3-producer"
+    )
+    assert response.status_code == 201, response.text
+    await _stats_reader_token(store)
+
+
+async def _stats_wait_idle(store, season="s2", timeout=15):
+    # The void request only enqueues; the background loop replays within a
+    # poll interval. Wait until the season flag clears.
+    deadline = time.monotonic() + timeout
+    while True:
+        board = await request(
+            store, "GET", f"/v2/stats/leaderboard?season={season}", None, "stats-reader"
+        )
+        assert board.status_code == 200, board.text
+        if not board.json()["ratingsRebuilding"]:
+            return board.json()
+        assert time.monotonic() < deadline, "rating rebuild did not finish"
+        await asyncio.sleep(0.2)
+
+
+def test_stats_glicko2_matches_site_algorithm():
+    # Pinned outputs of the site's own glicko2.ts (origin/next e48b327) run
+    # under node (.dev/u-sitedb-u3/parity-battery.mjs + parity-output.json):
+    # the CP port must agree bit-for-bit on the same fixture.
+    from cpv2.core import (
+        _stat_glicko_composite,
+        _stat_glicko_inflate,
+        _stat_glicko_initial,
+        _stat_glicko_soft_reset,
+        _stat_glicko_update,
+        _stat_js_round,
+        _stat_mmr,
+    )
+
+    red0, blue0 = _stat_glicko_initial(), _stat_glicko_initial()
+    red1 = _stat_glicko_update(
+        red0, [{"opponent": _stat_glicko_composite([blue0]), "score": 1}]
+    )
+    blue1 = _stat_glicko_update(
+        blue0, [{"opponent": _stat_glicko_composite([red0]), "score": 0}]
+    )
+    assert red1 == {
+        "rating": 1662.3108939062977,
+        "rd": 290.31896371798047,
+        "volatility": 0.05999967537233814,
+    }
+    assert blue1 == {
+        "rating": 1337.6891060937023,
+        "rd": 290.31896371798047,
+        "volatility": 0.05999967537233814,
+    }
+    assert _stat_mmr(
+        {"rating": red1["rating"], "rd": red1["rd"], "ratedCampaigns": 1}
+    ) == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    inflated = _stat_glicko_inflate(
+        {"rating": red1["rating"], "rd": red1["rd"], "volatility": red1["volatility"]},
+        0,
+    )
+    red2 = _stat_glicko_update(
+        inflated,
+        [
+            {
+                "opponent": _stat_glicko_composite(
+                    [{"rating": blue1["rating"], "rd": blue1["rd"]}]
+                ),
+                "score": 0.5,
+            }
+        ],
+    )
+    assert red2 == {
+        "rating": 1576.6886643068638,
+        "rd": 260.48876356402207,
+        "volatility": 0.05999914867562188,
+    }
+    assert _stat_glicko_soft_reset(
+        {"rating": 1700, "rd": 60, "volatility": 0.06}, 1
+    ) == {
+        "rating": 1600,
+        "rd": 200,
+        "volatility": 0.06,
+    }
+    assert _stat_glicko_soft_reset(
+        {"rating": 1700, "rd": 60, "volatility": 0.06}, 2
+    ) == {
+        "rating": 1550,
+        "rd": 200,
+        "volatility": 0.06,
+    }
+    assert _stat_glicko_composite(
+        [{"rating": 1600, "rd": 100}, {"rating": 1400, "rd": 200}]
+    ) == {
+        "rating": 1500,
+        "rd": 158.11388300841898,
+    }
+    assert _stat_glicko_inflate({"rating": 1600, "rd": 60, "volatility": 0.06}, 3) == {
+        "rating": 1600,
+        "rd": 62.65717069576213,
+        "volatility": 0.06,
+    }
+    assert _stat_glicko_update({"rating": 1600, "rd": 100, "volatility": 0.06}, []) == {
+        "rating": 1600,
+        "rd": 100.54173435212178,
+        "volatility": 0.06,
+    }
+    # Site Math.round is half-up; Python round() is banker's: 1500.5 -> 1501.
+    assert _stat_js_round(1500.5) == 1501
+    assert _stat_mmr({"rating": 1500.5, "rd": 150.0, "ratedCampaigns": 5}) == {
+        "rating": 1501,
+        "rd": 150,
+        "ratedCampaigns": 5,
+        "provisional": False,
+    }
+    assert _stat_mmr({"rating": None, "rd": None, "ratedCampaigns": None}) is None
+
+
+def test_stats_seasons_match_site_contract():
+    # Pinned seasons() output of the site (same node battery): s1 alpha,
+    # s2 to end of 2026, then UTC quarters.
+    from cpv2.core import stat_season_at, stat_seasons
+
+    nov = stat_seasons(1793836800000)
+    assert nov == [
+        {
+            "id": "s1",
+            "name": "Альфа Сезон",
+            "startsAt": "2026-09-14T00:00:00.000Z",
+            "endsAt": "2026-09-25T23:59:59.999Z",
+        },
+        {
+            "id": "s2",
+            "name": "Сезон 1",
+            "startsAt": "2026-09-26T00:00:00.000Z",
+            "endsAt": "2026-12-31T23:59:59.999Z",
+        },
+    ]
+    assert [s["id"] for s in stat_seasons(1805068800000)] == ["s1", "s2", "s3"]
+    assert stat_season_at(1577836800000)["id"] == "s1"
+    assert stat_season_at(1792900000000)["id"] == "s2"
+
+
+async def test_stats_seasons_route(store):
+    await _stats_reader_token(store)
+    response = await request(store, "GET", "/v2/stats/seasons", None, "stats-reader")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["schemaVersion"] == 1
+    assert body["current"] == body["seasons"][-1]["id"]
+    assert [s["id"] for s in body["seasons"][:2]] == ["s1", "s2"]
+    assert body["seasons"][0]["startsAt"] == "2026-09-14T00:00:00.000Z"
+    assert body["seasons"][1] == {
+        "id": "s2",
+        "name": "Сезон 1",
+        "startsAt": "2026-09-26T00:00:00.000Z",
+        "endsAt": "2026-12-31T23:59:59.999Z",
+    }
+
+
+async def test_stats_reads_require_stats_read_scope(store):
+    await _stats_token(store, _U3_SERVER, "stats-u3-producer")
+    await _stats_reader_token(store)
+    for path in (
+        "/v2/stats/seasons",
+        "/v2/stats/leaderboard",
+        f"/v2/stats/players/{_U3_PA}",
+        "/v2/stats/hitreg",
+    ):
+        assert (await store["client"].get(path)).status_code == 401
+        denied = await request(store, "GET", path, None, "stats-u3-producer")
+        assert denied.status_code == 403, denied.text
+        assert denied.json() == {"error": "forbidden"}
+    void = {"serverId": _U3_SERVER, "eventId": _U3_M1, "voided": True}
+    assert (
+        await store["client"].post("/v2/stats/results/void", json=void)
+    ).status_code == 401
+    denied = await request(
+        store, "POST", "/v2/stats/results/void", void, "stats-u3-producer"
+    )
+    assert denied.status_code == 403, denied.text
+    denied = await request(
+        store, "POST", "/v2/stats/results/void", void, "stats-reader"
+    )
+    assert denied.status_code == 403, denied.text
+
+
+async def test_stats_filters_reject_like_site(store):
+    await _stats_reader_token(store)
+    from cpv2.core import stat_seasons
+
+    future = f"s{len(stat_seasons()) + 1}"
+    cases = [
+        "mode=arena",
+        "period=year",
+        "sort=unknown",
+        "season=s2&period=all",
+        "season=s2&period=week",
+        "season=s99",
+        f"season={future}",
+        "limit=0",
+        "limit=101",
+        "limit=abc",
+        "limit=25.0",
+        "page=0",
+        "page=1001",
+        "page=x",
+    ]
+    for query in cases:
+        response = await request(
+            store, "GET", f"/v2/stats/leaderboard?{query}", None, "stats-reader"
+        )
+        assert response.status_code == 400, (query, response.text)
+        assert response.json() == {"error": "invalid_stats_filter"}, query
+
+
+async def test_stats_leaderboard_player_hitreg_roundtrip(store):
+    await _stats_u3_seed(store)
+    board = await request(
+        store, "GET", "/v2/stats/leaderboard?season=s2", None, "stats-reader"
+    )
+    assert board.status_code == 200, board.text
+    body = board.json()
+    assert body["schemaVersion"] == 1
+    assert body["mode"] is None
+    assert body["season"] == "s2"
+    assert body["mmrSeason"] == "s2"
+    assert body["page"] == 1 and body["limit"] == 25
+    assert body["total"] == 2
+    assert body["ratingStatus"] == "glicko2-v1"
+    assert [p["uuid"] for p in body["players"]] == [_U3_PB, _U3_PA]
+    first, second = body["players"]
+    assert (first["rank"], second["rank"]) == (1, 2)
+    assert (first["score"], second["score"]) == (16.0, 14.0)
+    assert (first["kills"], first["deaths"], first["kd"]) == (8, 6, 1.333)
+    assert (second["kills"], second["deaths"], second["kd"]) == (6, 3, 2.0)
+    assert (first["wins"], second["wins"]) == (1, 1)
+    assert (first["matches"], second["matches"]) == (2, 2)
+    assert first["mmr"] == {
+        "rating": 1338,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    assert second["mmr"] == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    # Campaign summaries never count round kills/score twice.
+    assert first["captures"] == 3 and second["captures"] == 3
+    # Sort/rank contract: ties break by uuid ascending.
+    tied = (
+        await request(
+            store,
+            "GET",
+            "/v2/stats/leaderboard?season=s2&sort=captures",
+            None,
+            "stats-reader",
+        )
+    ).json()["players"]
+    assert [(p["uuid"], p["rank"]) for p in tied] == [(_U3_PA, 1), (_U3_PB, 2)]
+    kills = (
+        await request(
+            store,
+            "GET",
+            "/v2/stats/leaderboard?season=s2&sort=kd",
+            None,
+            "stats-reader",
+        )
+    ).json()["players"]
+    assert [p["uuid"] for p in kills] == [_U3_PA, _U3_PB]
+    rated = (
+        await request(
+            store,
+            "GET",
+            "/v2/stats/leaderboard?season=s2&sort=rating",
+            None,
+            "stats-reader",
+        )
+    ).json()["players"]
+    assert [p["uuid"] for p in rated] == [_U3_PA, _U3_PB]
+    empty = (
+        await request(
+            store, "GET", "/v2/stats/leaderboard?season=s1", None, "stats-reader"
+        )
+    ).json()
+    assert empty["total"] == 0 and empty["players"] == [] and empty["mmrSeason"] == "s1"
+
+    player = await request(
+        store, "GET", f"/v2/stats/players/{_U3_PA}?season=s2", None, "stats-reader"
+    )
+    assert player.status_code == 200, player.text
+    data = player.json()
+    assert data["schemaVersion"] == 1
+    assert data["profile"] == {
+        "uuid": _U3_PA,
+        "name": "Игрок Альфа",
+        "lastSeen": 1794398400000,
+    }
+    assert data["totals"]["rank"] == 2
+    assert data["totals"]["score"] == 14.0
+    assert data["campaigns"] == {"completed": 1, "wins": 1}
+    # Classes aggregate matches only: the 500 s campaign breakdown stays out.
+    assert data["classes"] == [
+        {
+            "classId": "assault",
+            "variantId": "0",
+            "timeSeconds": 90,
+            "kills": 6,
+            "deaths": 3,
+            "pointSeconds": 15,
+        },
+        {
+            "classId": "medic",
+            "variantId": "1",
+            "timeSeconds": 90,
+            "kills": 0,
+            "deaths": 0,
+            "pointSeconds": 20,
+        },
+    ]
+    assert [(h["eventId"], h["kind"]) for h in data["history"]] == [
+        (_U3_C1, "campaign"),
+        (_U3_M2, "match"),
+        (_U3_M1, "match"),
+    ]
+    assert data["history"][0]["winner"] == "RED"
+    assert data["history"][2]["winnerUuid"] is None
+    assert data["mmr"] == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    assert data["ratingHistory"] == [
+        {
+            "campaignSessionId": _U3_C1,
+            "ratedAt": 1794398400000,
+            "team": "RED",
+            "score": 1,
+            "before": 1500,
+            "after": 1662,
+            "rd": 290,
+        }
+    ]
+    assert data["ratingStatus"] == "glicko2-v1"
+    unknown = await request(
+        store,
+        "GET",
+        "/v2/stats/players/99999999-9999-4999-8999-999999999999?season=s2",
+        None,
+        "stats-reader",
+    )
+    assert unknown.status_code == 404, unknown.text
+    malformed = await request(
+        store, "GET", "/v2/stats/players/not-a-uuid?season=s2", None, "stats-reader"
+    )
+    assert malformed.status_code == 400, malformed.text
+
+    hitreg = (
+        await request(store, "GET", "/v2/stats/hitreg?season=s2", None, "stats-reader")
+    ).json()
+    assert hitreg["schemaVersion"] == 1
+    assert hitreg["mode"] is None
+    assert hitreg["matches"] == 2
+    assert hitreg["withTelemetry"] == 1
+    assert hitreg["truncated"] is False
+    assert hitreg["shots"] == 100
+    assert hitreg["fallbackShare"] == 0.25
+    assert hitreg["disputes"] == 1
+    assert hitreg["counters"] == {"hits": 70, "shots_fired": 100}
+    assert hitreg["tickMsP50Median"] == 5.0
+    assert hitreg["tickMsP99P99"] == 20.0
+    assert hitreg["ageTicksP50Median"] == 2.0
+    assert hitreg["rewindTicksP50Median"] == 1.0
+
+
+async def test_stats_void_replays_ratings_like_site(store):
+    await _stats_u3_seed(store)
+
+    async def mmr_of(uuid):
+        player = (
+            await request(
+                store,
+                "GET",
+                f"/v2/stats/players/{uuid}?season=s2",
+                None,
+                "stats-reader",
+            )
+        ).json()
+        return player["mmr"], player["ratingHistory"]
+
+    before_a, history_a = await mmr_of(_U3_PA)
+    assert before_a == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+    assert len(history_a) == 1
+    # Matches are not rated: voiding one only removes its battles.
+    match_void = {"serverId": _U3_SERVER, "eventId": _U3_M1, "voided": True}
+    response = await request(
+        store, "POST", "/v2/stats/results/void", match_void, "admin"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["rebuilt"] is None
+    board = (
+        await request(
+            store, "GET", "/v2/stats/leaderboard?season=s2", None, "stats-reader"
+        )
+    ).json()
+    assert {p["uuid"]: (p["matches"], p["score"]) for p in board["players"]} == {
+        _U3_PA: (1, 4.0),
+        _U3_PB: (1, 9.0),
+    }
+    # Voiding the rated campaign enqueues a background replay: the request
+    # returns at once, the worker clears the ratings shortly after.
+    campaign_void = {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True}
+    response = await request(
+        store, "POST", "/v2/stats/results/void", campaign_void, "admin"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["rebuilt"] == "s2"
+    await _stats_wait_idle(store)
+    after_a, history_after = await mmr_of(_U3_PA)
+    assert after_a is None and history_after == []
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    # Double void conflicts; restoring replays the same ratings back.
+    conflict = await request(
+        store, "POST", "/v2/stats/results/void", campaign_void, "admin"
+    )
+    assert conflict.status_code == 409, conflict.text
+    restore = {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": False}
+    response = await request(store, "POST", "/v2/stats/results/void", restore, "admin")
+    assert response.status_code == 200, response.text
+    assert response.json()["rebuilt"] == "s2"
+    await _stats_wait_idle(store)
+    restored_a, history_restored = await mmr_of(_U3_PA)
+    assert restored_a == before_a and history_restored == history_a
+    missing = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": _U3_M2, "voided": False},
+        "admin",
+    )
+    assert missing.status_code == 409, missing.text
+    gone = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {
+            "serverId": _U3_SERVER,
+            "eventId": "99999999-9999-4999-8999-999999999999",
+            "voided": True,
+        },
+        "admin",
+    )
+    assert gone.status_code == 404, gone.text
+
+
+async def test_stats_migration_005_backfills_pre_005_results(store):
+    # Results ingested before 005 have no ratings rows; applying 005 replays
+    # them so the store equals a fresh ingest, and re-migrating is a no-op.
+    from cpv2.db import migrate
+    from psycopg.conninfo import conninfo_to_dict
+
+    await _stats_u3_seed(store)
+    ratings_query = (
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns,last_rated_at"
+        " FROM stat_ratings ORDER BY uuid"
+    )
+    changes_query = (
+        "SELECT server_id,event_id,uuid,rules_version,team,score,opp_rating,opp_rd,"
+        "before_rating,before_rd,before_volatility,after_rating,after_rd,"
+        "after_volatility,rated_at,season_id FROM stat_rating_changes"
+        " ORDER BY server_id,event_id,uuid"
+    )
+    before = await sql(store, ratings_query)
+    changes_before = await sql(store, changes_query)
+    assert len(before) == 2 and len(changes_before) == 2
+    dbname = conninfo_to_dict(store["admin"])["dbname"]
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"], autocommit=True
+    ) as conn:
+        await conn.execute("DROP TABLE control.stat_rating_rebuilds")
+        await conn.execute("DROP TABLE control.stat_result_voids")
+        await conn.execute("DROP TABLE control.stat_rating_changes")
+        await conn.execute("DROP TABLE control.stat_ratings")
+        await conn.execute("DELETE FROM control.schema_migrations WHERE version>=5")
+    await migrate(store["admin"], dbname)
+    assert await sql(store, ratings_query) == before
+    assert await sql(store, changes_query) == changes_before
+    await migrate(store["admin"], dbname)
+    assert await sql(store, ratings_query) == before
+
+
+async def test_stats_winner_none_completed_is_stored_unrated(store):
+    # A completed campaign without a winner is stored but never rated (the
+    # site scored it as a loss for both sides); a draw still splits the point.
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server, "stats-none")
+    await _stats_reader_token(store)
+    participants = [
+        _stats_u3_participant(
+            _U3_PA,
+            "Игрок Альфа",
+            "RED",
+            10,
+            5,
+            0,
+            [_stats_u3_class("assault", "0", 60, 5, 0, 10)],
+        ),
+        _stats_u3_participant(
+            _U3_PB,
+            "Player Beta",
+            "BLUE",
+            7,
+            2,
+            5,
+            [_stats_u3_class("recon", "2", 60, 2, 5, 3)],
+        ),
+    ]
+    none_event = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    none = _stats_u3_campaign_body(
+        none_event, server, "2026-11-11T12:00:00Z", "NONE", participants
+    )
+    created = await request(store, "POST", "/v2/stats/results", none, "stats-none")
+    assert created.status_code == 201, created.text
+    stored = await sql(
+        store, "SELECT 1 FROM stat_results WHERE event_id=%s", (none_event,)
+    )
+    assert len(stored) == 1
+    changes = await sql(
+        store,
+        "SELECT uuid FROM stat_rating_changes WHERE event_id=%s",
+        (none_event,),
+    )
+    assert changes == []
+    ratings = await sql(store, "SELECT uuid FROM stat_ratings WHERE season_id='s2'")
+    assert ratings == []
+    # The gap scan must not treat the unrated campaign as a missing rating.
+    from cpv2.core import stat_gap_scan
+
+    async with store["app"].state.db.transaction() as conn:
+        assert await stat_gap_scan(conn) is None
+    draw_event = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    draw = _stats_u3_campaign_body(
+        draw_event, server, "2026-11-11T13:00:00Z", "NONE", participants
+    )
+    draw["endReason"] = "draw"
+    created = await request(store, "POST", "/v2/stats/results", draw, "stats-none")
+    assert created.status_code == 201, created.text
+    changes = await sql(
+        store,
+        "SELECT uuid,score FROM stat_rating_changes WHERE event_id=%s ORDER BY uuid",
+        (draw_event,),
+    )
+    assert [(row["uuid"], row["score"]) for row in changes] == [
+        (_U3_PA, 0.5),
+        (_U3_PB, 0.5),
+    ]
+
+
+async def test_stats_leaderboard_every_sort_key(store):
+    from cpv2.core import STAT_SORTS
+
+    await _stats_u3_seed(store)
+    for sort in STAT_SORTS:
+        response = await request(
+            store,
+            "GET",
+            f"/v2/stats/leaderboard?season=s2&sort={sort}",
+            None,
+            "stats-reader",
+        )
+        assert response.status_code == 200, (sort, response.text)
+        body = response.json()
+        assert body["total"] == 2 and len(body["players"]) == 2, sort
+        assert body["ratingsRebuilding"] is False, sort
+
+
+async def test_stats_void_returns_fast_and_rebuild_matches_replay(store):
+    await _stats_u3_seed(store)
+    player = (
+        await request(
+            store, "GET", f"/v2/stats/players/{_U3_PA}?season=s2", None, "stats-reader"
+        )
+    ).json()
+    assert player["ratingsRebuilding"] is False
+    started = time.monotonic()
+    response = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+        "admin",
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["rebuilt"] == "s2"
+    assert time.monotonic() - started < 5
+    await _stats_wait_idle(store)
+    # Restore, then immediately ingest a second campaign while the rebuild is
+    # pending: the ingest serializes on the rating lock and stays correct.
+    restore = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": False},
+        "admin",
+    )
+    assert restore.status_code == 200, restore.text
+    second_event = "99999999-9999-4999-8999-999999999999"
+    second = _stats_u3_campaign_body(
+        second_event,
+        _U3_SERVER,
+        "2026-11-11T13:00:00Z",
+        "BLUE",
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                4,
+                1,
+                3,
+                [_stats_u3_class("assault", "0", 30, 1, 3, 5)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                9,
+                6,
+                1,
+                [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+            ),
+        ],
+    )
+    created = await request(
+        store, "POST", "/v2/stats/results", second, "stats-u3-producer"
+    )
+    assert created.status_code == 201, created.text
+    await _stats_wait_idle(store)
+    history = (
+        await request(
+            store, "GET", f"/v2/stats/players/{_U3_PA}?season=s2", None, "stats-reader"
+        )
+    ).json()
+    assert [row["campaignSessionId"] for row in history["ratingHistory"]] == [
+        second_event,
+        _U3_C1,
+    ]
+    assert [row["score"] for row in history["ratingHistory"]] == [0, 1]
+    assert history["mmr"]["ratedCampaigns"] == 2
+    assert history["ratingsRebuilding"] is False
+    # The worker's replay and a manual full replay of the results table agree.
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    from cpv2.core import _stat_rebuild_ratings, stat_seasons
+
+    season = next(s for s in stat_seasons() if s["id"] == "s2")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await _stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c3_batched_replay_never_blocks_requests(store, monkeypatch):
+    # Round 3A: the replay holds the rating lock per bounded batch only. With
+    # a mocked slow batch in flight, a void and an ingest still complete
+    # without waiting for the whole replay, and ratings converge afterwards.
+    await _stats_u3_seed(store)
+    extras = []
+    for hour, event in (
+        ("13", "99999991-9999-4999-8999-999999999999"),
+        ("14", "99999992-9999-4999-8999-999999999999"),
+        ("15", "99999993-9999-4999-8999-999999999999"),
+    ):
+        body = _stats_u3_campaign_body(
+            event,
+            _U3_SERVER,
+            f"2026-11-11T{hour}:00:00Z",
+            "RED" if hour != "14" else "BLUE",
+            [
+                _stats_u3_participant(
+                    _U3_PA,
+                    "Игрок Альфа",
+                    "RED",
+                    4,
+                    1,
+                    3,
+                    [_stats_u3_class("assault", "0", 30, 1, 3, 5)],
+                ),
+                _stats_u3_participant(
+                    _U3_PB,
+                    "Player Beta",
+                    "BLUE",
+                    9,
+                    6,
+                    1,
+                    [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+                ),
+            ],
+        )
+        created = await request(
+            store, "POST", "/v2/stats/results", body, "stats-u3-producer"
+        )
+        assert created.status_code == 201, created.text
+        extras.append(event)
+    real_rate = core._stat_rate
+
+    async def slow_rate(conn, clean, ended_ms):
+        await asyncio.sleep(0.5)
+        return await real_rate(conn, clean, ended_ms)
+
+    monkeypatch.setattr(core, "_stat_rate", slow_rate)
+    voided = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+        "admin",
+    )
+    assert voided.status_code == 200, voided.text
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await core.stat_rebuild_drain(conn)
+
+    replay = asyncio.create_task(drain_once())
+    await asyncio.sleep(0.3)
+    fresh_event = "99999994-9999-4999-8999-999999999999"
+    fresh = _stats_u3_campaign_body(
+        fresh_event,
+        _U3_SERVER,
+        "2026-11-11T16:00:00Z",
+        "BLUE",
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                4,
+                1,
+                3,
+                [_stats_u3_class("assault", "0", 30, 1, 3, 5)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                9,
+                6,
+                1,
+                [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+            ),
+        ],
+    )
+    started = time.monotonic()
+    void_response, ingest_response = await asyncio.gather(
+        request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {"serverId": _U3_SERVER, "eventId": extras[0], "voided": True},
+            "admin",
+        ),
+        request(store, "POST", "/v2/stats/results", fresh, "stats-u3-producer"),
+    )
+    elapsed = time.monotonic() - started
+    assert void_response.status_code == 200, void_response.text
+    assert ingest_response.status_code == 201, ingest_response.text
+    # The replay needs ~2 s (4 campaigns x 0.5 s); neither request waited it out.
+    assert elapsed < 1.5, elapsed
+    assert not replay.done()
+    await replay
+    monkeypatch.undo()
+    await _stats_wait_idle(store)
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    season = next(s for s in core.stat_seasons() if s["id"] == "s2")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await core._stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c3_rebuilding_covers_earlier_seasons(store, monkeypatch):
+    # Round 3B: voiding an s1 campaign rebuilds every later season, so s1 AND
+    # s2 reads report ratingsRebuilding until the worker lands. The worker is
+    # frozen so the pending row cannot vanish mid-assertion.
+    await _stats_u3_seed(store)
+    s1_event = "99999995-9999-4999-8999-999999999999"
+    campaign = _stats_u3_campaign_body(
+        s1_event,
+        _U3_SERVER,
+        "2026-09-20T12:00:00Z",
+        "RED",
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                12,
+                4,
+                1,
+                [_stats_u3_class("assault", "0", 500, 4, 1, 100)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                8,
+                2,
+                4,
+                [_stats_u3_class("recon", "2", 500, 2, 4, 50)],
+            ),
+        ],
+    )
+    campaign["startedAt"] = "2026-09-20T11:00:00Z"
+    created = await request(
+        store, "POST", "/v2/stats/results", campaign, "stats-u3-producer"
+    )
+    assert created.status_code == 201, created.text
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+    voided = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": s1_event, "voided": True},
+        "admin",
+    )
+    assert voided.status_code == 200, voided.text
+    assert voided.json()["rebuilt"] == "s1"
+    for path in (
+        "/v2/stats/leaderboard?season=s1",
+        "/v2/stats/leaderboard?season=s2",
+        f"/v2/stats/players/{_U3_PA}?season=s2",
+    ):
+        body = (await request(store, "GET", path, None, "stats-reader")).json()
+        assert body["ratingsRebuilding"] is True, path
+    monkeypatch.undo()
+    await _stats_wait_idle(store)
+    board = (
+        await request(
+            store, "GET", "/v2/stats/leaderboard?season=s2", None, "stats-reader"
+        )
+    ).json()
+    assert board["ratingsRebuilding"] is False
+    player = (
+        await request(
+            store, "GET", f"/v2/stats/players/{_U3_PA}?season=s2", None, "stats-reader"
+        )
+    ).json()
+    assert player["ratingsRebuilding"] is False
+    assert player["mmr"] == {
+        "rating": 1662,
+        "rd": 290,
+        "ratedCampaigns": 1,
+        "provisional": True,
+    }
+
+
+async def test_stats_c3_gap_scan_heals_old_path_campaign(store):
+    # Round 3C: a campaign committed by the old (no-rating) path after the
+    # migration has no stat_rating_changes row; the gap scan enqueues a
+    # rebuild for it (idempotent) and the worker fills the ratings in.
+    from cpv2.core import stat_gap_scan
+
+    await _stats_u3_seed(store)
+    gap_event = "99999996-9999-4999-8999-999999999999"
+    body = _stats_u3_campaign_body(
+        gap_event,
+        _U3_SERVER,
+        "2026-11-11T14:00:00Z",
+        "BLUE",
+        [
+            _stats_u3_participant(
+                _U3_PA,
+                "Игрок Альфа",
+                "RED",
+                4,
+                1,
+                3,
+                [_stats_u3_class("assault", "0", 30, 1, 3, 5)],
+            ),
+            _stats_u3_participant(
+                _U3_PB,
+                "Player Beta",
+                "BLUE",
+                9,
+                6,
+                1,
+                [_stats_u3_class("recon", "2", 120, 6, 1, 30)],
+            ),
+        ],
+    )
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"], autocommit=True
+    ) as conn:
+        await conn.execute(
+            "INSERT INTO control.stat_results(server_id,event_id,kind,mode,campaign_id,ended_at,reason,winner,digest,payload)"
+            " VALUES(%s,%s,'campaign','campaign',%s,%s,'completed','BLUE',%s,%s)",
+            (
+                _U3_SERVER,
+                gap_event,
+                gap_event,
+                "2026-11-11T14:00:00+00:00",
+                "gapdigest",
+                Jsonb(body),
+            ),
+        )
+        for participant in (
+            (_U3_PA, "RED", 4, 1, 3),
+            (_U3_PB, "BLUE", 9, 6, 1),
+        ):
+            await conn.execute(
+                "INSERT INTO control.stat_participants(server_id,event_id,uuid,team,score,kills,deaths,captures,neutralizations,"
+                "point_seconds,play_seconds,suicides,team_kills,max_streak)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s,0,0,0,0,0,0,0)",
+                (_U3_SERVER, gap_event, *participant),
+            )
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        (gap_event,),
+    ) == [{"n": 0}]
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        autocommit=True,
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        assert await stat_gap_scan(conn) == "s2"
+        assert await stat_gap_scan(conn) == "s2"
+        queue = await (
+            await conn.execute("SELECT * FROM stat_rating_rebuilds")
+        ).fetchall()
+        assert [row["season_id"] for row in queue] == ["s2"]
+    await _stats_wait_idle(store)
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        (gap_event,),
+    ) == [{"n": 2}]
+    player = (
+        await request(
+            store, "GET", f"/v2/stats/players/{_U3_PA}?season=s2", None, "stats-reader"
+        )
+    ).json()
+    assert player["mmr"]["ratedCampaigns"] == 2
+    assert player["ratingsRebuilding"] is False
+
+
+async def test_stats_c4_reenqueue_restarts_for_late_campaign(store, monkeypatch):
+    # Round 4A: a re-enqueue carries its from-point. A late campaign ingested
+    # behind the replay cursor restarts the replay (NULL cursor) so the worker
+    # replays it; a later campaign keeps the cursor. Fail-before: the old bump
+    # kept the cursor and the queue cleared with the late rating missing.
+    from datetime import datetime, timezone
+
+    from cpv2.core import stat_gap_scan
+
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    extra = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999981-9999-4999-8999-999999999999", "2026-11-11T13:00:00Z", "BLUE"
+        ),
+        "stats-u3-producer",
+    )
+    assert extra.status_code == 201, extra.text
+    voided = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+        "admin",
+    )
+    assert voided.status_code == 200, voided.text
+    await drain_once()
+    assert await sql(
+        store,
+        "SELECT last_ended_at IS NOT NULL AS progressed FROM stat_rating_rebuilds",
+    ) == [{"progressed": True}]
+    # A later campaign keeps the cursor: the replay reaches it on its own.
+    later = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999982-9999-4999-8999-999999999999", "2026-11-11T14:00:00Z", "RED"
+        ),
+        "stats-u3-producer",
+    )
+    assert later.status_code == 201, later.text
+    assert await sql(
+        store,
+        "SELECT last_ended_at AT TIME ZONE 'UTC' AS cursor FROM stat_rating_rebuilds",
+    ) == [{"cursor": datetime(2026, 11, 11, 13, 0)}]
+    # The gap scan defers to the progressing replay instead of restarting it.
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        autocommit=True,
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        assert await stat_gap_scan(conn) is None
+    # A late campaign behind the cursor restarts the replay from the start.
+    late = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999983-9999-4999-8999-999999999999", "2026-11-11T11:30:00Z", "RED"
+        ),
+        "stats-u3-producer",
+    )
+    assert late.status_code == 201, late.text
+    assert await sql(
+        store,
+        "SELECT last_ended_at,last_server_id,last_event_id FROM stat_rating_rebuilds",
+    ) == [{"last_ended_at": None, "last_server_id": None, "last_event_id": None}]
+    monkeypatch.undo()
+    await _stats_wait_idle(store)
+    for event in (
+        "99999981-9999-4999-8999-999999999999",
+        "99999982-9999-4999-8999-999999999999",
+        "99999983-9999-4999-8999-999999999999",
+    ):
+        assert await sql(
+            store,
+            "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+            (event,),
+        ) == [{"n": 2}], event
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    # Upsert matrix: new rows start over; a later from-point keeps the cursor;
+    # an earlier one and season start (NULL) restart it.
+    from cpv2.core import _stat_enqueue_rebuild
+
+    utc = timezone.utc
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+
+            async def cursor():
+                row = await (
+                    await conn.execute(
+                        "SELECT last_ended_at,last_server_id,last_event_id"
+                        " FROM stat_rating_rebuilds WHERE season_id='s2'"
+                    )
+                ).fetchone()
+                return (
+                    row["last_ended_at"],
+                    row["last_server_id"],
+                    row["last_event_id"],
+                )
+
+            await _stat_enqueue_rebuild(
+                conn,
+                "s2",
+                _U3_SERVER,
+                "99999981-9999-4999-8999-999999999999",
+                datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+            )
+            assert await cursor() == (None, None, None)
+            await conn.execute(
+                "UPDATE stat_rating_rebuilds SET last_ended_at=%s,last_server_id=%s,last_event_id=%s"
+                " WHERE season_id='s2'",
+                (
+                    datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+                    _U3_SERVER,
+                    "99999981-9999-4999-8999-999999999999",
+                ),
+            )
+            await _stat_enqueue_rebuild(
+                conn,
+                "s2",
+                _U3_SERVER,
+                "99999982-9999-4999-8999-999999999999",
+                datetime(2026, 11, 11, 14, 0, tzinfo=utc),
+            )
+            assert await cursor() == (
+                datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+                _U3_SERVER,
+                "99999981-9999-4999-8999-999999999999",
+            )
+            await _stat_enqueue_rebuild(
+                conn,
+                "s2",
+                _U3_SERVER,
+                "99999983-9999-4999-8999-999999999999",
+                datetime(2026, 11, 11, 11, 30, tzinfo=utc),
+            )
+            assert await cursor() == (None, None, None)
+            await conn.execute(
+                "UPDATE stat_rating_rebuilds SET last_ended_at=%s,last_server_id=%s,last_event_id=%s"
+                " WHERE season_id='s2'",
+                (
+                    datetime(2026, 11, 11, 13, 0, tzinfo=utc),
+                    _U3_SERVER,
+                    "99999981-9999-4999-8999-999999999999",
+                ),
+            )
+            await _stat_enqueue_rebuild(
+                conn, "s2", _U3_SERVER, "99999981-9999-4999-8999-999999999999", None
+            )
+            assert await cursor() == (None, None, None)
+
+
+async def test_stats_c4_earliest_season_first_and_matches_full_replay(
+    store, monkeypatch
+):
+    # Round 4B: the worker serves the earliest queued season first, so an s1
+    # rebuild runs while a mid-replay s2 row waits (its stale cursor resets
+    # when s1 restarts from scratch), and the final ratings equal a full
+    # replay. Fail-before: the old requested_at order served s2 first.
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    first = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_c4_campaign_body(
+            "99999985-9999-4999-8999-999999999999",
+            "2026-09-20T12:00:00Z",
+            "RED",
+            started="2026-09-20T11:00:00Z",
+        ),
+        "stats-u3-producer",
+    )
+    assert first.status_code == 201, first.text
+    for event, hour in (
+        ("99999986-9999-4999-8999-999999999999", "13"),
+        ("99999987-9999-4999-8999-999999999999", "14"),
+    ):
+        created = await request(
+            store,
+            "POST",
+            "/v2/stats/results",
+            _stats_c4_campaign_body(event, f"2026-11-11T{hour}:00:00Z", "BLUE"),
+            "stats-u3-producer",
+        )
+        assert created.status_code == 201, created.text
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+            "admin",
+        )
+    ).status_code == 200
+    await drain_once()
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {
+                "serverId": _U3_SERVER,
+                "eventId": "99999985-9999-4999-8999-999999999999",
+                "voided": True,
+            },
+            "admin",
+        )
+    ).status_code == 200
+    before = await sql(
+        store,
+        "SELECT season_id,requested_at,last_ended_at IS NOT NULL AS progressed"
+        " FROM stat_rating_rebuilds ORDER BY season_id",
+    )
+    assert [(row["season_id"], row["progressed"]) for row in before] == [
+        ("s1", False),
+        ("s2", True),
+    ]
+    s2_requested = next(
+        row["requested_at"] for row in before if row["season_id"] == "s2"
+    )
+    await drain_once()
+    after = await sql(
+        store,
+        "SELECT season_id,requested_at,last_ended_at IS NOT NULL AS progressed"
+        " FROM stat_rating_rebuilds ORDER BY season_id",
+    )
+    assert [(row["season_id"], row["progressed"]) for row in after] == [
+        ("s1", True),
+        ("s2", False),
+    ]
+    assert (
+        next(row["requested_at"] for row in after if row["season_id"] == "s2")
+        == s2_requested
+    )
+    monkeypatch.undo()
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    deadline = time.monotonic() + 30
+    while True:
+        if await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+            {"n": 0}
+        ]:
+            break
+        assert time.monotonic() < deadline, "rating rebuild did not finish"
+        await asyncio.sleep(0.2)
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    season = next(s for s in core.stat_seasons() if s["id"] == "s1")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await core._stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c4_resume_race_aborts_pass(store, monkeypatch):
+    # Round 4 scenario, round-5 mechanism: a reset landing between a batch's
+    # read and its commit bumps generation, so the guarded write misses and
+    # the batch rolls back to its savepoint (no raise): the pass drops its
+    # work instead of committing ratings the next pass would rate twice
+    # (stat_rating_changes PK collision). Fail-before: the old
+    # requested_at guard raised _StatRebuildRace here.
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    for event, hour in (
+        ("99999991-9999-4999-8999-999999999999", "13"),
+        ("99999992-9999-4999-8999-999999999999", "14"),
+        ("99999993-9999-4999-8999-999999999999", "15"),
+    ):
+        created = await request(
+            store,
+            "POST",
+            "/v2/stats/results",
+            _stats_c4_campaign_body(event, f"2026-11-11T{hour}:00:00Z", "BLUE"),
+            "stats-u3-producer",
+        )
+        assert created.status_code == 201, created.text
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+            "admin",
+        )
+    ).status_code == 200
+    await drain_once()
+    real_rate = core._stat_rate
+    reset_done = False
+
+    async def resetting_rate(conn, clean, ended_ms):
+        nonlocal reset_done
+        if not reset_done:
+            reset_done = True
+            async with await psycopg.AsyncConnection.connect(
+                store["admin"],
+                options="-c search_path=control,pg_catalog",
+                row_factory=psycopg.rows.dict_row,
+            ) as reset_conn:
+                async with reset_conn.transaction():
+                    # A reset behind the cursor lands mid-batch: it restarts
+                    # the replay and bumps generation via the real path.
+                    from datetime import datetime, timezone
+
+                    await core._stat_enqueue_rebuild(
+                        reset_conn,
+                        "s2",
+                        _U3_SERVER,
+                        _U3_C1,
+                        datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc),
+                    )
+        return await real_rate(conn, clean, ended_ms)
+
+    monkeypatch.setattr(core, "_stat_rate", resetting_rate)
+    before = await sql(
+        store, "SELECT generation FROM stat_rating_rebuilds WHERE season_id='s2'"
+    )
+    await drain_once()
+    assert reset_done
+    # No raise: the batch rolled back, so its campaign has no ratings, and
+    # the queue row kept the reset (NULL cursor, bumped generation).
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        ("99999992-9999-4999-8999-999999999999",),
+    ) == [{"n": 0}]
+    after = await sql(
+        store,
+        "SELECT generation,last_ended_at FROM stat_rating_rebuilds WHERE season_id='s2'",
+    )
+    assert after == [{"generation": before[0]["generation"] + 1, "last_ended_at": None}]
+    monkeypatch.undo()
+    monkeypatch.setattr(core, "STAT_REBUILD_BATCH", 1)
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+    for _ in range(4):
+        await drain_once()
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    for event in (
+        "99999991-9999-4999-8999-999999999999",
+        "99999992-9999-4999-8999-999999999999",
+        "99999993-9999-4999-8999-999999999999",
+    ):
+        assert await sql(
+            store,
+            "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+            (event,),
+        ) == [{"n": 2}], event
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    season = next(s for s in core.stat_seasons() if s["id"] == "s2")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await core._stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c5_equal_cursor_void_restarts_replay(store, monkeypatch):
+    # Round 5 / bot 4544506235: a re-enqueue whose from-point EQUALS the
+    # cursor restarts the replay (<=), so voiding exactly the last replayed
+    # campaign re-rates it away. Fail-before: strict < kept the cursor, the
+    # next batch selected >(cursor) = nothing, and the voided campaign kept
+    # its rating forever.
+    from datetime import datetime
+
+    real_drain = core.stat_rebuild_drain
+
+    async def frozen(conn):
+        return None
+
+    monkeypatch.setattr(core, "stat_rebuild_drain", frozen)
+
+    async def drain_once():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        ) as conn:
+            async with conn.transaction():
+                await real_drain(conn)
+
+    await _stats_u3_seed(store)
+    for event, hour in (
+        ("99999961-9999-4999-8999-999999999999", "13"),
+        ("99999962-9999-4999-8999-999999999999", "14"),
+    ):
+        created = await request(
+            store,
+            "POST",
+            "/v2/stats/results",
+            _stats_c4_campaign_body(event, f"2026-11-11T{hour}:00:00Z", "BLUE"),
+            "stats-u3-producer",
+        )
+        assert created.status_code == 201, created.text
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {"serverId": _U3_SERVER, "eventId": _U3_C1, "voided": True},
+            "admin",
+        )
+    ).status_code == 200
+    await drain_once()
+    assert await sql(
+        store,
+        "SELECT last_ended_at AT TIME ZONE 'UTC' AS cursor,last_server_id,last_event_id"
+        " FROM stat_rating_rebuilds WHERE season_id='s2'",
+    ) == [
+        {
+            "cursor": datetime(2026, 11, 11, 14, 0),
+            "last_server_id": _U3_SERVER,
+            "last_event_id": "99999962-9999-4999-8999-999999999999",
+        }
+    ]
+    # Void exactly the cursor campaign: the cursor must restart, not stick.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {
+                "serverId": _U3_SERVER,
+                "eventId": "99999962-9999-4999-8999-999999999999",
+                "voided": True,
+            },
+            "admin",
+        )
+    ).status_code == 200
+    assert await sql(
+        store,
+        "SELECT last_ended_at,last_server_id,last_event_id FROM stat_rating_rebuilds WHERE season_id='s2'",
+    ) == [{"last_ended_at": None, "last_server_id": None, "last_event_id": None}]
+    monkeypatch.undo()
+    await _stats_wait_idle(store)
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        ("99999962-9999-4999-8999-999999999999",),
+    ) == [{"n": 0}]
+    assert await sql(
+        store,
+        "SELECT count(*) AS n FROM stat_rating_changes WHERE event_id=%s",
+        ("99999961-9999-4999-8999-999999999999",),
+    ) == [{"n": 2}]
+    assert await sql(store, "SELECT count(*) AS n FROM stat_rating_rebuilds") == [
+        {"n": 0}
+    ]
+    snap = await sql(
+        store,
+        "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+    )
+    season = next(s for s in core.stat_seasons() if s["id"] == "s2")
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        async with conn.transaction():
+            await core._stat_rebuild_ratings(conn, season)
+    assert (
+        await sql(
+            store,
+            "SELECT season_id,uuid,rating,rd,volatility,rated_campaigns FROM stat_ratings ORDER BY uuid",
+        )
+        == snap
+    )
+
+
+async def test_stats_c5_single_worker_lock_excludes_second_replica(store):
+    # Round 5 / bot 4544506243: exactly one rebuild worker runs across CP
+    # replicas. The loop holds _stat_try_worker_lock for its whole life, so
+    # while it runs a second replica's try-lock fails instead of replaying
+    # concurrently from a stale cursor.
+    from cpv2.core import _stat_try_worker_lock
+
+    async def open_conn():
+        return await psycopg.AsyncConnection.connect(
+            store["admin"],
+            options="-c search_path=control,pg_catalog",
+            row_factory=psycopg.rows.dict_row,
+        )
+
+    probe = await open_conn()
+    second = await open_conn()
+    try:
+        deadline = time.monotonic() + 15
+        while await _stat_try_worker_lock(probe):
+            # We beat the app worker to the lock: hand it back and wait
+            # until it holds the lock for its whole life.
+            await probe.execute(
+                "SELECT pg_advisory_unlock(hashtext('stats-rebuild-worker'),1)"
+            )
+            assert time.monotonic() < deadline, "app worker never took the lock"
+            await asyncio.sleep(0.05)
+        assert await _stat_try_worker_lock(second) is False
+    finally:
+        await probe.close()
+        await second.close()
+
+
+async def test_stats_read_provision_scopes(store):
+    from cpv2.auth import STATS_READ_SCOPES
+
+    assert STATS_READ_SCOPES == {"stats.read"}
+    with pytest.raises(ValueError, match="unbound site credential"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "stats-bound",
+                    "via": "game",
+                    "ceiling": ["stats.read"],
+                },
+                "ceiling": ["stats.read"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": _U3_SERVER,
+            },
+        )
+    with pytest.raises(ValueError, match="service credential ceiling"):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": "stats-void-svc",
+                    "via": "game",
+                    "ceiling": ["stats.void"],
+                },
+                "ceiling": ["stats.void"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+            },
+        )
