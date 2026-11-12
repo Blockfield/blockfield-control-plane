@@ -31,6 +31,14 @@ class SettingsChange(Mutation):
     actorAccountId: ID | None = None
 
 
+class GateToggle(Mutation):
+    # Single-call gate update: absolute desired state, no client-side read.
+    # The server reads the head under lock (see core.gate_toggle), so the
+    # site needs one POST instead of GET /v1/gate + PATCH.
+    mode: str = Field(pattern="^(open|draining|maintenance)$")
+    message: str = Field(default="", max_length=500)
+
+
 class Rollback(Mutation):
     expectedRevision: int = Field(ge=0, le=9223372036854775807)
     revision: int = Field(ge=1, le=9223372036854775807)

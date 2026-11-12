@@ -2285,6 +2285,65 @@ async def test_c3_gate_initialization_is_explicit_at_imported_revision_zero(
     )
 
 
+async def test_gate_toggle_is_a_single_server_side_read_modify_write(store):
+    # admin50-D: one POST replaces GET /v1/gate + PATCH; same auth scope,
+    # audit and idempotency as PATCH, visible via the proxy snapshot and
+    # the /v1/gate compat read.
+    def toggle(key, mode, message=""):
+        return {
+            "idempotencyKey": key,
+            "environment": "prod",
+            "backend": "game",
+            "mode": mode,
+            "message": message,
+        }
+
+    assert (await request(store, "GET", "/v2/settings/gate/*")).json()[
+        "initialized"
+    ] is False
+    first = await request(
+        store, "POST", "/v2/gate/toggle", toggle("t1", "maintenance", "db")
+    )
+    assert first.status_code == 202, first.text
+    assert first.json()["revision"] == 1
+    view = (await request(store, "GET", "/v2/settings/gate/*")).json()
+    assert view["initialized"] is True and view["revision"] == 1
+    assert view["value"] == {"mode": "maintenance", "message": "db"}
+    compat = (await request(store, "GET", "/v1/gate", role="game-agent")).json()
+    assert compat["mode"] == "maintenance" and compat["revision"] == 1
+    # Same key redelivered (e.g. a site timeout retry) dedupes to the receipt.
+    again = await request(
+        store, "POST", "/v2/gate/toggle", toggle("t1", "maintenance", "db")
+    )
+    assert again.status_code == 202
+    assert again.json()["operationId"] == first.json()["operationId"]
+    assert again.json()["revision"] == 1
+    assert (
+        len(await sql(store, "SELECT * FROM settings_revisions WHERE namespace='gate'"))
+        == 1
+    )
+    # Key reuse with a different body conflicts, like PATCH.
+    assert (
+        await request(store, "POST", "/v2/gate/toggle", toggle("t1", "open"))
+    ).status_code == 409
+    # A second toggle advances the revision in one call.
+    second = await request(store, "POST", "/v2/gate/toggle", toggle("t2", "open"))
+    assert second.status_code == 202 and second.json()["revision"] == 2
+    assert (await request(store, "GET", "/v1/gate", role="game-agent")).json()[
+        "mode"
+    ] == "open"
+    # Auth scope and validation match PATCH: moderators cannot toggle, a bad
+    # mode is 422.
+    assert (
+        await request(
+            store, "POST", "/v2/gate/toggle", toggle("t3", "open"), "moderator"
+        )
+    ).status_code == 403
+    assert (
+        await request(store, "POST", "/v2/gate/toggle", toggle("t4", "half-open"))
+    ).status_code == 422
+
+
 @pytest.mark.parametrize("credential_scope", ["*", "arena"])
 async def test_c3_owner_audit_respects_requested_and_credential_scope(
     store, credential_scope
