@@ -2237,13 +2237,18 @@ def _stat_glicko_update(player, games, tau=_STAT_G_TAU):
 
 
 def _stat_rated(clean):
-    # Site `src/lib/stats.ts:1590` rated(): kind/mode/endReason only, no winner
-    # check — a completed campaign with winner NONE is rated, both sides score
-    # 0 (site `stats.ts:908`: draw 0.5 else winner==team ? 1 : 0).
+    # Unlike site `src/lib/stats.ts:1590`, a completed campaign without a
+    # winner is stored but not rated: the site scored it as a loss for both
+    # sides. Keep in sync with the SQL selections of rated campaigns below.
     return (
         clean["kind"] == "campaign"
         and clean["modeId"] == "campaign"
-        and clean["endReason"] in ("completed", "draw")
+        and (
+            clean["endReason"] == "draw"
+            or (
+                clean["endReason"] == "completed" and clean["winner"] in ("RED", "BLUE")
+            )
+        )
     )
 
 
@@ -2310,7 +2315,7 @@ async def _stat_rate(conn, clean, ended_ms):
     for team, own, foes in (("RED", reds, blues), ("BLUE", blues, reds)):
         opponent = _stat_glicko_composite([before[o["uuid"]][0] for o in foes])
         # Site `src/lib/stats.ts:908`: a draw splits the point, otherwise the
-        # winning team takes it — a completed winner-NONE campaign rates 0-0.
+        # winning team takes it (winner-NONE completions are never rated).
         score = (
             0.5
             if clean["endReason"] == "draw"
@@ -2379,7 +2384,7 @@ async def _stat_rebuild_ratings(conn, season):
     args: tuple = () if number == 1 else (_stat_dt(season["startsAt"]),)
     matches = await rows(
         conn,
-        "SELECT payload,ended_at FROM stat_results WHERE kind='campaign' AND mode='campaign' AND reason IN ('completed','draw')"
+        "SELECT payload,ended_at FROM stat_results WHERE kind='campaign' AND mode='campaign' AND (reason='draw' OR (reason='completed' AND winner IN ('RED','BLUE')))"
         + ("" if number == 1 else " AND ended_at>=%s")
         + " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=stat_results.server_id AND v.event_id=stat_results.event_id)"
         + " ORDER BY ended_at,server_id,event_id",
@@ -2395,7 +2400,7 @@ async def stat_backfill_ratings(conn):
     # advisory lock ingest uses, so a concurrent ingest serializes behind it.
     first = await one(
         conn,
-        "SELECT MIN(ended_at) AS first FROM stat_results WHERE kind='campaign' AND mode='campaign' AND reason IN ('completed','draw')"
+        "SELECT MIN(ended_at) AS first FROM stat_results WHERE kind='campaign' AND mode='campaign' AND (reason='draw' OR (reason='completed' AND winner IN ('RED','BLUE')))"
         " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=stat_results.server_id AND v.event_id=stat_results.event_id)",
     )
     if first is None or first["first"] is None:
@@ -2496,7 +2501,7 @@ async def _stat_rebuild_batch(conn, season, cursor):
             (number,),
         )
     where = (
-        "kind='campaign' AND mode='campaign' AND reason IN ('completed','draw')"
+        "kind='campaign' AND mode='campaign' AND (reason='draw' OR (reason='completed' AND winner IN ('RED','BLUE')))"
         " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=stat_results.server_id AND v.event_id=stat_results.event_id)"
     )
     args: tuple = ()
@@ -2583,7 +2588,7 @@ async def stat_gap_scan(conn):
     gap = await one(
         conn,
         "SELECT r.server_id,r.event_id,r.ended_at FROM stat_results r"
-        " WHERE r.kind='campaign' AND r.mode='campaign' AND r.reason IN ('completed','draw')"
+        " WHERE r.kind='campaign' AND r.mode='campaign' AND (r.reason='draw' OR (r.reason='completed' AND r.winner IN ('RED','BLUE')))"
         " AND NOT EXISTS(SELECT 1 FROM stat_result_voids v WHERE v.server_id=r.server_id AND v.event_id=r.event_id)"
         " AND NOT EXISTS(SELECT 1 FROM stat_rating_changes c WHERE c.server_id=r.server_id AND c.event_id=r.event_id)"
         " AND EXISTS(SELECT 1 FROM stat_participants p WHERE p.server_id=r.server_id AND p.event_id=r.event_id AND p.team='RED')"

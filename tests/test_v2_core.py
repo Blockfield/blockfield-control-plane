@@ -7595,9 +7595,9 @@ async def test_stats_migration_005_backfills_pre_005_results(store):
     assert await sql(store, ratings_query) == before
 
 
-async def test_stats_winner_none_completed_rates_double_loss_like_site(store):
-    # Site rated() (src/lib/stats.ts:1590) ignores the winner and score
-    # (:908) is 0-0 for a completed winner-NONE campaign with both sides.
+async def test_stats_winner_none_completed_is_stored_unrated(store):
+    # A completed campaign without a winner is stored but never rated (the
+    # site scored it as a loss for both sides); a draw still splits the point.
     server = "22222222-2222-2222-2222-222222222222"
     await _stats_token(store, server, "stats-none")
     await _stats_reader_token(store)
@@ -7627,23 +7627,23 @@ async def test_stats_winner_none_completed_rates_double_loss_like_site(store):
     )
     created = await request(store, "POST", "/v2/stats/results", none, "stats-none")
     assert created.status_code == 201, created.text
+    stored = await sql(
+        store, "SELECT 1 FROM stat_results WHERE event_id=%s", (none_event,)
+    )
+    assert len(stored) == 1
     changes = await sql(
         store,
-        "SELECT uuid,score FROM stat_rating_changes WHERE event_id=%s ORDER BY uuid",
+        "SELECT uuid FROM stat_rating_changes WHERE event_id=%s",
         (none_event,),
     )
-    assert [(row["uuid"], row["score"]) for row in changes] == [
-        (_U3_PA, 0),
-        (_U3_PB, 0),
-    ]
-    ratings = await sql(
-        store, "SELECT uuid,rating FROM stat_ratings WHERE season_id='s2' ORDER BY uuid"
-    )
-    assert len(ratings) == 2
-    # Both sides lose to an equal opponent: the site battery's pinned loss
-    # value (test_stats_glicko2_matches_site_algorithm), on both sides.
-    assert abs(ratings[0]["rating"] - 1337.6891060937023) < 1e-9
-    assert ratings[0]["rating"] == ratings[1]["rating"] < 1500
+    assert changes == []
+    ratings = await sql(store, "SELECT uuid FROM stat_ratings WHERE season_id='s2'")
+    assert ratings == []
+    # The gap scan must not treat the unrated campaign as a missing rating.
+    from cpv2.core import stat_gap_scan
+
+    async with store["app"].state.db.transaction() as conn:
+        assert await stat_gap_scan(conn) is None
     draw_event = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     draw = _stats_u3_campaign_body(
         draw_event, server, "2026-11-11T13:00:00Z", "NONE", participants
