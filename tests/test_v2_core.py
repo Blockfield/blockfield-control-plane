@@ -1652,6 +1652,129 @@ async def test_c7_second_rotation_refused_while_previous_valid(store):
     assert row["previous_credential_id"] != c1
 
 
+async def test_renew_crash_before_confirm_replays_and_confirm_revokes_old(store):
+    generation = str(uuid4())
+    spec = {
+        "client": {
+            "id": "ren",
+            "via": "game",
+            "ceiling": ["agents.acks", "agents.events"],
+        },
+        "ceiling": ["agents.acks", "agents.events"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+        "expiresInSeconds": 600,
+        "consumer": {
+            "id": "ren",
+            "generation": generation,
+            "capabilities": ["settings.gameplay", "settings.gate"],
+        },
+    }
+    old = await provision(store["admin"], spec)
+    auth = lambda t: {"Authorization": f"Bearer {t}"}  # noqa: E731
+    client = store["client"]
+    me = (await client.get("/v2/me", headers=auth(old))).json()
+    lifetime = datetime.fromisoformat(me["expiresAt"]) - datetime.fromisoformat(
+        me["issuedAt"]
+    )
+    assert abs(lifetime - timedelta(seconds=600)) < timedelta(seconds=5)
+
+    first = await client.post("/v2/credentials/renew", headers=auth(old))
+    assert first.status_code == 201, first.text
+    new = first.json()["token"]
+    assert new != old
+    # Crash before confirm: the old token still works and a retry returns the
+    # same pending successor instead of minting a second one.
+    assert (await client.get("/v2/me", headers=auth(old))).status_code == 200
+    again = await client.post("/v2/credentials/renew", headers=auth(old))
+    assert again.status_code == 201, again.text
+    assert again.json() == first.json()
+    assert len(await sql(store, "SELECT 1 FROM credentials WHERE client_id='ren'")) == 2
+    # Same client, scopes, lifetime and consumer binding.
+    me_new = (await client.get("/v2/me", headers=auth(new))).json()
+    assert me_new["client"] == "ren" and me_new["ceiling"] == me["ceiling"]
+    assert (
+        datetime.fromisoformat(me_new["expiresAt"])
+        - datetime.fromisoformat(me_new["issuedAt"])
+        == lifetime
+    )
+    row = (await sql(store, "SELECT * FROM consumers WHERE id='ren'"))[0]
+    assert str(row["credential_id"]) == me_new["credentialId"]
+    assert str(row["previous_credential_id"]) == me["credentialId"]
+    # The successor may not renew while the earlier renewal is unconfirmed.
+    refused = await client.post("/v2/credentials/renew", headers=auth(new))
+    assert (
+        refused.status_code == 409 and refused.json()["error"] == "renewal_unconfirmed"
+    )
+    # Only the successor confirms.
+    assert (
+        await client.post("/v2/credentials/renew/confirm", headers=auth(old))
+    ).status_code == 404
+    done = await client.post("/v2/credentials/renew/confirm", headers=auth(new))
+    assert done.status_code == 200, done.text
+    assert (await client.get("/v2/me", headers=auth(old))).status_code == 401
+    assert (
+        await client.get("/v2/agents/ren/snapshot", headers=auth(new))
+    ).status_code == 200
+    # Confirm is idempotent; the next cycle renews from the successor.
+    assert (
+        await client.post("/v2/credentials/renew/confirm", headers=auth(new))
+    ).status_code == 200
+    assert (
+        await client.post("/v2/credentials/renew", headers=auth(new))
+    ).status_code == 201
+    actions = [
+        r["action"]
+        for r in await sql(
+            store,
+            "SELECT action FROM audit_events WHERE client_id='ren' AND outcome IN ('accepted','replayed') ORDER BY sequence",
+        )
+    ]
+    assert actions == [
+        "credentials.renew",
+        "credentials.renew",
+        "credentials.renew.confirm",
+        "credentials.renew",
+    ]
+
+
+async def test_renew_grace_expires_old_and_refuses_humans_and_floods(store):
+    spec = {
+        "client": {"id": "ren2", "via": "game", "ceiling": ["gate:read"]},
+        "ceiling": ["gate:read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+        "expiresInSeconds": 30 * 86400,
+    }
+    old = await provision(store["admin"], spec)
+    client = store["client"]
+    renewed = await client.post(
+        "/v2/credentials/renew", headers={"Authorization": f"Bearer {old}"}
+    )
+    assert renewed.status_code == 201, renewed.text
+    left = (
+        await sql(
+            store,
+            "SELECT expires_at - now() AS left FROM credentials WHERE client_id='ren2' ORDER BY created_at LIMIT 1",
+        )
+    )[0]["left"]
+    # Unconfirmed, the old credential lives at most the grace hour.
+    assert left <= timedelta(hours=1)
+    human = await request(store, "POST", "/v2/credentials/renew", None, "admin")
+    assert human.status_code == 403 and human.json()["error"] == "renew_service_only"
+    codes = [
+        (
+            await client.post(
+                "/v2/credentials/renew", headers={"Authorization": f"Bearer {old}"}
+            )
+        ).status_code
+        for _ in range(8)
+    ]
+    assert 429 in codes
+
+
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
     wakeups = store["app"].state.wakeups
     waiter = wakeups.subscribe("game")

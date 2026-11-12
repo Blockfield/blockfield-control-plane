@@ -12,7 +12,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from cpv2 import core, delivery, models
-from cpv2.auth import Identity, Problem, audit, authenticate, challenge, verifier
+from cpv2.auth import (
+    Identity,
+    Problem,
+    audit,
+    authenticate,
+    challenge,
+    confirm_renewal,
+    renew_credential,
+    verifier,
+)
 from cpv2.db import MIGRATIONS, Database, one, rows
 from cpv2.settings import DEFINITIONS, digest
 
@@ -409,7 +418,25 @@ def create_app(dsn=None):
                 for g in i.grants
             ],
             "ceiling": sorted(set(i.credential["ceiling"]) & set(i.client["ceiling"])),
+            # Self-renewing services schedule renew from these (coordination#33).
+            "credentialId": str(i.credential["id"]),
+            "issuedAt": i.credential["created_at"].isoformat(),
+            "expiresAt": i.credential["expires_at"].isoformat(),
         }
+
+    @app.post("/v2/credentials/renew", status_code=201)
+    async def credentials_renew(request: Request):
+        # A renewing service needs a handful of calls a day; a loop is a bug.
+        limiter.check(
+            ("renew", request.state.identity.credential["id"]),
+            global_count=False,
+            limit=6,
+        )
+        return await write(request, renew_credential, request.state.token)
+
+    @app.post("/v2/credentials/renew/confirm")
+    async def credentials_renew_confirm(request: Request):
+        return await write(request, confirm_renewal)
 
     @app.post("/v2/owner/challenges", status_code=201)
     async def owner_challenge(body: models.Challenge, request: Request):

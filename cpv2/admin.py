@@ -21,6 +21,7 @@ from cpv2.auth import (
     OWNER_SCOPES,
     ROLE_SCOPES,
     SERVICE_SCOPES,
+    SERVICE_TTL_CAP,
     SITE_SESSIONS_SCOPES,
     SITE_SETTINGS_SCOPES,
     STAFF_SCOPES,
@@ -174,7 +175,6 @@ async def provision(dsn, spec, bearer_sink=None):
 
 # Service credentials (account-less) live at most 30 days and are re-issued
 # monthly; human session credentials stay at 24h, like staff rotation.
-SERVICE_TTL_CAP = 30 * 86400
 HUMAN_TTL_CAP = 86400
 
 

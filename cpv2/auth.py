@@ -1,7 +1,8 @@
+import base64
 import hashlib
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
@@ -507,3 +508,145 @@ async def step_up(conn, identity, assertion, method, path, body):
         )
     except (KeyError, ValueError, TypeError, AttributeError, WebAuthnException):
         raise Problem("invalid_owner_assertion") from None
+
+
+SERVICE_TTL_CAP = 30 * 86400
+# The outgoing credential stays valid this long after renew unless confirmed
+# sooner; a consumer that lost the response retries with it inside the window.
+RENEW_GRACE = timedelta(hours=1)
+
+
+def renewed_token(old_token, nonce):
+    # Re-derivable from the presented old token, so a retry after a lost
+    # response returns the same successor while the DB stores only a nonce.
+    digest_ = hashlib.sha256(b"cp-renew\0" + nonce + old_token.encode()).digest()
+    return "cp2_" + base64.urlsafe_b64encode(digest_).rstrip(b"=").decode()
+
+
+def _renewal_view(token, new):
+    return {
+        "token": token,
+        "credentialId": str(new["id"]),
+        "issuedAt": new["created_at"].isoformat(),
+        "expiresAt": new["expires_at"].isoformat(),
+    }
+
+
+async def renew_credential(conn, identity, attempt, token):
+    c = identity.credential
+    if c["kind"] != "service":
+        raise Problem("renew_service_only", 403)
+    pending = await one(
+        conn,
+        "SELECT r.nonce, n.* FROM credential_renewals r JOIN credentials n ON n.id=r.new_id"
+        " WHERE r.old_id=%s",
+        (c["id"],),
+    )
+    if pending:
+        if pending["revoked_at"] or pending["expires_at"] <= now():
+            raise Problem("renewal_revoked", 409)
+        # Retry after a lost response or a crash before persisting: same successor.
+        await audit(
+            conn, attempt, identity, "credentials.renew", str(pending["id"]), "replayed"
+        )
+        return _renewal_view(renewed_token(token, pending["nonce"]), pending)
+    unconfirmed = await one(
+        conn,
+        "SELECT 1 FROM credential_renewals r JOIN credentials o ON o.id=r.old_id"
+        " WHERE r.new_id=%s AND r.confirmed_at IS NULL AND o.revoked_at IS NULL AND o.expires_at>now()",
+        (c["id"],),
+    )
+    if unconfirmed:
+        raise Problem("renewal_unconfirmed", 409)
+    consumer = await one(
+        conn,
+        "SELECT * FROM consumers WHERE credential_id=%s OR previous_credential_id=%s FOR UPDATE",
+        (c["id"], c["id"]),
+    )
+    if consumer:
+        if consumer["credential_id"] != c["id"]:
+            raise Problem("credential_superseded", 409)
+        if consumer["previous_credential_id"] is not None:
+            prev = await one(
+                conn,
+                "SELECT revoked_at, expires_at FROM credentials WHERE id=%s",
+                (consumer["previous_credential_id"],),
+            )
+            if prev and prev["revoked_at"] is None and prev["expires_at"] > now():
+                raise Problem("previous_credential_live", 409)
+    lifetime = min(
+        c["expires_at"] - c["created_at"], timedelta(seconds=SERVICE_TTL_CAP)
+    )
+    nonce, new_id = secrets.token_bytes(32), uuid4()
+    new_token = renewed_token(token, nonce)
+    new = await one(
+        conn,
+        "INSERT INTO credentials(id,verifier,client_id,ceiling,environment,backend,resource,kind,audience,expires_at)"
+        " VALUES(%s,%s,%s,%s,%s,%s,%s,'service',%s,now()+%s) RETURNING *",
+        (
+            new_id,
+            verifier(new_token),
+            c["client_id"],
+            c["ceiling"],
+            c["environment"],
+            c["backend"],
+            c["resource"],
+            c["audience"],
+            lifetime,
+        ),
+    )
+    # A concurrent renew of the same credential conflicts on old_id (or
+    # deadlocks on the row lock) and fails; the retry takes the replay path.
+    await conn.execute(
+        "INSERT INTO credential_renewals(old_id,new_id,nonce) VALUES(%s,%s,%s)",
+        (c["id"], new_id, nonce),
+    )
+    await conn.execute(
+        "UPDATE credentials SET expires_at=least(expires_at, now()+%s) WHERE id=%s",
+        (RENEW_GRACE, c["id"]),
+    )
+    if consumer:
+        await conn.execute(
+            "UPDATE consumers SET previous_credential_id=credential_id,credential_id=%s WHERE id=%s",
+            (new_id, consumer["id"]),
+        )
+    await audit(
+        conn,
+        attempt,
+        identity,
+        "credentials.renew",
+        str(new_id),
+        "accepted",
+        {"from": str(c["id"]), "consumer": consumer["id"] if consumer else None},
+    )
+    return _renewal_view(new_token, new)
+
+
+async def confirm_renewal(conn, identity, attempt):
+    c = identity.credential
+    r = await one(
+        conn,
+        "SELECT * FROM credential_renewals WHERE new_id=%s FOR UPDATE",
+        (c["id"],),
+    )
+    if not r:
+        raise Problem("renewal_not_found", 404)
+    if r["confirmed_at"] is None:
+        await conn.execute(
+            "UPDATE credentials SET revoked_at=now() WHERE id=%s AND revoked_at IS NULL",
+            (r["old_id"],),
+        )
+        await conn.execute(
+            "UPDATE credential_renewals SET confirmed_at=now() WHERE old_id=%s",
+            (r["old_id"],),
+        )
+        await audit(
+            conn,
+            attempt,
+            identity,
+            "credentials.renew.confirm",
+            str(r["old_id"]),
+            "accepted",
+        )
+        await conn.execute("SELECT pg_notify('cp_events','')")
+    return {"confirmed": True, "revoked": str(r["old_id"])}
