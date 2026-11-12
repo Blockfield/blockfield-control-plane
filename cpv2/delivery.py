@@ -77,9 +77,15 @@ class Wakeups:
 
 async def consumer_for(conn, identity, consumer_id, scope):
     c = await one(conn, "SELECT * FROM consumers WHERE id=%s", (consumer_id,))
+    # Rotation overlap: the outgoing credential pulls delivery until it is
+    # revoked. Revocation never reaches here: authenticate() already 401s
+    # revoked or expired tokens, so this match cannot resurrect one.
     if (
         not c
-        or c["credential_id"] != identity.credential["id"]
+        or (
+            c["credential_id"] != identity.credential["id"]
+            and c["previous_credential_id"] != identity.credential["id"]
+        )
         or identity.credential["kind"] != "service"
     ):
         raise Problem("consumer_identity_mismatch")

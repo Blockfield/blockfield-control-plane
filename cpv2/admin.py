@@ -338,23 +338,49 @@ async def _provision(dsn, spec, bearer_sink=None):
                 now() + timedelta(seconds=ttl),
             ),
         )
+        rebound, rebound_id = None, None
         if spec.get("consumer"):
             if account_id:
                 raise ValueError("consumer requires its own service credential")
             c = spec["consumer"]
-            await conn.execute(
-                "INSERT INTO consumers(id,credential_id,environment,backend,resource,generation,epoch,capabilities) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    c["id"],
-                    cid,
-                    spec["environment"],
-                    spec["backend"],
-                    spec["resource"],
-                    UUID(c["generation"]),
-                    uuid4(),
-                    c["capabilities"],
-                ),
+            # Rotation rebinds the existing consumer id to the new credential
+            # instead of failing on the primary key: the row (generation,
+            # epoch, cursors, outbox) survives, and the outgoing credential
+            # stays valid until revoked, so delivery has no gap. A different
+            # environment/backend/resource/generation is a different consumer
+            # and is refused rather than silently rebound.
+            existing = await one(
+                conn,
+                "SELECT * FROM consumers WHERE id=%s FOR UPDATE",
+                (c["id"],),
             )
+            if existing is None:
+                await conn.execute(
+                    "INSERT INTO consumers(id,credential_id,environment,backend,resource,generation,epoch,capabilities) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        c["id"],
+                        cid,
+                        spec["environment"],
+                        spec["backend"],
+                        spec["resource"],
+                        UUID(c["generation"]),
+                        uuid4(),
+                        c["capabilities"],
+                    ),
+                )
+            else:
+                if (
+                    existing["environment"] != spec["environment"]
+                    or existing["backend"] != spec["backend"]
+                    or existing["resource"] != spec["resource"]
+                    or existing["generation"] != UUID(c["generation"])
+                ):
+                    raise ValueError("consumer scope or generation mismatch")
+                await conn.execute(
+                    "UPDATE consumers SET previous_credential_id=credential_id,credential_id=%s WHERE id=%s",
+                    (cid, c["id"]),
+                )
+                rebound, rebound_id = existing["credential_id"], c["id"]
         attempt = uuid4()
         await record(
             conn,
@@ -368,6 +394,11 @@ async def _provision(dsn, spec, bearer_sink=None):
                         "subjectAccount": str(account_id) if account_id else None,
                         "source": "offline_operator",
                     }
+                    | (
+                        {"consumerRebind": {"id": rebound_id, "from": str(rebound)}}
+                        if rebound is not None
+                        else {}
+                    )
                 ),
             ),
         )
