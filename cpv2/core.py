@@ -437,6 +437,51 @@ async def settings_change(
     )
 
 
+async def gate_toggle(conn, identity, attempt, model):
+    # Single-call gate update: server-side read-modify-write, so the site
+    # sends one POST instead of GET /v1/gate + PATCH. Audit, auth scope and
+    # idempotency match PATCH: the head row is locked first, then the change
+    # goes through settings_change. A redelivery reuses the stored
+    # expectedRevision, so its idempotency fingerprint matches the original.
+    data = models.request_body(model)
+    env, backend = data["environment"], data["backend"]
+    await conn.execute(
+        "INSERT INTO settings_heads VALUES(%s,%s,%s,%s,0) ON CONFLICT DO NOTHING",
+        ("gate", env, backend, "*"),
+    )
+    head = await one(
+        conn,
+        "SELECT * FROM settings_heads WHERE namespace=%s AND environment=%s AND backend=%s AND target=%s FOR UPDATE",
+        ("gate", env, backend, "*"),
+    )
+    prior = await one(
+        conn,
+        "SELECT * FROM operations WHERE credential_id=%s AND idempotency_key=%s",
+        (identity.credential["id"], data["idempotencyKey"]),
+    )
+    expected = head["revision"]
+    if (
+        prior is not None
+        and prior["kind"] == "settings.gate.patch"
+        and prior["expected_revision"] is not None
+    ):
+        expected = prior["expected_revision"]
+    return await settings_change(
+        conn,
+        identity,
+        attempt,
+        "gate",
+        "*",
+        models.SettingsChange(
+            idempotencyKey=data["idempotencyKey"],
+            environment=env,
+            backend=backend,
+            expectedRevision=expected,
+            patch={"mode": data["mode"], "message": data["message"]},
+        ),
+    )
+
+
 async def grant_change(conn, identity, attempt, model, assertion, path):
     data = model.model_dump(mode="json")
     env, backend, target = data["environment"], data["backend"], data["resource"]
