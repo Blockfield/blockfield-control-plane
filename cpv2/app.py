@@ -3,7 +3,7 @@ import json
 import os
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from uuid import UUID, uuid4
 
 import psycopg
@@ -13,11 +13,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from cpv2 import core, delivery, models
 from cpv2.auth import Identity, Problem, audit, authenticate, challenge, verifier
-from cpv2.db import Database, one, rows
+from cpv2.db import MIGRATIONS, Database, one, rows
 from cpv2.settings import DEFINITIONS, digest
 
 # Indirection so tests can expire the /health cache without patching time.
 _health_clock = time.monotonic
+
+# Mutation body caps by path. Everything else stays at 32 KiB; the stats
+# ingest route honors the producer outbox contract (1 MiB/event, same as the
+# site MAX_BODY) so a full 512-player result is never a 413.
+BODY_LIMITS = {"/v2/stats/results": core.STAT_MAX_BODY}
 
 
 class Limits:
@@ -53,6 +58,7 @@ def create_app(dsn=None):
     @asynccontextmanager
     async def lifespan(app):
         await database.open()
+        rebuild_task = None
         try:
             async with database.transaction() as conn:
                 role = await one(
@@ -100,8 +106,15 @@ def create_app(dsn=None):
                 if not await one(conn, "SELECT 1 FROM owner_memberships LIMIT 1"):
                     raise RuntimeError("offline owner bootstrap required")
             await wakeups.start()
+            # Rating replays run here, not in the void request: the request
+            # only enqueues the season, this loop drains it.
+            rebuild_task = asyncio.create_task(core.stat_rebuild_loop(database))
             yield
         finally:
+            if rebuild_task is not None:
+                rebuild_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await rebuild_task
             await wakeups.close()
             await database.close()
 
@@ -210,10 +223,11 @@ def create_app(dsn=None):
                         "pending",
                     )
                 chunks, size = [], 0
+                limit = BODY_LIMITS.get(request.url.path, 32768)
                 async with asyncio.timeout(5):
                     async for chunk in request.stream():
                         size += len(chunk)
-                        if size > 32768:
+                        if size > limit:
                             raise Problem("body_too_large", 413)
                         chunks.append(chunk)
                 request._body = b"".join(chunks)
@@ -328,28 +342,42 @@ def create_app(dsn=None):
             raise Problem("invalid_owner_assertion", 422) from None
 
     health_ok_until = 0.0
+    # Last version read from control.schema_migrations; reported when the
+    # database is unreachable and no newer read exists.
+    health_schema = len(MIGRATIONS)
 
     @app.get("/health")
     async def health():
         # CP-H5: unauthenticated liveness + readiness. 200 only when the
-        # control database answers and the owner bootstrap is present.
-        # Never leak DSNs, errors or gate state here.
-        nonlocal health_ok_until
+        # control database answers, the owner bootstrap is present, and the
+        # stats migration is applied. Never leak DSNs, errors or gate state.
+        nonlocal health_ok_until, health_schema
         # Public route: cache success so probe floods cannot drain the DB pool;
         # failures re-check, since an outage has no pool left to protect.
         if _health_clock() < health_ok_until:
-            return {"status": "ok", "schema": 2}
+            return {"status": "ok", "schema": health_schema}
         try:
             async with database.transaction() as conn:
                 bootstrapped = await one(
                     conn, "SELECT EXISTS(SELECT 1 FROM owner_memberships) AS ok"
                 )
+                applied = await one(
+                    conn, "SELECT MAX(version) AS version FROM schema_migrations"
+                )
         except Exception:
-            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
-        if not bootstrapped or not bootstrapped["ok"]:
-            return JSONResponse({"status": "unavailable", "schema": 2}, status_code=503)
+            return JSONResponse(
+                {"status": "unavailable", "schema": health_schema}, status_code=503
+            )
+        version = (
+            applied["version"] if applied and applied["version"] is not None else 0
+        )
+        health_schema = version
+        if not bootstrapped or not bootstrapped["ok"] or version < len(MIGRATIONS):
+            return JSONResponse(
+                {"status": "unavailable", "schema": version}, status_code=503
+            )
         health_ok_until = _health_clock() + 5
-        return {"status": "ok", "schema": 2}
+        return {"status": "ok", "schema": version}
 
     @app.get("/v1/openapi.json")
     async def openapi():
@@ -615,6 +643,96 @@ def create_app(dsn=None):
             )
             await conn.execute("SELECT pg_notify('cp_events','')")
             return {"revoked": True}
+
+    @app.post("/v2/stats/results")
+    async def stats_ingest(body: dict, request: Request):
+        # The producer outbox acknowledges 200/201 JSON carrying inserted and
+        # the exact eventId; anything else stays under rejected/ for review.
+        # The write path commits the completion audit in the same transaction
+        # as the insert, like site sessions.
+        result = await write(request, core.stat_ingest, body)
+        return JSONResponse(result, status_code=201 if result["inserted"] else 200)
+
+    def stats_query(request, default_period=None):
+        # The site read contracts parse raw query strings (limit "007" is
+        # valid, "25.0" is a 400): keep them strings and let core.stat_filters
+        # apply the same validation.
+        params = {}
+        for key in ("mode", "season", "period", "sort", "limit", "page"):
+            value = request.query_params.get(key)
+            if value is not None:
+                params[key] = value
+        if (
+            default_period is not None
+            and "season" not in params
+            and "period" not in params
+        ):
+            params["period"] = default_period
+        return params
+
+    @app.get("/v2/stats/seasons")
+    async def stats_seasons(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        seasons = core.stat_seasons()
+        return {
+            "schemaVersion": 1,
+            "current": seasons[-1]["id"] if seasons else None,
+            "seasons": seasons,
+        }
+
+    @app.get("/v2/stats/leaderboard")
+    async def stats_leaderboard(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        query = core.stat_filters(stats_query(request))
+        async with database.transaction() as conn:
+            return await core.stat_leaderboard(conn, query)
+
+    @app.get("/v2/stats/players/{player_uuid}")
+    async def stats_player(player_uuid: str, request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        query = core.stat_filters(stats_query(request))
+        async with database.transaction() as conn:
+            return await core.stat_player(conn, query, player_uuid)
+
+    @app.get("/v2/stats/hitreg")
+    async def stats_hitreg(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        # Staff-only window like the site admin hit-reg report: the last
+        # 7 days unless a season or period is given.
+        query = core.stat_filters(stats_query(request, "week"))
+        async with database.transaction() as conn:
+            return await core.stat_hitreg(conn, query)
+
+    @app.post("/v2/stats/results/void")
+    async def stats_void(body: models.StatVoid, request: Request):
+        return await write(request, core.stat_void, body)
+
+    @app.post("/v2/site/sessions", status_code=201)
+    async def site_session_create(body: models.SiteSessionCreate, request: Request):
+        # The write path commits the completion audit in the same transaction
+        # as the mutation, so a post-commit audit failure rolls the session
+        # back instead of losing its one-time id.
+        return await write(request, core.site_session_create, body)
+
+    @app.get("/v2/site/sessions/{session_id}")
+    async def site_session_read(session_id: str, request: Request):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            result = await core.site_session_read(conn, identity, session_id)
+        if result is None:
+            # Expired (or concurrently revoked): the cleanup above already
+            # committed, so 404 here instead of raising inside the transaction
+            # and rolling it back.
+            raise Problem("session_not_found", 404)
+        return result
+
+    @app.delete("/v2/site/sessions/{session_id}")
+    async def site_session_revoke(session_id: str, request: Request):
+        return await write(request, core.site_session_revoke, session_id)
+
+    @app.delete("/v2/site/users/{player_uuid}/sessions")
+    async def site_sessions_revoke_user(player_uuid: str, request: Request):
+        return await write(request, core.site_sessions_revoke_user, player_uuid)
 
     @app.get("/v2/operations/{operation_id}")
     async def operation(operation_id: UUID, request: Request):

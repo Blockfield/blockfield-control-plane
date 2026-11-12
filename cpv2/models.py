@@ -159,6 +159,21 @@ class Delegation(Mutation):
     expiresInSeconds: int = Field(default=300, ge=1, le=900)
 
 
+class SiteSessionCreate(Strict):
+    # Sealed Drasl token as stored by the site today (opaque to CP, AES-GCM
+    # sealed hex.hex); CP never decrypts, only stores and returns it.
+    sealedToken: str = Field(min_length=1, max_length=4096)
+    playerUuid: str = Field(min_length=1, max_length=128)
+
+
+class StatVoid(Strict):
+    # Void/restore one ingested result (site setVoided contract): voiding a
+    # rated campaign enqueues its season for the background rebuild loop.
+    serverId: ID
+    eventId: ID
+    voided: bool
+
+
 class OperationReceipt(Strict):
     operationId: ID
     revision: int | None

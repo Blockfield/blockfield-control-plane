@@ -69,6 +69,11 @@ ROLE_SCOPES = {
         "settings.gameplay.write",
         "staff.lower.manage",
         "audit.read",
+        # Stats reads mirror the site leaderboard/player/hit-reg contracts;
+        # voids replay MMR like the site admin void. Admins and owners hold
+        # both directly; services hold reads only (see STATS_READ_SCOPES).
+        "stats.read",
+        "stats.void",
         *MODERATION_SCOPES,
         *MODERATION_ADMIN_SCOPES,
         *WORKSHOP_WRITE_SCOPES,
@@ -86,6 +91,9 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     # Workshop AI keys mirror the site `ai` permission: founders only. In no
     # role, so no admin, moderator or service credential can ever hold it.
     "workshop.ai-key",
+    # Site player sessions: the site stores sealed Drasl tokens in CP and can
+    # revoke them; founders keep revocation when the site is unavailable.
+    "site.sessions",
 }
 SERVICE_SCOPES = {
     "agents.events",
@@ -111,6 +119,24 @@ STAFF_SCOPES = {"staff.read", "staff.lower.manage", "staff.admin.manage"}
 # while the token itself stays unbound (see admin.provision). Reads ride the
 # same token without an actor since they need no attribution.
 SITE_SETTINGS_SCOPES = {"settings.read", "settings.gameplay.write"}
+# Site player sessions (coordination#29): sealed Drasl tokens live in CP, the
+# site is a stateless client. Service-only like staff scopes: provisioned
+# solely on a resource="*" credential, never in a human role, so no scoped
+# consumer can mint sessions for another resource.
+SITE_SESSIONS_SCOPES = {"site.sessions"}
+# Game-producer stats ingest (coordination#29 U1): match/campaign results go
+# to the CP stats schema instead of the site DB. Service-only, never in a
+# human role or owner scope. Unlike the site scopes above the credential stays
+# bound to its server resource (provision refuses "*"), so one server can
+# never submit another server's results; the runtime requires the scope on
+# the body's serverId (see core.stat_ingest).
+STATS_SCOPES = {"stats.ingest"}
+# Stats reads (coordination#29 U3): leaderboard, player, hit-reg and seasons
+# with the site's filter/sort/rank contracts. Service-holdable on an unbound
+# (resource "*") credential only — the site SSR, launcher and bot read with
+# it — never in a human role; admins and owners hold it via their role (see
+# ROLE_SCOPES). The public-exposure unit adds domain/rate-limit policy later.
+STATS_READ_SCOPES = {"stats.read"}
 
 
 class Problem(Exception):
@@ -176,11 +202,27 @@ class Identity:
             return False
         if c["kind"] == "service":
             if self.account is None:
-                return scope in SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES
+                return (
+                    scope
+                    in SERVICE_SCOPES
+                    | STAFF_SCOPES
+                    | SITE_SETTINGS_SCOPES
+                    | SITE_SESSIONS_SCOPES
+                    | STATS_SCOPES
+                    | STATS_READ_SCOPES
+                )
             # Service-asserted actor (staff/settings writes via the site
             # principal): the service must be provisioned for the scope, and
             # the asserted actor must hold it exactly like a direct caller.
-            if scope not in SERVICE_SCOPES | STAFF_SCOPES | SITE_SETTINGS_SCOPES:
+            if (
+                scope
+                not in SERVICE_SCOPES
+                | STAFF_SCOPES
+                | SITE_SETTINGS_SCOPES
+                | SITE_SESSIONS_SCOPES
+                | STATS_SCOPES
+                | STATS_READ_SCOPES
+            ):
                 return False
         if self.owner:
             return scope in OWNER_SCOPES

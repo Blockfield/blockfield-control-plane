@@ -3,7 +3,13 @@
 import pytest
 from pydantic import ValidationError
 
-from cpv2.models import Action, GrantChange, ModerationAction, Rollback, SettingsChange
+from cpv2.models import (
+    Action,
+    GrantChange,
+    ModerationAction,
+    Rollback,
+    SettingsChange,
+)
 from cpv2.settings import (
     DEFINITIONS,
     AiLimits,
@@ -403,3 +409,16 @@ def test_owner_challenge_and_write_hash_the_same_settings_body():
     challenged = normalized_action("PATCH", "/v2/settings/gate/*", body)
     assert challenged == request_body(SettingsChange(**body))
     assert "actorAccountId" not in challenged
+
+
+def test_site_session_create_rejects_empty_or_oversized_token():
+    from cpv2.models import SiteSessionCreate
+
+    ok = SiteSessionCreate(sealedToken="ab12.cd34", playerUuid="player-1")
+    assert ok.sealedToken == "ab12.cd34"
+    with pytest.raises(ValidationError):
+        SiteSessionCreate(sealedToken="", playerUuid="player-1")
+    with pytest.raises(ValidationError):
+        SiteSessionCreate(sealedToken="x" * 4097, playerUuid="player-1")
+    with pytest.raises(ValidationError):
+        SiteSessionCreate(sealedToken="tok", playerUuid="")
