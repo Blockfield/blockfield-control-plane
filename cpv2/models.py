@@ -37,6 +37,9 @@ class GateToggle(Mutation):
     # site needs one POST instead of GET /v1/gate + PATCH.
     mode: str = Field(pattern="^(open|draining|maintenance)$")
     message: str = Field(default="", max_length=500)
+    # Service-asserted acting account (site principal only). Direct callers
+    # are authenticated and must never send it.
+    actorAccountId: ID | None = None
 
 
 class Rollback(Mutation):
@@ -219,14 +222,14 @@ def request_body(model):
 
     SettingsChange and Rollback gained actorAccountId later: when it is absent
     their body must stay byte-identical to the pre-actor shape, so a retry of an
-    operation accepted before the upgrade still matches its stored hash. The
-    owner step-up challenge (auth.normalized_action) and the write path
-    (core.settings_change) both use this, so they always hash the same body.
-    Other models already carried the field and keep their shape.
+    operation accepted before the upgrade still matches its stored hash. GateToggle
+    gained it the same way. The owner step-up challenge (auth.normalized_action)
+    and the write path (core.settings_change) both use this, so they always hash
+    the same body. Other models already carried the field and keep their shape.
     """
     data = model.model_dump(mode="json")
     if (
-        isinstance(model, (SettingsChange, Rollback))
+        isinstance(model, (SettingsChange, Rollback, GateToggle))
         and data.get("actorAccountId") is None
     ):
         data.pop("actorAccountId", None)

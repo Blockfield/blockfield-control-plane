@@ -235,14 +235,23 @@ async def settings_change(
         else definition.write
     )
     identity.require(scope, env, backend, target)
-    if scope in SITE_SETTINGS_SCOPES and identity.credential["kind"] == "service":
+    # The game-leg gate (any non-workshop gate target) asserts like gameplay:
+    # its moderation.ban write scope would otherwise mint an account-less
+    # operation that delivery fences. The workshop leg keeps the
+    # stable-principal path below.
+    site_asserted = scope in SITE_SETTINGS_SCOPES or (
+        namespace == "gate" and target != "workshop"
+    )
+    if site_asserted and identity.credential["kind"] == "service":
         # The site principal asserts the logged-in admin (like staff/
         # moderation): CP re-resolves that actor's account, live grants and
         # owner membership, then the actor's own grants decide. Only the
-        # unbound site principal may assert an actor. Other service scopes
-        # (workshop.gate, moderation.ban) keep the stable-principal path, and
-        # protected paths still fail closed below (owner step-up needs a
-        # direct owner session).
+        # unbound site principal may assert an actor. The game-leg gate PATCH
+        # (moderation.ban at a non-workshop target) asserts the same way, so
+        # its operation carries a human account past delivery; other service
+        # scopes (workshop.gate, moderation.ban for inbox actions) keep the
+        # stable-principal path, and protected paths still fail closed below
+        # (owner step-up needs a direct owner session).
         if model.actorAccountId is None:
             raise Problem("service_actor_required")
         # Only the unbound site principal may assert an actor; a scoped
@@ -485,6 +494,7 @@ async def gate_toggle(conn, identity, attempt, model):
             backend=backend,
             expectedRevision=expected,
             patch={"mode": data["mode"], "message": data["message"]},
+            actorAccountId=data.get("actorAccountId"),
         ),
     )
 
