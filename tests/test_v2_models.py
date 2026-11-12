@@ -126,6 +126,15 @@ def test_complete_object_and_nested_diff():
         Gameplay.model_validate(merge(value, {"lobby": {"owner": True}}))
 
 
+def test_legacy_gameplay_ai_drops_instead_of_failing():
+    # coordination#56 removed gameplay.ai: pre-removal rows still store it,
+    # so unrelated writes on legacy values must validate with ai dropped.
+    legacy = {**Gameplay().model_dump(), "ai": {"budget": 10, "hardLimit": 20}}
+    updated = Gameplay.model_validate(merge(legacy, {"match": {"maxPlayers": 16}}))
+    assert updated.match.maxPlayers == 16
+    assert "ai" not in updated.model_dump()
+
+
 def test_c5_rate_limiter_evicts_lru_instead_of_locking_out_new_keys():
     from cpv2.app import Limits
     from cpv2.auth import Problem

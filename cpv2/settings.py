@@ -59,6 +59,16 @@ class Gameplay(Strict):
     lobby: Lobby = Field(default_factory=Lobby)
     match: Match = Field(default_factory=Match)
 
+    @model_validator(mode="before")
+    @classmethod
+    def drop_legacy_ai(cls, values):
+        # coordination#56 removed gameplay.ai: pre-removal revisions still
+        # store it, so drop it here or every unrelated write on a legacy
+        # row fails validation.
+        if isinstance(values, dict):
+            values.pop("ai", None)
+        return values
+
 
 class Gate(Strict):
     mode: str = Field(default="maintenance", pattern="^(open|draining|maintenance)$")
