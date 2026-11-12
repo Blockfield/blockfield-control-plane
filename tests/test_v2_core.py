@@ -4079,8 +4079,11 @@ async def test_c13_surrogate_dict_key_is_invalid_without_side_effects(store):
 
 
 async def test_c14_malformed_owner_assertion_is_4xx(store):
-    path = "/v2/settings/gameplay/arena"
-    body = patch("c14-malformed", value={"match": {"maxPlayers": 64}})
+    path = "/v2/settings/ai-limits/global"
+    body = patch(
+        "c14-malformed",
+        value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}},
+    )
     proof = json.loads(
         (await assertion(store, "PATCH", path, body))["X-CP-Owner-Assertion"]
     )
