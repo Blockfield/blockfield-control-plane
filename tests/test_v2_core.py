@@ -9079,7 +9079,7 @@ async def test_stats_diag_retention_prunes_by_age_and_severity(store, monkeypatc
         )
         await conn.execute(
             "INSERT INTO control.stat_events(server_id,event_id,at,kind,message,repeats) VALUES(%s,%s,%s,'error','old',1)",
-            (_DIAG_SERVER, _DIAG_EVENT, datetime.fromtimestamp(old_event / 1000, tz=timezone.utc)),
+            (_DIAG_SERVER, "00000000-0000-0000-0000-000000000000", datetime.fromtimestamp(old_event / 1000, tz=timezone.utc)),
         )
         await conn.commit()
     response = await request(store, "POST", "/v2/stats/diagnostics", _diag_body(now_ms), "stats-diag-retain")
