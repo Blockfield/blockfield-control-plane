@@ -337,8 +337,7 @@ async def settings_change(
         raise Problem("invalid_settings", 422) from None
     diff = changed(before["value"], after)
     # Paths nest under dict fields (sessions.<uuid>), so a protected subtree
-    # matches by prefix; exact gameplay behavior is unchanged (ai.hardLimit is
-    # a leaf, ai.budget still matches nothing).
+    # matches by prefix.
     protected = any(
         field == path or field.startswith(path + ".")
         for field in diff

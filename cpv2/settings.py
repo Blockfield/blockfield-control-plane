@@ -55,21 +55,9 @@ class Match(Strict):
     respawnSeconds: int = Field(default=5, ge=0, le=120)
 
 
-class AI(Strict):
-    budget: int = Field(default=0, ge=0, le=100000)
-    hardLimit: int = Field(default=100, ge=0, le=100000)
-
-    @model_validator(mode="after")
-    def ceiling(self):
-        if self.budget > self.hardLimit:
-            raise ValueError("budget exceeds hardLimit")
-        return self
-
-
 class Gameplay(Strict):
     lobby: Lobby = Field(default_factory=Lobby)
     match: Match = Field(default_factory=Match)
-    ai: AI = Field(default_factory=AI)
 
 
 class Gate(Strict):
@@ -604,9 +592,7 @@ class Definition:
 
 
 DEFINITIONS = {
-    "gameplay": Definition(
-        Gameplay, "settings.read", "settings.gameplay.write", ("ai.hardLimit",)
-    ),
+    "gameplay": Definition(Gameplay, "settings.read", "settings.gameplay.write"),
     "gate": Definition(Gate, "settings.read", "moderation.ban", timing="live"),
     # Site settings.json sections and policy files. Game settings share the
     # gameplay write scope (site `settings` permission); money and Workshop AI

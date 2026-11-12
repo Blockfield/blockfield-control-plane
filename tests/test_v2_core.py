@@ -492,8 +492,8 @@ async def test_admin_cannot_become_owner_by_any_api_route(store):
         ),
         (
             "PATCH",
-            "/v2/settings/gameplay/arena",
-            patch(value={"ai": {"hardLimit": 200}}),
+            "/v2/settings/ai-limits/global",
+            patch(value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}}),
         ),
         (
             "PATCH",
@@ -566,8 +566,9 @@ async def test_grants_scope_self_peer_higher_and_epoch_revocation(store):
 async def test_owner_stepup_is_action_bound_one_use_user_verified_and_origin_bound(
     store,
 ):
-    path = "/v2/settings/gameplay/arena"
-    body = patch(value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    account = "12345678-1234-1234-1234-1234567890ab"
+    body = patch(value={"sessions": {account: 1000}})
     assert (await request(store, "PATCH", path, body, "owner")).status_code == 403
     for opts in ({"origin": "https://site.example.test"}, {"uv": False}):
         proof = await assertion(store, "PATCH", path, body, **opts)
@@ -575,7 +576,7 @@ async def test_owner_stepup_is_action_bound_one_use_user_verified_and_origin_bou
             await request(store, "PATCH", path, body, "owner", proof)
         ).status_code == 403
     proof = await assertion(store, "PATCH", path, body)
-    changed_body = patch(value={"ai": {"hardLimit": 300}})
+    changed_body = patch(value={"sessions": {account: 2000}})
     assert (
         await request(store, "PATCH", path, changed_body, "owner", proof)
     ).status_code == 403
@@ -585,15 +586,16 @@ async def test_owner_stepup_is_action_bound_one_use_user_verified_and_origin_bou
     assert (
         await request(store, "PATCH", path, body, "owner", proof)
     ).json() == response.json()
-    second = patch(key="replay", revision=1, value={"ai": {"hardLimit": 400}})
+    second = patch(key="replay", revision=1, value={"sessions": {account: 3000}})
     assert (
         await request(store, "PATCH", path, second, "owner", proof)
     ).status_code == 403
 
 
 async def test_protected_rollback_and_normalized_parent_patch(store):
-    path = "/v2/settings/gameplay/arena"
-    first = patch(value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    account = "12345678-1234-1234-1234-1234567890ab"
+    first = patch(value={"sessions": {account: 1000}})
     assert (
         await request(
             store,
@@ -604,7 +606,7 @@ async def test_protected_rollback_and_normalized_parent_patch(store):
             await assertion(store, "PATCH", path, first),
         )
     ).status_code == 202
-    second = patch("owner-second", 1, {"ai": {"hardLimit": 300}})
+    second = patch("owner-second", 1, {"sessions": {account: 2000}})
     assert (
         await request(
             store,
@@ -619,9 +621,9 @@ async def test_protected_rollback_and_normalized_parent_patch(store):
     response = await request(store, "POST", path + "/rollback", body)
     assert response.status_code == 403
     for value in (
-        {"ai": {"hardLimit": 400, "budget": 100}},
-        {"ai": None},
-        {"lobby": {"owner": True}},
+        {"sessions": {"not-a-uuid": 100}},
+        {"sessions": None},
+        {"mode": "bogus"},
     ):
         assert (
             await request(store, "PATCH", path, patch("parent", 2, value))
@@ -653,7 +655,7 @@ async def test_settings_validate_no_effect_cas_concurrency_and_idempotency(store
     assert len(await sql(store, "SELECT * FROM outbox")) == 2
     assert (
         await request(
-            store, "PATCH", path, patch("invalid", 1, {"ai": {"budget": 101}})
+            store, "PATCH", path, patch("invalid", 1, {"match": {"maxPlayers": 999}})
         )
     ).status_code == 422
 
@@ -1968,7 +1970,7 @@ async def test_nonhuman_owner_session_never_acquires_owner_authority(store):
         json={
             "method": "PATCH",
             "path": "/v2/settings/gameplay/arena",
-            "body": patch(value={"ai": {"hardLimit": 200}}),
+            "body": patch(value={"match": {"maxPlayers": 64}}),
         },
     )
     assert response.status_code == 403
@@ -4078,7 +4080,7 @@ async def test_c13_surrogate_dict_key_is_invalid_without_side_effects(store):
 
 async def test_c14_malformed_owner_assertion_is_4xx(store):
     path = "/v2/settings/gameplay/arena"
-    body = patch("c14-malformed", value={"ai": {"hardLimit": 200}})
+    body = patch("c14-malformed", value={"match": {"maxPlayers": 64}})
     proof = json.loads(
         (await assertion(store, "PATCH", path, body))["X-CP-Owner-Assertion"]
     )
@@ -4386,8 +4388,11 @@ async def test_c18_provision_bearer_write_failure_rolls_back(
 
 
 async def test_c18_protected_scope_rechecked_at_delivery(store):
-    path = "/v2/settings/gameplay/arena"
-    body = patch("c18-protected", value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    body = patch(
+        "c18-protected",
+        value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}},
+    )
     proof = await assertion(store, "PATCH", path, body)
     response = await request(store, "PATCH", path, body, "owner", proof)
     assert response.status_code == 202, response.text
@@ -4419,8 +4424,11 @@ async def test_c18_protected_scope_rechecked_at_delivery(store):
 
 
 async def test_c19_both_scopes_rechecked_at_delivery(store):
-    path = "/v2/settings/gameplay/arena"
-    body = patch("c19-both", value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    body = patch(
+        "c19-both",
+        value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}},
+    )
     proof = await assertion(store, "PATCH", path, body)
     response = await request(store, "PATCH", path, body, "owner", proof)
     assert response.status_code == 202, response.text
@@ -5703,7 +5711,7 @@ async def test_settings_patch_null_deletes_rollback_restores_and_replays(store):
     assert set(value["value"]["kits"]) == {"alpha", "beta"}
 
 
-async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
+async def test_settings_patch_nested_delete_reset_and_invalid_change(store):
     path = "/v2/settings/campaign/arena"
     seed = patch(
         "camp-seed",
@@ -5732,15 +5740,12 @@ async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
     assert (await request(store, "GET", path)).json()["value"] == {
         "campaignBalance": {}
     }
-    # Delete that breaks an invariant is rejected: budget above a deleted hardLimit.
+    # The removed ai section is rejected like any unknown field.
     gpath = "/v2/settings/gameplay/arena"
-    first = patch("g-seed", 0, {"ai": {"budget": 200, "hardLimit": 300}})
-    proof = await assertion(store, "PATCH", gpath, first)
-    assert (
-        await request(store, "PATCH", gpath, first, "owner", proof)
-    ).status_code == 202
-    bad = patch("g-bad", 1, {"ai": {"hardLimit": None}})
-    assert (await request(store, "PATCH", gpath, bad, "owner")).status_code == 422
+    seed = patch("g-seed", 0, {"match": {"maxPlayers": 24}})
+    assert (await request(store, "PATCH", gpath, seed)).status_code == 202
+    gone = patch("g-gone", 1, {"ai": {"hardLimit": 200}})
+    assert (await request(store, "PATCH", gpath, gone)).status_code == 422
 
 
 async def test_cpp1_workshop_leg_reaches_proxy_snapshot_and_frames(store):
