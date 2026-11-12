@@ -1721,9 +1721,12 @@ async def test_renew_crash_before_confirm_replays_and_confirm_revokes_old(store)
     assert (
         await client.post("/v2/credentials/renew/confirm", headers=auth(new))
     ).status_code == 200
+    nxt = await client.post("/v2/credentials/renew", headers=auth(new))
+    assert nxt.status_code == 201
+    # The intermediate credential no longer confirms its own (already confirmed) row.
     assert (
-        await client.post("/v2/credentials/renew", headers=auth(new))
-    ).status_code == 201
+        await client.post("/v2/credentials/renew/confirm", headers=auth(new))
+    ).status_code == 404
     actions = [
         r["action"]
         for r in await sql(

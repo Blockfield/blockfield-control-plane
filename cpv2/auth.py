@@ -629,7 +629,10 @@ async def confirm_renewal(conn, identity, attempt):
         "SELECT * FROM credential_renewals WHERE new_id=%s FOR UPDATE",
         (c["id"],),
     )
-    if not r:
+    # Only the latest successor confirms: once it renewed on, its own row is the live one.
+    if not r or await one(
+        conn, "SELECT 1 FROM credential_renewals WHERE old_id=%s", (c["id"],)
+    ):
         raise Problem("renewal_not_found", 404)
     if r["confirmed_at"] is None:
         await conn.execute(
