@@ -1570,6 +1570,88 @@ async def test_c7_consumer_credential_rotates_without_gap(store):
     assert ack.status_code == 200, ack.text
 
 
+async def test_c7_rebind_refuses_capability_or_client_change(store):
+    generation = str(uuid4())
+
+    def rot_spec(**over):
+        spec = {
+            "client": {
+                "id": "rot2",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot2",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+        spec.update(over)
+        return spec
+
+    await provision(store["admin"], rot_spec())
+    first = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[
+        0
+    ]["credential_id"]
+    # Narrowed capabilities are a different consumer: refused, not rebound.
+    bad = rot_spec()
+    bad["consumer"] = {**bad["consumer"], "capabilities": ["settings.gameplay"]}
+    with pytest.raises(ValueError, match="mismatch"):
+        await provision(store["admin"], bad)
+    # Another client's credential must not steal the consumer id.
+    stolen = rot_spec()
+    stolen["client"] = {**stolen["client"], "id": "rot2-attacker"}
+    with pytest.raises(ValueError, match="client mismatch"):
+        await provision(store["admin"], stolen)
+    row = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[0]
+    assert row["credential_id"] == first
+
+
+async def test_c7_second_rotation_refused_while_previous_valid(store):
+    generation = str(uuid4())
+
+    def rot_spec():
+        return {
+            "client": {
+                "id": "rot3",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot3",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+
+    await provision(store["admin"], rot_spec())
+    c1 = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot3'"))[0][
+        "credential_id"
+    ]
+    await provision(store["admin"], rot_spec())
+    # Rotating again before revoking C1 must not silently drop it.
+    with pytest.raises(ValueError, match="still valid"):
+        await provision(store["admin"], rot_spec())
+    assert await revoke_credential(store["admin"], c1) == c1
+    await provision(store["admin"], rot_spec())
+    row = (
+        await sql(
+            store,
+            "SELECT credential_id, previous_credential_id"
+            " FROM consumers WHERE id='rot3'",
+        )
+    )[0]
+    assert row["previous_credential_id"] != c1
+
+
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
     wakeups = store["app"].state.wakeups
     waiter = wakeups.subscribe("game")

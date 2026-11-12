@@ -347,8 +347,11 @@ async def _provision(dsn, spec, bearer_sink=None):
             # instead of failing on the primary key: the row (generation,
             # epoch, cursors, outbox) survives, and the outgoing credential
             # stays valid until revoked, so delivery has no gap. A different
-            # environment/backend/resource/generation is a different consumer
-            # and is refused rather than silently rebound.
+            # environment/backend/resource/generation/capabilities/client is a
+            # different consumer and is refused rather than silently rebound;
+            # a second rotation while the previous credential is still valid
+            # is refused too, so the single overlap slot never drops a live
+            # credential (the unattended renewer revokes after switching).
             existing = await one(
                 conn,
                 "SELECT * FROM consumers WHERE id=%s FOR UPDATE",
@@ -374,8 +377,30 @@ async def _provision(dsn, spec, bearer_sink=None):
                     or existing["backend"] != spec["backend"]
                     or existing["resource"] != spec["resource"]
                     or existing["generation"] != UUID(c["generation"])
+                    or set(existing["capabilities"]) != set(c["capabilities"])
                 ):
                     raise ValueError("consumer scope or generation mismatch")
+                old_cred = await one(
+                    conn,
+                    "SELECT client_id FROM credentials WHERE id=%s",
+                    (existing["credential_id"],),
+                )
+                if old_cred is None or old_cred["client_id"] != client["id"]:
+                    raise ValueError("consumer client mismatch")
+                if existing["previous_credential_id"] is not None:
+                    prev = await one(
+                        conn,
+                        "SELECT revoked_at, expires_at FROM credentials WHERE id=%s",
+                        (existing["previous_credential_id"],),
+                    )
+                    if (
+                        prev is not None
+                        and prev["revoked_at"] is None
+                        and prev["expires_at"] > now()
+                    ):
+                        raise ValueError(
+                            "previous consumer credential still valid; revoke it before rotating again"
+                        )
                 await conn.execute(
                     "UPDATE consumers SET previous_credential_id=credential_id,credential_id=%s WHERE id=%s",
                     (cid, c["id"]),
