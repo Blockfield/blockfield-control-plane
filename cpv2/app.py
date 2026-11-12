@@ -507,6 +507,12 @@ def create_app(dsn=None):
         )
 
     @app.post(
+        "/v2/gate/toggle", status_code=202, response_model=models.OperationReceipt
+    )
+    async def gate_toggle(body: models.GateToggle, request: Request):
+        return await write(request, core.gate_toggle, body)
+
+    @app.post(
         "/v2/settings/{namespace}/{target}/rollback",
         status_code=202,
         response_model=models.OperationReceipt,
