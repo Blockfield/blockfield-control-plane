@@ -1480,6 +1480,178 @@ async def test_admin_cli_provision_receipt_and_revoke(
     ).status_code == 401
 
 
+async def test_c7_consumer_credential_rotates_without_gap(store):
+    generation = str(uuid4())
+
+    def rot_spec():
+        return {
+            "client": {
+                "id": "rot",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+
+    old_token = await provision(store["admin"], rot_spec())
+    store["tokens"]["rot-agent"] = old_token
+    old_id = (await sql(store, "SELECT id FROM credentials WHERE client_id='rot'"))[0][
+        "id"
+    ]
+    before = (
+        await sql(
+            store,
+            "SELECT epoch, generation, credential_id FROM consumers WHERE id='rot'",
+        )
+    )[0]
+    # A frame queued before the rotation must survive the rebind.
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gameplay/*", patch("global", 0)
+    )
+    assert accepted.status_code == 202, accepted.text
+
+    new_token = await provision(store["admin"], rot_spec())
+    row = (
+        await sql(
+            store,
+            "SELECT epoch, generation, credential_id, previous_credential_id"
+            " FROM consumers WHERE id='rot'",
+        )
+    )[0]
+    assert row["epoch"] == before["epoch"]
+    assert row["generation"] == before["generation"]
+    assert row["credential_id"] != before["credential_id"]
+    assert row["previous_credential_id"] == before["credential_id"]
+
+    async def batch_as(token):
+        async with store["app"].state.db.transaction() as conn:
+            return await delivery.batch(
+                conn, await authenticate(conn, token), "rot", row["epoch"], 0
+            )
+
+    # Overlap: both tokens pull delivery until the old one is revoked.
+    assert len(await batch_as(old_token)) == 1
+    assert len(await batch_as(new_token)) == 1
+
+    # A different generation is a different consumer: refused, not rebound.
+    bad = rot_spec()
+    bad["consumer"] = {**bad["consumer"], "generation": str(uuid4())}
+    with pytest.raises(ValueError, match="mismatch"):
+        await provision(store["admin"], bad)
+
+    assert await revoke_credential(store["admin"], old_id) == old_id
+    assert (
+        await request(
+            store,
+            "GET",
+            "/v2/agents/rot/snapshot",
+            None,
+            "admin",
+            {"Authorization": f"Bearer {old_token}"},
+        )
+    ).status_code == 401
+    # The redeployed consumer keeps pulling and ACKing on the new credential.
+    store["tokens"]["rot-agent"] = new_token
+    snapshot = await request(store, "GET", "/v2/agents/rot/snapshot", None, "rot-agent")
+    assert snapshot.status_code == 200, snapshot.text
+    frames = await envelopes(store, cid="rot")
+    assert len(frames) == 1
+    ack = await request(
+        store, "POST", "/v2/agents/rot/acks", ack_body(frames[0]), "rot-agent"
+    )
+    assert ack.status_code == 200, ack.text
+
+
+async def test_c7_rebind_refuses_capability_or_client_change(store):
+    generation = str(uuid4())
+
+    def rot_spec(**over):
+        spec = {
+            "client": {
+                "id": "rot2",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot2",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+        spec.update(over)
+        return spec
+
+    await provision(store["admin"], rot_spec())
+    first = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[
+        0
+    ]["credential_id"]
+    # Narrowed capabilities are a different consumer: refused, not rebound.
+    bad = rot_spec()
+    bad["consumer"] = {**bad["consumer"], "capabilities": ["settings.gameplay"]}
+    with pytest.raises(ValueError, match="mismatch"):
+        await provision(store["admin"], bad)
+    # Another client's credential must not steal the consumer id.
+    stolen = rot_spec()
+    stolen["client"] = {**stolen["client"], "id": "rot2-attacker"}
+    with pytest.raises(ValueError, match="client mismatch"):
+        await provision(store["admin"], stolen)
+    row = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[0]
+    assert row["credential_id"] == first
+
+
+async def test_c7_second_rotation_refused_while_previous_valid(store):
+    generation = str(uuid4())
+
+    def rot_spec():
+        return {
+            "client": {
+                "id": "rot3",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot3",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+
+    await provision(store["admin"], rot_spec())
+    c1 = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot3'"))[0][
+        "credential_id"
+    ]
+    await provision(store["admin"], rot_spec())
+    # Rotating again before revoking C1 must not silently drop it.
+    with pytest.raises(ValueError, match="still valid"):
+        await provision(store["admin"], rot_spec())
+    assert await revoke_credential(store["admin"], c1) == c1
+    await provision(store["admin"], rot_spec())
+    row = (
+        await sql(
+            store,
+            "SELECT credential_id, previous_credential_id"
+            " FROM consumers WHERE id='rot3'",
+        )
+    )[0]
+    assert row["previous_credential_id"] != c1
+
+
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
     wakeups = store["app"].state.wakeups
     waiter = wakeups.subscribe("game")
@@ -5400,7 +5572,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 7}
+    assert response.json() == {"status": "ok", "schema": 8}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -5408,7 +5580,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 7}
+    assert broken.json() == {"status": "unavailable", "schema": 8}
 
 
 async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
