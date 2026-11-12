@@ -118,12 +118,21 @@ def test_settings_changes_accept_service_actor_but_reject_bare_actor():
 
 def test_complete_object_and_nested_diff():
     value = Gameplay().model_dump()
-    updated = merge(value, {"ai": {"hardLimit": 200}})
-    assert list(changed(value, updated)) == ["ai.hardLimit"]
+    updated = merge(value, {"match": {"maxPlayers": 64}})
+    assert list(changed(value, updated)) == ["match.maxPlayers"]
     with pytest.raises(ValidationError):
-        Gameplay.model_validate(merge(value, {"ai": {"budget": 101}}))
+        Gameplay.model_validate(merge(value, {"match": {"maxPlayers": 999}}))
     with pytest.raises(ValidationError):
         Gameplay.model_validate(merge(value, {"lobby": {"owner": True}}))
+
+
+def test_legacy_gameplay_ai_drops_instead_of_failing():
+    # coordination#56 removed gameplay.ai: pre-removal rows still store it,
+    # so unrelated writes on legacy values must validate with ai dropped.
+    legacy = {**Gameplay().model_dump(), "ai": {"budget": 10, "hardLimit": 20}}
+    updated = Gameplay.model_validate(merge(legacy, {"match": {"maxPlayers": 16}}))
+    assert updated.match.maxPlayers == 16
+    assert "ai" not in updated.model_dump()
 
 
 def test_c5_rate_limiter_evicts_lru_instead_of_locking_out_new_keys():
@@ -261,11 +270,18 @@ def test_merge_patch_null_deletes_recursively():
 
 def test_merge_delete_validates_like_any_change():
     full = Gameplay().model_dump(mode="json")
-    full["ai"] = {"budget": 200, "hardLimit": 300}
-    Gameplay.model_validate(full)
-    # Deleting hardLimit revives the default 100 under budget 200: 422.
+    # Deleting match.maxPlayers resets to the 32 default.
+    assert (
+        Gameplay.model_validate(
+            merge(full, {"match": {"maxPlayers": None}})
+        ).match.maxPlayers
+        == 32
+    )
+    # Merged output validates like any change: unknown AI accounts rejected.
     with pytest.raises(ValidationError):
-        Gameplay.model_validate(merge(full, {"ai": {"hardLimit": None}}))
+        AiLimits.model_validate(
+            merge(AiLimits().model_dump(mode="json"), {"sessions": {"nope": 5}})
+        )
     # Nullable scalars reset to their None default when deleted.
     rooms = merge(Rooms().model_dump(mode="json"), {"maxRooms": 4})
     assert Rooms.model_validate(merge(rooms, {"maxRooms": None})).maxRooms is None

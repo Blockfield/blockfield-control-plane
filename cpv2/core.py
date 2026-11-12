@@ -335,6 +335,10 @@ async def settings_change(
             raise Problem("revision_not_found", 404)
         candidate = old["value"]
     else:
+        # gameplay.ai was removed (coordination#56): the model silently drops it
+        # from legacy rows, so an explicit write must be refused, not ignored.
+        if namespace == "gameplay" and (data["patch"] or {}).get("ai") is not None:
+            raise Problem("invalid_settings", 422)
         candidate = merge(before["value"], data["patch"])
     try:
         after = (
@@ -346,8 +350,7 @@ async def settings_change(
         raise Problem("invalid_settings", 422) from None
     diff = changed(before["value"], after)
     # Paths nest under dict fields (sessions.<uuid>), so a protected subtree
-    # matches by prefix; exact gameplay behavior is unchanged (ai.hardLimit is
-    # a leaf, ai.budget still matches nothing).
+    # matches by prefix.
     protected = any(
         field == path or field.startswith(path + ".")
         for field in diff
