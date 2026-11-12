@@ -2344,6 +2344,40 @@ async def test_gate_toggle_is_a_single_server_side_read_modify_write(store):
     ).status_code == 422
 
 
+async def test_gate_toggle_and_patch_with_one_key_never_deadlock(store):
+    # Toggle and PATCH must take the idempotency lock and the head row in the
+    # same order; the reverse order deadlocked when both raced on one key.
+    for round_ in range(10):
+        key = f"race-{round_}"
+        toggle = request(
+            store,
+            "POST",
+            "/v2/gate/toggle",
+            {
+                "idempotencyKey": key,
+                "environment": "prod",
+                "backend": "game",
+                "mode": "open",
+                "message": "",
+            },
+        )
+        head = (await request(store, "GET", "/v2/settings/gate/*")).json()
+        patch_ = request(
+            store,
+            "PATCH",
+            "/v2/settings/gate/*",
+            {
+                "idempotencyKey": key,
+                "environment": "prod",
+                "backend": "game",
+                "expectedRevision": head["revision"],
+                "patch": {"mode": "open", "message": ""},
+            },
+        )
+        results = await asyncio.gather(toggle, patch_)
+        assert all(r.status_code < 500 for r in results), [r.text for r in results]
+
+
 @pytest.mark.parametrize("credential_scope", ["*", "arena"])
 async def test_c3_owner_audit_respects_requested_and_credential_scope(
     store, credential_scope

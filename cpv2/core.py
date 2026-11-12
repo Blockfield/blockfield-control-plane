@@ -445,6 +445,13 @@ async def gate_toggle(conn, identity, attempt, model):
     # expectedRevision, so its idempotency fingerprint matches the original.
     data = models.request_body(model)
     env, backend = data["environment"], data["backend"]
+    # Same lock order as operation()/settings_change (idempotency advisory lock,
+    # then the head row); the reverse order deadlocks against a concurrent
+    # PATCH that reuses this key. Advisory xact locks are re-entrant.
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+        (str(identity.credential["id"]) + data["idempotencyKey"],),
+    )
     await conn.execute(
         "INSERT INTO settings_heads VALUES(%s,%s,%s,%s,0) ON CONFLICT DO NOTHING",
         ("gate", env, backend, "*"),
