@@ -2378,6 +2378,160 @@ async def test_gate_toggle_and_patch_with_one_key_never_deadlock(store):
         assert all(r.status_code < 500 for r in results), [r.text for r in results]
 
 
+async def test_site_gate_toggle_asserts_actor_and_delivers_to_game_leg(store):
+    # control-plane#52: the site principal asserts the logged-in admin on the
+    # gate toggle and the game-leg gate PATCH; the operation stores
+    # account_id=actor + authorization_epoch, so the proxy frame executes
+    # instead of fencing as account-less.
+    store["tokens"]["sitegate"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "sitegate",
+                "via": "game",
+                "ceiling": ["settings.read", "moderation.ban"],
+            },
+            "ceiling": ["settings.read", "moderation.ban"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    admin = store["accounts"]["admin"]
+
+    def toggle(key, actor=None):
+        body = {
+            "idempotencyKey": key,
+            "environment": "prod",
+            "backend": "game",
+            "mode": "maintenance",
+            "message": "db",
+        }
+        if actor is not None:
+            body["actorAccountId"] = str(actor)
+        return body
+
+    denied = await request(
+        store, "POST", "/v2/gate/toggle", toggle("gate-no-actor"), "sitegate"
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "service_actor_required", denied.text
+    # The asserted actor must hold the scope: moderators cannot toggle.
+    peer = await request(
+        store,
+        "POST",
+        "/v2/gate/toggle",
+        toggle("gate-peer", store["accounts"]["moderator"]),
+        "sitegate",
+    )
+    assert peer.status_code == 403, peer.text
+    accepted = await request(
+        store, "POST", "/v2/gate/toggle", toggle("gate-admin", admin), "sitegate"
+    )
+    assert accepted.status_code == 202, accepted.text
+    assert accepted.json()["revision"] == 1
+    operation = accepted.json()["operationId"]
+    stored = await sql(
+        store,
+        "SELECT o.account_id, o.authorization_epoch, a.authorization_epoch AS epoch FROM operations o JOIN accounts a ON a.id=o.account_id WHERE o.id=%s",
+        (operation,),
+    )
+    assert [r["account_id"] for r in stored] == [admin]
+    assert stored[0]["authorization_epoch"] == stored[0]["epoch"]
+    frames = await envelopes(store)
+    frame = next(item for item in frames if item["operationId"] == operation)
+    assert frame["executable"] and frame["reason"] is None
+    assert frame["payload"]["namespace"] == "gate" and frame["payload"]["target"] == "*"
+    # Direct callers are authenticated and must never send an actor.
+    forged = await request(
+        store, "POST", "/v2/gate/toggle", toggle("gate-direct", admin)
+    )
+    assert forged.status_code == 403
+    assert forged.json()["error"] == "actor_forbidden", forged.text
+    # Only the unbound site principal may assert an actor.
+    store["tokens"]["sitegate-scoped"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "sitegate-scoped",
+                "via": "game",
+                "ceiling": ["moderation.ban"],
+            },
+            "ceiling": ["moderation.ban"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "arena",
+        },
+    )
+    bound = await request(
+        store,
+        "POST",
+        "/v2/gate/toggle",
+        toggle("gate-scoped", admin),
+        "sitegate-scoped",
+    )
+    assert bound.status_code == 403
+    # The toggle target is always "*": a scoped credential cannot cover it,
+    # so the scope require fences before the actor branch. The scoped-actor
+    # rule itself fires on a covered target (mirrors grant_change).
+    assert bound.json()["error"] == "forbidden", bound.text
+    scoped_patch = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gate/arena",
+        {
+            "idempotencyKey": "gate-scoped-patch",
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": 0,
+            "patch": {"mode": "open", "message": ""},
+            "actorAccountId": str(admin),
+        },
+        "sitegate-scoped",
+    )
+    assert scoped_patch.status_code == 403
+    assert scoped_patch.json()["error"] == "actor_forbidden", scoped_patch.text
+    # The game-leg gate PATCH asserts the same way through settings_change.
+    view = (await request(store, "GET", "/v2/settings/gate/*")).json()
+    refused = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gate/*",
+        {
+            "idempotencyKey": "gate-patch-no-actor",
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": view["revision"],
+            "patch": {"mode": "open", "message": ""},
+        },
+        "sitegate",
+    )
+    assert refused.status_code == 403
+    assert refused.json()["error"] == "service_actor_required", refused.text
+    patched = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gate/*",
+        {
+            "idempotencyKey": "gate-patch-admin",
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": view["revision"],
+            "patch": {"mode": "open", "message": ""},
+            "actorAccountId": str(admin),
+        },
+        "sitegate",
+    )
+    assert patched.status_code == 202, patched.text
+    patched_frames = await envelopes(store)
+    patched_frame = next(
+        item
+        for item in patched_frames
+        if item["operationId"] == patched.json()["operationId"]
+    )
+    assert patched_frame["executable"] and patched_frame["reason"] is None
+
+
 @pytest.mark.parametrize("credential_scope", ["*", "arena"])
 async def test_c3_owner_audit_respects_requested_and_credential_scope(
     store, credential_scope
