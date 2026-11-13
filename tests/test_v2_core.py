@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -492,8 +492,8 @@ async def test_admin_cannot_become_owner_by_any_api_route(store):
         ),
         (
             "PATCH",
-            "/v2/settings/gameplay/arena",
-            patch(value={"ai": {"hardLimit": 200}}),
+            "/v2/settings/ai-limits/global",
+            patch(value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}}),
         ),
         (
             "PATCH",
@@ -566,8 +566,9 @@ async def test_grants_scope_self_peer_higher_and_epoch_revocation(store):
 async def test_owner_stepup_is_action_bound_one_use_user_verified_and_origin_bound(
     store,
 ):
-    path = "/v2/settings/gameplay/arena"
-    body = patch(value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    account = "12345678-1234-1234-1234-1234567890ab"
+    body = patch(value={"sessions": {account: 1000}})
     assert (await request(store, "PATCH", path, body, "owner")).status_code == 403
     for opts in ({"origin": "https://site.example.test"}, {"uv": False}):
         proof = await assertion(store, "PATCH", path, body, **opts)
@@ -575,7 +576,7 @@ async def test_owner_stepup_is_action_bound_one_use_user_verified_and_origin_bou
             await request(store, "PATCH", path, body, "owner", proof)
         ).status_code == 403
     proof = await assertion(store, "PATCH", path, body)
-    changed_body = patch(value={"ai": {"hardLimit": 300}})
+    changed_body = patch(value={"sessions": {account: 2000}})
     assert (
         await request(store, "PATCH", path, changed_body, "owner", proof)
     ).status_code == 403
@@ -585,15 +586,16 @@ async def test_owner_stepup_is_action_bound_one_use_user_verified_and_origin_bou
     assert (
         await request(store, "PATCH", path, body, "owner", proof)
     ).json() == response.json()
-    second = patch(key="replay", revision=1, value={"ai": {"hardLimit": 400}})
+    second = patch(key="replay", revision=1, value={"sessions": {account: 3000}})
     assert (
         await request(store, "PATCH", path, second, "owner", proof)
     ).status_code == 403
 
 
 async def test_protected_rollback_and_normalized_parent_patch(store):
-    path = "/v2/settings/gameplay/arena"
-    first = patch(value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    account = "12345678-1234-1234-1234-1234567890ab"
+    first = patch(value={"sessions": {account: 1000}})
     assert (
         await request(
             store,
@@ -604,7 +606,7 @@ async def test_protected_rollback_and_normalized_parent_patch(store):
             await assertion(store, "PATCH", path, first),
         )
     ).status_code == 202
-    second = patch("owner-second", 1, {"ai": {"hardLimit": 300}})
+    second = patch("owner-second", 1, {"sessions": {account: 2000}})
     assert (
         await request(
             store,
@@ -619,9 +621,9 @@ async def test_protected_rollback_and_normalized_parent_patch(store):
     response = await request(store, "POST", path + "/rollback", body)
     assert response.status_code == 403
     for value in (
-        {"ai": {"hardLimit": 400, "budget": 100}},
-        {"ai": None},
-        {"lobby": {"owner": True}},
+        {"sessions": {"not-a-uuid": 100}},
+        {"sessions": None},
+        {"mode": "bogus"},
     ):
         assert (
             await request(store, "PATCH", path, patch("parent", 2, value))
@@ -653,7 +655,7 @@ async def test_settings_validate_no_effect_cas_concurrency_and_idempotency(store
     assert len(await sql(store, "SELECT * FROM outbox")) == 2
     assert (
         await request(
-            store, "PATCH", path, patch("invalid", 1, {"ai": {"budget": 101}})
+            store, "PATCH", path, patch("invalid", 1, {"match": {"maxPlayers": 999}})
         )
     ).status_code == 422
 
@@ -1478,6 +1480,304 @@ async def test_admin_cli_provision_receipt_and_revoke(
     ).status_code == 401
 
 
+async def test_c7_consumer_credential_rotates_without_gap(store):
+    generation = str(uuid4())
+
+    def rot_spec():
+        return {
+            "client": {
+                "id": "rot",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+
+    old_token = await provision(store["admin"], rot_spec())
+    store["tokens"]["rot-agent"] = old_token
+    old_id = (await sql(store, "SELECT id FROM credentials WHERE client_id='rot'"))[0][
+        "id"
+    ]
+    before = (
+        await sql(
+            store,
+            "SELECT epoch, generation, credential_id FROM consumers WHERE id='rot'",
+        )
+    )[0]
+    # A frame queued before the rotation must survive the rebind.
+    accepted = await request(
+        store, "PATCH", "/v2/settings/gameplay/*", patch("global", 0)
+    )
+    assert accepted.status_code == 202, accepted.text
+
+    new_token = await provision(store["admin"], rot_spec())
+    row = (
+        await sql(
+            store,
+            "SELECT epoch, generation, credential_id, previous_credential_id"
+            " FROM consumers WHERE id='rot'",
+        )
+    )[0]
+    assert row["epoch"] == before["epoch"]
+    assert row["generation"] == before["generation"]
+    assert row["credential_id"] != before["credential_id"]
+    assert row["previous_credential_id"] == before["credential_id"]
+
+    async def batch_as(token):
+        async with store["app"].state.db.transaction() as conn:
+            return await delivery.batch(
+                conn, await authenticate(conn, token), "rot", row["epoch"], 0
+            )
+
+    # Overlap: both tokens pull delivery until the old one is revoked.
+    assert len(await batch_as(old_token)) == 1
+    assert len(await batch_as(new_token)) == 1
+
+    # A different generation is a different consumer: refused, not rebound.
+    bad = rot_spec()
+    bad["consumer"] = {**bad["consumer"], "generation": str(uuid4())}
+    with pytest.raises(ValueError, match="mismatch"):
+        await provision(store["admin"], bad)
+
+    assert await revoke_credential(store["admin"], old_id) == old_id
+    assert (
+        await request(
+            store,
+            "GET",
+            "/v2/agents/rot/snapshot",
+            None,
+            "admin",
+            {"Authorization": f"Bearer {old_token}"},
+        )
+    ).status_code == 401
+    # The redeployed consumer keeps pulling and ACKing on the new credential.
+    store["tokens"]["rot-agent"] = new_token
+    snapshot = await request(store, "GET", "/v2/agents/rot/snapshot", None, "rot-agent")
+    assert snapshot.status_code == 200, snapshot.text
+    frames = await envelopes(store, cid="rot")
+    assert len(frames) == 1
+    ack = await request(
+        store, "POST", "/v2/agents/rot/acks", ack_body(frames[0]), "rot-agent"
+    )
+    assert ack.status_code == 200, ack.text
+
+
+async def test_c7_rebind_refuses_capability_or_client_change(store):
+    generation = str(uuid4())
+
+    def rot_spec(**over):
+        spec = {
+            "client": {
+                "id": "rot2",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot2",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+        spec.update(over)
+        return spec
+
+    await provision(store["admin"], rot_spec())
+    first = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[
+        0
+    ]["credential_id"]
+    # Narrowed capabilities are a different consumer: refused, not rebound.
+    bad = rot_spec()
+    bad["consumer"] = {**bad["consumer"], "capabilities": ["settings.gameplay"]}
+    with pytest.raises(ValueError, match="mismatch"):
+        await provision(store["admin"], bad)
+    # Another client's credential must not steal the consumer id.
+    stolen = rot_spec()
+    stolen["client"] = {**stolen["client"], "id": "rot2-attacker"}
+    with pytest.raises(ValueError, match="client mismatch"):
+        await provision(store["admin"], stolen)
+    row = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[0]
+    assert row["credential_id"] == first
+
+
+async def test_c7_second_rotation_refused_while_previous_valid(store):
+    generation = str(uuid4())
+
+    def rot_spec():
+        return {
+            "client": {
+                "id": "rot3",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "rot3",
+                "generation": generation,
+                "capabilities": ["settings.gameplay", "settings.gate"],
+            },
+        }
+
+    await provision(store["admin"], rot_spec())
+    c1 = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot3'"))[0][
+        "credential_id"
+    ]
+    await provision(store["admin"], rot_spec())
+    # Rotating again before revoking C1 must not silently drop it.
+    with pytest.raises(ValueError, match="still valid"):
+        await provision(store["admin"], rot_spec())
+    assert await revoke_credential(store["admin"], c1) == c1
+    await provision(store["admin"], rot_spec())
+    row = (
+        await sql(
+            store,
+            "SELECT credential_id, previous_credential_id"
+            " FROM consumers WHERE id='rot3'",
+        )
+    )[0]
+    assert row["previous_credential_id"] != c1
+
+
+async def test_renew_crash_before_confirm_replays_and_confirm_revokes_old(store):
+    generation = str(uuid4())
+    spec = {
+        "client": {
+            "id": "ren",
+            "via": "game",
+            "ceiling": ["agents.acks", "agents.events"],
+        },
+        "ceiling": ["agents.acks", "agents.events"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+        "expiresInSeconds": 600,
+        "consumer": {
+            "id": "ren",
+            "generation": generation,
+            "capabilities": ["settings.gameplay", "settings.gate"],
+        },
+    }
+    old = await provision(store["admin"], spec)
+    auth = lambda t: {"Authorization": f"Bearer {t}"}  # noqa: E731
+    client = store["client"]
+    me = (await client.get("/v2/me", headers=auth(old))).json()
+    lifetime = datetime.fromisoformat(me["expiresAt"]) - datetime.fromisoformat(
+        me["issuedAt"]
+    )
+    assert abs(lifetime - timedelta(seconds=600)) < timedelta(seconds=5)
+
+    first = await client.post("/v2/credentials/renew", headers=auth(old))
+    assert first.status_code == 201, first.text
+    new = first.json()["token"]
+    assert new != old
+    # Crash before confirm: the old token still works and a retry returns the
+    # same pending successor instead of minting a second one.
+    assert (await client.get("/v2/me", headers=auth(old))).status_code == 200
+    again = await client.post("/v2/credentials/renew", headers=auth(old))
+    assert again.status_code == 201, again.text
+    assert again.json() == first.json()
+    assert len(await sql(store, "SELECT 1 FROM credentials WHERE client_id='ren'")) == 2
+    # Same client, scopes, lifetime and consumer binding.
+    me_new = (await client.get("/v2/me", headers=auth(new))).json()
+    assert me_new["client"] == "ren" and me_new["ceiling"] == me["ceiling"]
+    assert (
+        datetime.fromisoformat(me_new["expiresAt"])
+        - datetime.fromisoformat(me_new["issuedAt"])
+        == lifetime
+    )
+    row = (await sql(store, "SELECT * FROM consumers WHERE id='ren'"))[0]
+    assert str(row["credential_id"]) == me_new["credentialId"]
+    assert str(row["previous_credential_id"]) == me["credentialId"]
+    # The successor may not renew while the earlier renewal is unconfirmed.
+    refused = await client.post("/v2/credentials/renew", headers=auth(new))
+    assert (
+        refused.status_code == 409 and refused.json()["error"] == "renewal_unconfirmed"
+    )
+    # Only the successor confirms.
+    assert (
+        await client.post("/v2/credentials/renew/confirm", headers=auth(old))
+    ).status_code == 404
+    done = await client.post("/v2/credentials/renew/confirm", headers=auth(new))
+    assert done.status_code == 200, done.text
+    assert (await client.get("/v2/me", headers=auth(old))).status_code == 401
+    assert (
+        await client.get("/v2/agents/ren/snapshot", headers=auth(new))
+    ).status_code == 200
+    # Confirm is idempotent; the next cycle renews from the successor.
+    assert (
+        await client.post("/v2/credentials/renew/confirm", headers=auth(new))
+    ).status_code == 200
+    nxt = await client.post("/v2/credentials/renew", headers=auth(new))
+    assert nxt.status_code == 201
+    # The intermediate credential no longer confirms its own (already confirmed) row.
+    assert (
+        await client.post("/v2/credentials/renew/confirm", headers=auth(new))
+    ).status_code == 404
+    actions = [
+        r["action"]
+        for r in await sql(
+            store,
+            "SELECT action FROM audit_events WHERE client_id='ren' AND outcome IN ('accepted','replayed') ORDER BY sequence",
+        )
+    ]
+    assert actions == [
+        "credentials.renew",
+        "credentials.renew",
+        "credentials.renew.confirm",
+        "credentials.renew",
+    ]
+
+
+async def test_renew_grace_expires_old_and_refuses_humans_and_floods(store):
+    spec = {
+        "client": {"id": "ren2", "via": "game", "ceiling": ["gate:read"]},
+        "ceiling": ["gate:read"],
+        "environment": "prod",
+        "backend": "game",
+        "resource": "*",
+        "expiresInSeconds": 30 * 86400,
+    }
+    old = await provision(store["admin"], spec)
+    client = store["client"]
+    renewed = await client.post(
+        "/v2/credentials/renew", headers={"Authorization": f"Bearer {old}"}
+    )
+    assert renewed.status_code == 201, renewed.text
+    left = (
+        await sql(
+            store,
+            "SELECT expires_at - now() AS left FROM credentials WHERE client_id='ren2' ORDER BY created_at LIMIT 1",
+        )
+    )[0]["left"]
+    # Unconfirmed, the old credential lives at most the grace hour.
+    assert left <= timedelta(hours=1)
+    human = await request(store, "POST", "/v2/credentials/renew", None, "admin")
+    assert human.status_code == 403 and human.json()["error"] == "renew_service_only"
+    codes = [
+        (
+            await client.post(
+                "/v2/credentials/renew", headers={"Authorization": f"Bearer {old}"}
+            )
+        ).status_code
+        for _ in range(8)
+    ]
+    assert 429 in codes
+
+
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
     wakeups = store["app"].state.wakeups
     waiter = wakeups.subscribe("game")
@@ -1968,7 +2268,7 @@ async def test_nonhuman_owner_session_never_acquires_owner_authority(store):
         json={
             "method": "PATCH",
             "path": "/v2/settings/gameplay/arena",
-            "body": patch(value={"ai": {"hardLimit": 200}}),
+            "body": patch(value={"match": {"maxPlayers": 64}}),
         },
     )
     assert response.status_code == 403
@@ -4231,8 +4531,11 @@ async def test_c13_surrogate_dict_key_is_invalid_without_side_effects(store):
 
 
 async def test_c14_malformed_owner_assertion_is_4xx(store):
-    path = "/v2/settings/gameplay/arena"
-    body = patch("c14-malformed", value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    body = patch(
+        "c14-malformed",
+        value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}},
+    )
     proof = json.loads(
         (await assertion(store, "PATCH", path, body))["X-CP-Owner-Assertion"]
     )
@@ -4540,8 +4843,11 @@ async def test_c18_provision_bearer_write_failure_rolls_back(
 
 
 async def test_c18_protected_scope_rechecked_at_delivery(store):
-    path = "/v2/settings/gameplay/arena"
-    body = patch("c18-protected", value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    body = patch(
+        "c18-protected",
+        value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}},
+    )
     proof = await assertion(store, "PATCH", path, body)
     response = await request(store, "PATCH", path, body, "owner", proof)
     assert response.status_code == 202, response.text
@@ -4573,8 +4879,11 @@ async def test_c18_protected_scope_rechecked_at_delivery(store):
 
 
 async def test_c19_both_scopes_rechecked_at_delivery(store):
-    path = "/v2/settings/gameplay/arena"
-    body = patch("c19-both", value={"ai": {"hardLimit": 200}})
+    path = "/v2/settings/ai-limits/global"
+    body = patch(
+        "c19-both",
+        value={"sessions": {"12345678-1234-1234-1234-1234567890ab": 1000}},
+    )
     proof = await assertion(store, "PATCH", path, body)
     response = await request(store, "PATCH", path, body, "owner", proof)
     assert response.status_code == 202, response.text
@@ -5389,7 +5698,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 6}
+    assert response.json() == {"status": "ok", "schema": 9}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -5397,7 +5706,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 6}
+    assert broken.json() == {"status": "unavailable", "schema": 9}
 
 
 async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
@@ -5857,7 +6166,14 @@ async def test_settings_patch_null_deletes_rollback_restores_and_replays(store):
     assert set(value["value"]["kits"]) == {"alpha", "beta"}
 
 
-async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
+async def test_gameplay_explicit_ai_write_is_rejected(store):
+    path = "/v2/settings/gameplay/arena"
+    body = patch("ai-write", 0, {"ai": {"hardLimit": 200}})
+    assert (await request(store, "PATCH", path, body)).status_code == 422
+    assert (await request(store, "GET", path)).json()["revision"] == 0
+
+
+async def test_settings_patch_nested_delete_reset_and_invalid_change(store):
     path = "/v2/settings/campaign/arena"
     seed = patch(
         "camp-seed",
@@ -5886,15 +6202,12 @@ async def test_settings_patch_nested_delete_reset_and_invalid_delete(store):
     assert (await request(store, "GET", path)).json()["value"] == {
         "campaignBalance": {}
     }
-    # Delete that breaks an invariant is rejected: budget above a deleted hardLimit.
+    # The removed ai section is rejected like any unknown field.
     gpath = "/v2/settings/gameplay/arena"
-    first = patch("g-seed", 0, {"ai": {"budget": 200, "hardLimit": 300}})
-    proof = await assertion(store, "PATCH", gpath, first)
-    assert (
-        await request(store, "PATCH", gpath, first, "owner", proof)
-    ).status_code == 202
-    bad = patch("g-bad", 1, {"ai": {"hardLimit": None}})
-    assert (await request(store, "PATCH", gpath, bad, "owner")).status_code == 422
+    seed = patch("g-seed", 0, {"match": {"maxPlayers": 24}})
+    assert (await request(store, "PATCH", gpath, seed)).status_code == 202
+    gone = patch("g-gone", 1, {"ai": {"hardLimit": 200}})
+    assert (await request(store, "PATCH", gpath, gone)).status_code == 422
 
 
 async def test_cpp1_workshop_leg_reaches_proxy_snapshot_and_frames(store):
@@ -7834,6 +8147,8 @@ async def test_stats_migration_005_backfills_pre_005_results(store):
         await conn.execute("DROP TABLE control.stat_result_voids")
         await conn.execute("DROP TABLE control.stat_rating_changes")
         await conn.execute("DROP TABLE control.stat_ratings")
+        await conn.execute("DROP TABLE control.stat_events")
+        await conn.execute("DROP TABLE control.stat_samples")
         await conn.execute("DELETE FROM control.schema_migrations WHERE version>=5")
     await migrate(store["admin"], dbname)
     assert await sql(store, ratings_query) == before
@@ -8954,3 +9269,315 @@ async def test_stats_read_provision_scopes(store):
                 "resource": "*",
             },
         )
+
+
+_DIAG_SERVER = "22222222-2222-2222-2222-222222222222"
+_DIAG_EVENT = "11111111-1111-1111-1111-111111111111"
+
+
+def _diag_body(now_ms=None, **over):
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    body = {
+        "schemaVersion": 1,
+        "serverId": _DIAG_SERVER,
+        "startedAt": now_ms - 3600000,
+        "samples": [
+            {
+                "at": now_ms - 60000,
+                "tps": 19.5,
+                "msptAvg": 21.0,
+                "msptP95": 30.0,
+                "msptMax": 340.0,
+                "players": 12,
+                "heapUsedMb": 1800,
+                "heapMaxMb": 3072,
+                "gcPauseMs": 5,
+            }
+        ],
+        "events": [
+            {
+                "id": _DIAG_EVENT,
+                "at": now_ms - 30000,
+                "kind": "freeze",
+                "durationMs": 3400,
+                "source": "Server thread",
+                "message": "tick stuck, see http://10.0.0.5:8080/logs",
+                "repeats": 2,
+            }
+        ],
+    }
+    body.update(over)
+    return body
+
+
+async def test_stats_diag_ingest_roundtrip_idempotent_and_redacted(store):
+    # Producer diagnostics (coordination#29 U4): same bytes as the site
+    # POST /api/stats/diagnostics, same idempotency, secrets redacted.
+    await _stats_token(store, _DIAG_SERVER, "stats-diag")
+    body = _diag_body()
+    created = await request(store, "POST", "/v2/stats/diagnostics", body, "stats-diag")
+    assert created.status_code == 200, created.text
+    assert created.json() == {"samples": 1, "events": 1}
+    samples = await sql(
+        store, "SELECT tps,mspt_p95,players,started_at FROM stat_samples"
+    )
+    assert len(samples) == 1
+    assert samples[0]["tps"] == 19.5
+    stored = await sql(
+        store, "SELECT kind,duration_ms,source,message,repeats FROM stat_events"
+    )
+    assert len(stored) == 1
+    assert stored[0]["message"] == "tick stuck, see [url]", stored
+    assert (stored[0]["kind"], stored[0]["duration_ms"], stored[0]["repeats"]) == (
+        "freeze",
+        3400,
+        2,
+    )
+    replayed = await request(store, "POST", "/v2/stats/diagnostics", body, "stats-diag")
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json() == {"samples": 1, "events": 1}
+    assert await sql(store, "SELECT count(*) AS n FROM stat_samples") == [{"n": 1}]
+    assert await sql(store, "SELECT count(*) AS n FROM stat_events") == [{"n": 1}]
+
+
+async def test_stats_diag_ingest_validation(store):
+    await _stats_token(store, _DIAG_SERVER, "stats-diag-valid")
+    now_ms = int(time.time() * 1000)
+    old = now_ms - 8 * 86400000
+    cases = [
+        {"schemaVersion": 2},
+        {"serverId": "not-a-uuid"},
+        {"samples": "nope"},
+        {"samples": [{"at": now_ms}] * 121},
+        {"samples": [{"at": now_ms, "tps": -1, "msptAvg": 1, "msptMax": 1}]},
+        {
+            "samples": [
+                {"at": now_ms, "tps": 20, "msptAvg": 1, "msptMax": 1, "players": 1.5}
+            ]
+        },
+        {"events": [{"id": _DIAG_EVENT, "at": now_ms, "kind": "oops", "message": "x"}]},
+        {
+            "events": [
+                {"id": _DIAG_EVENT, "at": now_ms, "kind": "error", "message": "   "}
+            ]
+        },
+        {
+            "events": [
+                {"id": _DIAG_EVENT, "at": now_ms, "kind": "freeze", "message": "x"}
+            ]
+        },
+        {"events": [{"id": "nope", "at": now_ms, "kind": "error", "message": "x"}]},
+        {
+            "samples": [
+                {"at": now_ms + 10 * 60000, "tps": 20, "msptAvg": 1, "msptMax": 1}
+            ]
+        },
+    ]
+    for patch in cases:
+        body = _diag_body(now_ms, **patch)
+        response = await request(
+            store, "POST", "/v2/stats/diagnostics", body, "stats-diag-valid"
+        )
+        assert response.status_code == 400, (patch, response.text)
+        assert response.json() == {"error": "invalid_diagnostics"}, response.text
+    # Out-of-retention items are dropped, not refused (like the site).
+    dropped = await request(
+        store,
+        "POST",
+        "/v2/stats/diagnostics",
+        _diag_body(
+            now_ms, samples=[{"at": old, "tps": 20, "msptAvg": 1, "msptMax": 1}]
+        ),
+        "stats-diag-valid",
+    )
+    assert dropped.status_code == 200, dropped.text
+    assert dropped.json() == {"samples": 0, "events": 1}
+    assert await sql(store, "SELECT count(*) AS n FROM stat_samples") == [{"n": 0}]
+
+
+async def test_stats_diag_ingest_rbac(store):
+    await _stats_token(store, _DIAG_SERVER, "stats-diag-rbac")
+    body = _diag_body()
+    for role in ("ordinary", "builder", "moderator", "admin", "game-agent"):
+        response = await request(store, "POST", "/v2/stats/diagnostics", body, role)
+        assert response.status_code == 403, (role, response.text)
+    assert (
+        await request(store, "POST", "/v2/stats/diagnostics", body, "owner")
+    ).status_code == 403
+    assert (
+        await store["client"].post("/v2/stats/diagnostics", json=body)
+    ).status_code == 401
+    other = "33333333-3333-3333-3333-333333333333"
+    await _stats_token(store, other, "stats-diag-other")
+    forged = await request(
+        store, "POST", "/v2/stats/diagnostics", body, "stats-diag-other"
+    )
+    assert forged.status_code == 403, forged.text
+
+
+async def test_stats_diag_retention_prunes_by_age_and_severity(store, monkeypatch):
+    # Age prune mirrors the site saveReport windows (7d samples, 14d events).
+    await _stats_token(store, _DIAG_SERVER, "stats-diag-retain")
+    now_ms = int(time.time() * 1000)
+    old_sample = now_ms - 8 * 86400000
+    old_event = now_ms - 15 * 86400000
+    async with await psycopg.AsyncConnection.connect(store["admin"]) as conn:
+        await conn.execute(
+            "INSERT INTO control.stat_samples(server_id,at,tps,mspt_avg,mspt_max) VALUES(%s,%s,20,1,1)",
+            (_DIAG_SERVER, datetime.fromtimestamp(old_sample / 1000, tz=timezone.utc)),
+        )
+        await conn.execute(
+            "INSERT INTO control.stat_events(server_id,event_id,at,kind,message,repeats) VALUES(%s,%s,%s,'error','old',1)",
+            (
+                _DIAG_SERVER,
+                "00000000-0000-0000-0000-000000000000",
+                datetime.fromtimestamp(old_event / 1000, tz=timezone.utc),
+            ),
+        )
+        await conn.commit()
+    response = await request(
+        store, "POST", "/v2/stats/diagnostics", _diag_body(now_ms), "stats-diag-retain"
+    )
+    assert response.status_code == 200, response.text
+    assert await sql(store, "SELECT count(*) AS n FROM stat_samples") == [{"n": 1}]
+    events = await sql(store, "SELECT message FROM stat_events")
+    assert [row["message"] for row in events] == ["tick stuck, see [url]"]
+    # Row-count prune keeps the severity-ordered newest window, like the site
+    # (crash/error before freeze before warning): with a cap of 2 the freeze
+    # and warning rows go even though they are newer than nothing here.
+    monkeypatch.setattr(core, "DIAG_MAX_EVENTS", 2)
+    kinds = ["warning", "freeze", "error", "crash"]
+    async with await psycopg.AsyncConnection.connect(store["admin"]) as conn:
+        for index, kind in enumerate(kinds):
+            await conn.execute(
+                "INSERT INTO control.stat_events(server_id,event_id,at,kind,message,repeats) VALUES(%s,%s,%s,%s,'k',1)",
+                (
+                    _DIAG_SERVER,
+                    f"22222222-2222-2222-2222-22222222222{index}",
+                    datetime.fromtimestamp(
+                        (now_ms - (index + 1) * 1000) / 1000, tz=timezone.utc
+                    ),
+                    kind,
+                ),
+            )
+        await conn.commit()
+    pruned = await request(
+        store,
+        "POST",
+        "/v2/stats/diagnostics",
+        _diag_body(now_ms, events=[]),
+        "stats-diag-retain",
+    )
+    assert pruned.status_code == 200, pruned.text
+    kept = await sql(store, "SELECT kind FROM control.stat_events ORDER BY kind")
+    assert sorted(row["kind"] for row in kept) == ["crash", "error"]
+
+
+async def test_stats_diag_read_matches_site_contract(store):
+    await _stats_token(store, _DIAG_SERVER, "stats-diag-read")
+    await _stats_reader_token(store)
+    now_ms = int(time.time() * 1000)
+    posted = await request(
+        store,
+        "POST",
+        "/v2/stats/diagnostics",
+        _diag_body(
+            now_ms,
+            samples=[
+                {"at": now_ms - 2 * 3600000, "tps": 20, "msptAvg": 10, "msptMax": 100}
+            ],
+            events=[],
+        ),
+        "stats-diag-read",
+    )
+    assert posted.status_code == 200, posted.text
+    posted = await request(
+        store, "POST", "/v2/stats/diagnostics", _diag_body(now_ms), "stats-diag-read"
+    )
+    assert posted.status_code == 200, posted.text
+    view = await request(store, "GET", "/v2/stats/diagnostics", None, "stats-reader")
+    assert view.status_code == 200, view.text
+    data = view.json()
+    assert data["schemaVersion"] == 1 and data["hours"] == 24
+    assert data["lastSampleAt"] == now_ms - 60000
+    assert len(data["samples"]) == 2 and len(data["events"]) == 1
+    sample = data["samples"][1]
+    assert sample["serverId"] == _DIAG_SERVER
+    assert (sample["at"], sample["tps"], sample["msptAvg"], sample["msptP95"]) == (
+        now_ms - 60000,
+        19.5,
+        21.0,
+        30.0,
+    )
+    assert (
+        sample["players"],
+        sample["heapUsedMb"],
+        sample["heapMaxMb"],
+        sample["gcPauseMs"],
+    ) == (12, 1800, 3072, 5)
+    assert sample["startedAt"] == now_ms - 3600000
+    event = data["events"][0]
+    assert (event["id"], event["kind"], event["durationMs"]) == (
+        _DIAG_EVENT,
+        "freeze",
+        3400,
+    )
+    assert event["message"] == "tick stuck, see [url]"
+    assert (event["source"], event["repeats"]) == ("Server thread", 2)
+    # The hours window filters samples only; the journal and the last-sample
+    # marker still cover everything, like the site view.
+    narrow = await request(
+        store, "GET", "/v2/stats/diagnostics?hours=1", None, "stats-reader"
+    )
+    assert narrow.status_code == 200, narrow.text
+    assert [row["at"] for row in narrow.json()["samples"]] == [now_ms - 60000]
+    assert len(narrow.json()["events"]) == 1
+    assert narrow.json()["lastSampleAt"] == now_ms - 60000
+    wide = await request(
+        store, "GET", "/v2/stats/diagnostics?hours=168", None, "stats-reader"
+    )
+    assert wide.status_code == 200, wide.text
+    for bad in ("abc", "0", "169"):
+        rejected = await request(
+            store, "GET", f"/v2/stats/diagnostics?hours={bad}", None, "stats-reader"
+        )
+        assert rejected.status_code == 400, (bad, rejected.text)
+    # Reads ride the unbound stats.read credential or a staff role; the
+    # per-server producer credential and unrelated roles stay rejected.
+    assert (
+        await request(store, "GET", "/v2/stats/diagnostics", None, "stats-diag-read")
+    ).status_code == 403
+    assert (
+        await request(store, "GET", "/v2/stats/diagnostics", None, "admin")
+    ).status_code == 200
+    assert (
+        await request(store, "GET", "/v2/stats/diagnostics", None, "ordinary")
+    ).status_code == 403
+
+
+async def test_stats_diag_ingest_accepts_full_size_report(store):
+    # A max-size producer report (120 samples + 200 full events) fits the
+    # 1 MiB route allowance, like the site 1 MiB ingest limit.
+    await _stats_token(store, _DIAG_SERVER, "stats-diag-full")
+    now_ms = int(time.time() * 1000)
+    body = _diag_body(
+        now_ms,
+        samples=[
+            {"at": now_ms - (i + 1) * 1000, "tps": 20, "msptAvg": 10, "msptMax": 100}
+            for i in range(120)
+        ],
+        events=[
+            {
+                "id": f"33333333-3333-3333-3333-{i:012d}",
+                "at": now_ms - (i + 1) * 1000,
+                "kind": "error",
+                "message": "x" * 4000,
+            }
+            for i in range(200)
+        ],
+    )
+    response = await request(
+        store, "POST", "/v2/stats/diagnostics", body, "stats-diag-full"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"samples": 120, "events": 200}

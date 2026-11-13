@@ -21,6 +21,7 @@ from cpv2.auth import (
     OWNER_SCOPES,
     ROLE_SCOPES,
     SERVICE_SCOPES,
+    SERVICE_TTL_CAP,
     SITE_SESSIONS_SCOPES,
     SITE_SETTINGS_SCOPES,
     STAFF_SCOPES,
@@ -174,7 +175,6 @@ async def provision(dsn, spec, bearer_sink=None):
 
 # Service credentials (account-less) live at most 30 days and are re-issued
 # monthly; human session credentials stay at 24h, like staff rotation.
-SERVICE_TTL_CAP = 30 * 86400
 HUMAN_TTL_CAP = 86400
 
 
@@ -338,23 +338,74 @@ async def _provision(dsn, spec, bearer_sink=None):
                 now() + timedelta(seconds=ttl),
             ),
         )
+        rebound, rebound_id = None, None
         if spec.get("consumer"):
             if account_id:
                 raise ValueError("consumer requires its own service credential")
             c = spec["consumer"]
-            await conn.execute(
-                "INSERT INTO consumers(id,credential_id,environment,backend,resource,generation,epoch,capabilities) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    c["id"],
-                    cid,
-                    spec["environment"],
-                    spec["backend"],
-                    spec["resource"],
-                    UUID(c["generation"]),
-                    uuid4(),
-                    c["capabilities"],
-                ),
+            # Rotation rebinds the existing consumer id to the new credential
+            # instead of failing on the primary key: the row (generation,
+            # epoch, cursors, outbox) survives, and the outgoing credential
+            # stays valid until revoked, so delivery has no gap. A different
+            # environment/backend/resource/generation/capabilities/client is a
+            # different consumer and is refused rather than silently rebound;
+            # a second rotation while the previous credential is still valid
+            # is refused too, so the single overlap slot never drops a live
+            # credential (the unattended renewer revokes after switching).
+            existing = await one(
+                conn,
+                "SELECT * FROM consumers WHERE id=%s FOR UPDATE",
+                (c["id"],),
             )
+            if existing is None:
+                await conn.execute(
+                    "INSERT INTO consumers(id,credential_id,environment,backend,resource,generation,epoch,capabilities) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        c["id"],
+                        cid,
+                        spec["environment"],
+                        spec["backend"],
+                        spec["resource"],
+                        UUID(c["generation"]),
+                        uuid4(),
+                        c["capabilities"],
+                    ),
+                )
+            else:
+                if (
+                    existing["environment"] != spec["environment"]
+                    or existing["backend"] != spec["backend"]
+                    or existing["resource"] != spec["resource"]
+                    or existing["generation"] != UUID(c["generation"])
+                    or set(existing["capabilities"]) != set(c["capabilities"])
+                ):
+                    raise ValueError("consumer scope or generation mismatch")
+                old_cred = await one(
+                    conn,
+                    "SELECT client_id FROM credentials WHERE id=%s",
+                    (existing["credential_id"],),
+                )
+                if old_cred is None or old_cred["client_id"] != client["id"]:
+                    raise ValueError("consumer client mismatch")
+                if existing["previous_credential_id"] is not None:
+                    prev = await one(
+                        conn,
+                        "SELECT revoked_at, expires_at FROM credentials WHERE id=%s",
+                        (existing["previous_credential_id"],),
+                    )
+                    if (
+                        prev is not None
+                        and prev["revoked_at"] is None
+                        and prev["expires_at"] > now()
+                    ):
+                        raise ValueError(
+                            "previous consumer credential still valid; revoke it before rotating again"
+                        )
+                await conn.execute(
+                    "UPDATE consumers SET previous_credential_id=credential_id,credential_id=%s WHERE id=%s",
+                    (cid, c["id"]),
+                )
+                rebound, rebound_id = existing["credential_id"], c["id"]
         attempt = uuid4()
         await record(
             conn,
@@ -368,6 +419,11 @@ async def _provision(dsn, spec, bearer_sink=None):
                         "subjectAccount": str(account_id) if account_id else None,
                         "source": "offline_operator",
                     }
+                    | (
+                        {"consumerRebind": {"id": rebound_id, "from": str(rebound)}}
+                        if rebound is not None
+                        else {}
+                    )
                 ),
             ),
         )

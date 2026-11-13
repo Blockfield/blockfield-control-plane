@@ -12,7 +12,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from cpv2 import core, delivery, models
-from cpv2.auth import Identity, Problem, audit, authenticate, challenge, verifier
+from cpv2.auth import (
+    Identity,
+    Problem,
+    audit,
+    authenticate,
+    challenge,
+    confirm_renewal,
+    renew_credential,
+    verifier,
+)
 from cpv2.db import MIGRATIONS, Database, one, rows
 from cpv2.settings import DEFINITIONS, digest
 
@@ -22,7 +31,10 @@ _health_clock = time.monotonic
 # Mutation body caps by path. Everything else stays at 32 KiB; the stats
 # ingest route honors the producer outbox contract (1 MiB/event, same as the
 # site MAX_BODY) so a full 512-player result is never a 413.
-BODY_LIMITS = {"/v2/stats/results": core.STAT_MAX_BODY}
+BODY_LIMITS = {
+    "/v2/stats/results": core.STAT_MAX_BODY,
+    "/v2/stats/diagnostics": core.DIAG_MAX_BODY,
+}
 
 
 class Limits:
@@ -406,7 +418,25 @@ def create_app(dsn=None):
                 for g in i.grants
             ],
             "ceiling": sorted(set(i.credential["ceiling"]) & set(i.client["ceiling"])),
+            # Self-renewing services schedule renew from these (coordination#33).
+            "credentialId": str(i.credential["id"]),
+            "issuedAt": i.credential["created_at"].isoformat(),
+            "expiresAt": i.credential["expires_at"].isoformat(),
         }
+
+    @app.post("/v2/credentials/renew", status_code=201)
+    async def credentials_renew(request: Request):
+        # A renewing service needs a handful of calls a day; a loop is a bug.
+        limiter.check(
+            ("renew", request.state.identity.credential["id"]),
+            global_count=False,
+            limit=6,
+        )
+        return await write(request, renew_credential, request.state.token)
+
+    @app.post("/v2/credentials/renew/confirm")
+    async def credentials_renew_confirm(request: Request):
+        return await write(request, confirm_renewal)
 
     @app.post("/v2/owner/challenges", status_code=201)
     async def owner_challenge(body: models.Challenge, request: Request):
@@ -712,6 +742,24 @@ def create_app(dsn=None):
     @app.post("/v2/stats/results/void")
     async def stats_void(body: models.StatVoid, request: Request):
         return await write(request, core.stat_void, body)
+
+    @app.post("/v2/stats/diagnostics")
+    async def stats_diag_ingest(body: dict, request: Request):
+        # Producer diagnostics (coordination#29 U4): same bytes as the site
+        # POST /api/stats/diagnostics; the site admin health view reads them
+        # back below. Always 200: resends are idempotent, like the site.
+        return await write(request, core.stat_diag_ingest, body)
+
+    @app.get("/v2/stats/diagnostics")
+    async def stats_diag_read(request: Request):
+        request.state.identity.require("stats.read", "prod", "game", "*")
+        raw = request.query_params.get("hours")
+        try:
+            hours = 24 if raw is None else int(raw, 10)
+        except ValueError:
+            raise Problem("invalid_diagnostics", 400)
+        async with database.transaction() as conn:
+            return await core.stat_diag_read(conn, hours)
 
     @app.post("/v2/site/sessions", status_code=201)
     async def site_session_create(body: models.SiteSessionCreate, request: Request):
