@@ -19,6 +19,7 @@ SERVICE_ISSUED = {
     ("moderation.announce", "moderation.announce"),
     ("console.run", "console.read"),
     ("console.run", "console.run"),
+    ("console.suggest", "console.read"),
 }
 TERMINAL = {"rejected", "unknown", "effective", "expired"}
 

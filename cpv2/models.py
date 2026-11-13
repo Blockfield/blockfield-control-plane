@@ -101,6 +101,18 @@ class ModerationAction(Mutation):
     actorAccountId: ID | None = None
 
 
+class ConsoleSuggest(Mutation):
+    # Brigadier completion for the site console (site#135). core validates
+    # the partial line, enqueues a console.suggest op for the game consumer
+    # and waits for its ack: the game answers over the agent channel like any
+    # other op, so completion never touches the game directly. Read-only
+    # (scope console.read): completing a line is not running it.
+    consumerId: str = Field(min_length=1, max_length=128)
+    generation: ID
+    input: str = Field(min_length=0, max_length=1000)
+    expiresInSeconds: int = Field(default=30, ge=1, le=60)
+
+
 class ConsoleRun(Mutation):
     # Owner console line for one game consumer (coordination#35). core.action
     # classifies it against the read-only allowlist: console.read covers the

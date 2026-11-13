@@ -290,6 +290,7 @@ async def store(postgres):
                         "moderation.maintenance",
                         "moderation.announce",
                         "console.run",
+                        "console.suggest",
                     ]
                     + (
                         [
@@ -9982,3 +9983,257 @@ async def test_stats_diag_ingest_accepts_full_size_report(store):
     )
     assert response.status_code == 200, response.text
     assert response.json() == {"samples": 120, "events": 200}
+
+
+def suggest_body(store, key, text, **extra):
+    return {
+        "idempotencyKey": key,
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "input": text,
+        **extra,
+    }
+
+
+def log_batch(store, key, entries, **extra):
+    return {
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "entries": entries,
+        **extra,
+    }
+
+
+def log_entry(now_ms, message, level="INFO", logger="Minecraft"):
+    return {"at": now_ms, "level": level, "logger": logger, "message": message}
+
+
+async def test_console_suggest_round_trip_and_validation(store):
+    # Moderators hold no console scope; unknown consumers and control
+    # characters are refused before any operation exists.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/console/suggest",
+            suggest_body(store, "s0", "ti"),
+            "moderator",
+        )
+    ).status_code == 403
+    bad_consumer = await request(
+        store,
+        "POST",
+        "/v2/console/suggest",
+        suggest_body(store, "s1", "time set", consumerId="nope"),
+    )
+    assert bad_consumer.status_code == 409, bad_consumer.text
+    bad_input = await request(
+        store, "POST", "/v2/console/suggest", suggest_body(store, "s2", "time\nstop")
+    )
+    assert bad_input.status_code == 422, bad_input.text
+    assert not await sql(store, "SELECT * FROM operations WHERE kind='console.suggest'")
+    # Slow game: the POST waits for the ack instead of returning a receipt.
+    pending = asyncio.create_task(
+        store["client"].post(
+            "/v2/console/suggest",
+            json=suggest_body(store, "s3", "time s"),
+            headers=headers(store),
+        )
+    )
+    await asyncio.sleep(0.2)
+    frames = await envelopes(store)
+    suggest = [f for f in frames if f["payload"].get("kind") == "console.suggest"]
+    assert len(suggest) == 1, [f["payload"].get("kind") for f in frames]
+    assert suggest[0]["payload"] == {
+        "kind": "console.suggest",
+        "target": "*",
+        "input": "time s",
+    }
+    assert suggest[0]["executable"]
+    answer = {"from": 5, "suggestions": [{"text": "set", "hint": "time set"}]}
+    await ack_chain(store, suggest[0], output=json.dumps(answer))
+    response = await asyncio.wait_for(pending, 10)
+    assert response.status_code == 200, response.text
+    assert response.json() == answer
+    # A malformed game answer is a 502, never rendered raw.
+    pending = asyncio.create_task(
+        store["client"].post(
+            "/v2/console/suggest",
+            json=suggest_body(store, "s4", "wea"),
+            headers=headers(store),
+        )
+    )
+    await asyncio.sleep(0.2)
+    frames = await envelopes(store)
+    broken = next(f for f in frames if f["payload"].get("input") == "wea")
+    await ack_chain(store, broken, output="not-json{{")
+    response = await asyncio.wait_for(pending, 10)
+    assert response.status_code == 502, response.text
+
+
+async def test_console_suggest_timeout_without_game(store):
+    response = await store["client"].post(
+        "/v2/console/suggest",
+        json=suggest_body(store, "s-timeout", "time s"),
+        headers=headers(store),
+        timeout=15,
+    )
+    assert response.status_code == 504, response.text
+
+
+async def test_console_log_push_and_tail(store):
+    now_ms = int(time.time() * 1000)
+    batch = log_batch(
+        store,
+        "log",
+        [log_entry(now_ms - 2000, "Starting server"), log_entry(now_ms, "Done")],
+    )
+    # The game loop sends no generation (only its credential proves it);
+    # an explicit one must still match.
+    del batch["generation"]
+    pushed = await request(store, "POST", "/v2/console/logs", batch, "game-agent")
+    assert pushed.status_code == 201, pushed.text
+    assert pushed.json() == {"accepted": 2, "next": 2}
+    tail = await request(store, "GET", "/v2/console/logs?consumerId=game&since=0")
+    assert tail.status_code == 200, tail.text
+    assert tail.json() == {
+        "entries": [
+            {
+                "seq": 1,
+                "at": (now_ms - 2000) // 1000 * 1000,
+                "level": "INFO",
+                "logger": "Minecraft",
+                "message": "Starting server",
+            },
+            {
+                "seq": 2,
+                "at": now_ms // 1000 * 1000,
+                "level": "INFO",
+                "logger": "Minecraft",
+                "message": "Done",
+            },
+        ],
+        "next": 2,
+    }
+    # Cursors only move forward; an empty page reports the latest sequence.
+    again = await request(store, "GET", "/v2/console/logs?consumerId=game&since=2")
+    assert again.json() == {"entries": [], "next": 2}
+    assert (
+        await request(store, "GET", "/v2/console/logs?consumerId=game&since=-1")
+    ).status_code == 422
+    assert (
+        await request(store, "GET", "/v2/console/logs?consumerId=nope&since=0")
+    ).status_code == 404
+    assert (
+        await request(
+            store, "GET", "/v2/console/logs?consumerId=game&since=0", None, "moderator"
+        )
+    ).status_code == 403
+    # Another consumer's credential cannot append to this ring.
+    foreign = log_batch(store, "log", [log_entry(now_ms, "x")], consumerId="workshop")
+    assert (
+        await request(store, "POST", "/v2/console/logs", foreign, "game-agent")
+    ).status_code == 403
+    # A stale generation fails closed instead of appending.
+    stale = log_batch(store, "log", [log_entry(now_ms, "x")])
+    stale["generation"] = "00000000-0000-0000-0000-000000000000"
+    assert (
+        await request(store, "POST", "/v2/console/logs", stale, "game-agent")
+    ).status_code == 409
+    # Malformed batches never touch the ring.
+    for bad in (
+        {"entries": []} | {"consumerId": "game"},
+        log_batch(store, "log", [{"at": now_ms}]),
+        log_batch(store, "log", [log_entry(now_ms, "x" * 2001)]),
+        log_batch(store, "log", [log_entry(now_ms, "x") for _ in range(201)]),
+    ):
+        response = await request(store, "POST", "/v2/console/logs", bad, "game-agent")
+        assert response.status_code == 422, response.text
+
+
+async def test_console_log_retention_bounds_the_ring(store):
+    now_ms = int(time.time() * 1000)
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        await conn.execute(
+            "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES('game',1,now()-make_interval(hours=>25),'INFO','old','gone')"
+        )
+        await conn.execute(
+            "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES('game',5000,now(),'INFO','new','kept')"
+        )
+        await conn.commit()
+    pushed = await request(
+        store,
+        "POST",
+        "/v2/console/logs",
+        log_batch(store, "log", [log_entry(now_ms, "fresh")]),
+        "game-agent",
+    )
+    assert pushed.json()["next"] == 5001, pushed.text
+    kept = await sql(
+        store,
+        "SELECT seq,message FROM console_log WHERE consumer_id='game' ORDER BY seq",
+    )
+    assert [(r["seq"], r["message"]) for r in kept] == [(5000, "kept"), (5001, "fresh")]
+
+
+async def test_public_entrypoint_allowlist_limits_and_headers(store):
+    await service_token(store, "launcher", ["stats.read"])
+    extra = {"X-CP-Public": "1"}
+    # Agent/site/admin routes never pass on the public path, even authed.
+    for method, path in (
+        ("POST", "/v2/actions/console.run"),
+        ("POST", "/v2/console/suggest"),
+        ("POST", "/v2/console/logs"),
+        (
+            "GET",
+            "/v2/agents/game/events?epoch=00000000-0000-0000-0000-000000000000&cursor=0",
+        ),
+        ("GET", "/v2/operations/00000000-0000-0000-0000-000000000000"),
+        ("GET", "/v2/settings/catalog"),
+        ("GET", "/v2/openapi.json"),
+    ):
+        response = await request(store, method, path, None, "owner", extra)
+        assert response.status_code == 404, (method, path, response.text)
+    # The same routes stay reachable on the internal path (auth decides).
+    internal = await request(store, "GET", "/v2/settings/catalog", None, "owner")
+    assert internal.status_code == 200, internal.text
+    # Launcher stats reads pass on the public path; unscoped ones do not.
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 200
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "ordinary", extra)
+    ).status_code == 403
+    # Per-token public budget: 60/min; the 61st is refused, while the same
+    # token still passes internally (separate budgets).
+    for _ in range(59):
+        response = await request(
+            store, "GET", "/v2/stats/seasons", None, "launcher", extra
+        )
+        assert response.status_code == 200, response.text
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 429
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+    ).status_code == 200
+    # Every response carries the hardening headers.
+    health = await request(store, "GET", "/health", None, "ordinary", extra)
+    assert health.status_code == 200, health.text
+    for header, value in (
+        ("strict-transport-security", "max-age=3153600; includeSubDomains"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        ("content-security-policy", "default-src 'none'; frame-ancestors 'none'"),
+        ("cache-control", "no-store"),
+    ):
+        assert health.headers[header] == value, header
