@@ -101,6 +101,20 @@ class ModerationAction(Mutation):
     actorAccountId: ID | None = None
 
 
+class ConsoleRun(Mutation):
+    # Owner console line for one game consumer (coordination#35). core.action
+    # classifies it against the read-only allowlist: console.read covers the
+    # allowlist, console.run anything else.
+    consumerId: str = Field(min_length=1, max_length=128)
+    generation: ID
+    target: str = Field(default="*", min_length=1, max_length=128)
+    command: str = Field(min_length=1, max_length=1000)
+    expiresInSeconds: int = Field(default=30, ge=1, le=60)
+    # Service-asserted acting account (site principal only); the actor must be
+    # an owner. Agent tokens provisioned for console scopes send none.
+    actorAccountId: ID | None = None
+
+
 class WorkshopAction(Mutation):
     consumerId: str = Field(min_length=1, max_length=128)
     generation: ID
@@ -146,6 +160,10 @@ class Ack(Strict):
     result: Literal[
         "ok", "invalid_schema", "stale_generation", "apply_failed", "effect_uncertain"
     ] = "ok"
+    # Command output (list, maintenance status, console lines). Informational:
+    # stored with the receipt, excluded from its fingerprint, so a repost
+    # after an executor crash (which no longer has it) stays a duplicate.
+    output: str | None = Field(default=None, max_length=65536)
 
     @field_validator("actualAt")
     @classmethod

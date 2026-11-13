@@ -35,6 +35,10 @@ disagree, fix the code.
 | applied | effective / unknown | observed effectiveness or uncertainty; `rejected` after `applied`/`effective` is a conflict, never a state change |
 | effective / rejected / unknown | exact duplicate only | same persisted receipt fingerprint succeeds; changed duplicate or new transition conflicts |
 
+The receipt fingerprint covers every ack field except `output` (command text
+stored with the receipt): an executor that restarted reposts its decided state
+without it and still matches.
+
 Post-policy `received`/`validated` are recorded as historical facts: the
 executor reports what it did before losing authorization. Recording grants
 nothing; execution stays fenced at `batch` time. A historical-fact upload is

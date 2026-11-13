@@ -13,6 +13,13 @@ from cpv2.db import one, rows
 from cpv2.settings import canonical, digest
 
 STATES = ("received", "validated", "applied", "effective")
+# (kind, required scope) pairs a service credential may issue without an actor.
+SERVICE_ISSUED = {
+    ("settings.gate.patch", "workshop.gate"),
+    ("moderation.announce", "moderation.announce"),
+    ("console.run", "console.read"),
+    ("console.run", "console.run"),
+}
 TERMINAL = {"rejected", "unknown", "effective", "expired"}
 
 
@@ -99,20 +106,19 @@ async def valid_operation(conn, op):
     c = await one(conn, "SELECT * FROM credentials WHERE id=%s", (op["credential_id"],))
     if not c or c["revoked_at"] or c["expires_at"] <= now():
         return "rejected"
-    # Service-issued operation: only the workshop gate leg may be
-    # service-issued (settings.gate.patch at target "workshop" with the
-    # service-holdable workshop.gate scope). Every other NULL-account kind
-    # stays rejected, as before this branch existed: then SELECT * FROM
-    # accounts WHERE id=NULL returned no row and the function fenced them.
-    # Delivery rechecks the provisioned scope exactly like the accept-time
-    # check. A narrowed or revoked credential, or a narrowed client ceiling,
-    # fences the frame; nothing here mints human authority.
+    # Service-issued operation: only the workshop gate leg (settings.gate.patch
+    # at target "workshop" with the service-holdable workshop.gate scope), the
+    # fixed deploy announce and owner-provisioned console lines may be
+    # service-issued. Every other NULL-account kind stays rejected, as before
+    # this branch existed: then SELECT * FROM accounts WHERE id=NULL returned
+    # no row and the function fenced them. Delivery rechecks the provisioned
+    # scope exactly like the accept-time check. A narrowed or revoked
+    # credential, or a narrowed client ceiling, fences the frame; nothing here
+    # mints human authority.
     if op["account_id"] is None:
-        if (
-            c["kind"] != "service"
-            or op["kind"] != "settings.gate.patch"
-            or op["target"] != "workshop"
-            or op["required_scope"] != "workshop.gate"
+        if c["kind"] != "service" or (
+            (op["kind"], op["required_scope"]) not in SERVICE_ISSUED
+            or (op["kind"] == "settings.gate.patch" and op["target"] != "workshop")
         ):
             return "rejected"
         c = await one(
@@ -148,14 +154,17 @@ async def valid_operation(conn, op):
             "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
             (account["id"], now()),
         )
-        owner = is_owner_session(
-            client,
-            c,
-            await one(
-                conn,
-                "SELECT 1 FROM owner_memberships WHERE account_id=%s",
-                (account["id"],),
-            ),
+        membership = await one(
+            conn,
+            "SELECT 1 FROM owner_memberships WHERE account_id=%s",
+            (account["id"],),
+        )
+        # A service-asserted actor (site principal) is an owner exactly when
+        # core.action accepted it as one: by membership, not by session shape.
+        owner = (
+            bool(membership)
+            if c["kind"] == "service"
+            else is_owner_session(client, c, membership)
         )
         identity = Identity(c, client, account, grants, owner)
     # required_scope lists every permission the accepted diff required
@@ -303,6 +312,9 @@ async def acknowledge(conn, identity, attempt, cid, model):
     ):
         raise Problem("receipt_mismatch", 409)
     body = model.model_dump(mode="json")
+    # Output is informational (see models.Ack): never part of the fingerprint,
+    # so receipts recorded before the field existed keep their hash.
+    output = body.pop("output")
     fingerprint = digest(body)
     prior = await one(
         conn,
@@ -376,7 +388,10 @@ async def acknowledge(conn, identity, attempt, cid, model):
             model.sequence,
             model.state,
             fingerprint,
-            Jsonb({"code": model.result}),
+            Jsonb(
+                {"code": model.result}
+                | ({"output": output} if output is not None else {})
+            ),
             actual,
         ),
     )
