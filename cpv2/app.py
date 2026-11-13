@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import os
 import time
@@ -34,7 +35,72 @@ _health_clock = time.monotonic
 BODY_LIMITS = {
     "/v2/stats/results": core.STAT_MAX_BODY,
     "/v2/stats/diagnostics": core.DIAG_MAX_BODY,
+    "/v2/console/logs": 65536,
+    "/v2/console/suggest": 4096,
 }
+
+# Public HTTPS entrypoint (coordination#35 owner decision «Публичный HTTPS»):
+# CP stays private-network-only (no Dokploy ingress); Traefik routes the
+# public domain to it and sets X-CP-Public: 1 on that router only, after
+# stripping any client-sent value. Direct container access needs homeserver
+# root, so the header is trustworthy: when present the request came through
+# the public router. Only the launcher/bot stats reads and liveness may pass.
+PUBLIC_ENTRYPOINT_HEADER = "x-cp-public"
+PUBLIC_ROUTES = ("/health", "/v2/stats/")
+
+
+def public_entrypoint(request):
+    return request.headers.get(PUBLIC_ENTRYPOINT_HEADER) == "1"
+
+
+def client_address(request, hops=None):
+    """Address the per-IP public budget keys on.
+
+    Behind Traefik request.client is the proxy, so every public client would
+    share one bucket. Each trusted proxy appends the peer it saw to
+    X-Forwarded-For; entries further left are client-supplied and ignored.
+    CP_PUBLIC_TRUSTED_HOPS is the number of trusted proxies in front
+    (1 = Traefik alone, see docs/PUBLIC.md). Internal requests and a missing
+    or malformed chain keep the socket peer.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if not public_entrypoint(request):
+        return peer
+    if hops is None:
+        hops = int(os.environ.get("CP_PUBLIC_TRUSTED_HOPS", "1"))
+    chain = [
+        part.strip()
+        for part in request.headers.get("x-forwarded-for", "").split(",")
+        if part.strip()
+    ]
+    if hops < 1 or len(chain) < hops:
+        return peer
+    try:
+        return str(ipaddress.ip_address(chain[-hops]))
+    except ValueError:
+        return peer
+
+
+def public_allowed(method, path):
+    # Reads only: mutations (POST stats ingest/diagnostics/void, console,
+    # actions, acks, settings) 404 on the public entrypoint even with a
+    # valid token, per docs/PUBLIC.md.
+    if method not in ("GET", "HEAD"):
+        return False
+    return path == "/health" or path.startswith("/v2/stats/")
+
+
+def secure(response):
+    # The API is JSON-only: no sniffing, no framing, no referrer, and HSTS
+    # for the public domain (internal loopback callers ignore it).
+    response.headers["Strict-Transport-Security"] = "max-age=3153600; includeSubDomains"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; frame-ancestors 'none'"
+    )
+    return response
 
 
 class Limits:
@@ -139,10 +205,23 @@ def create_app(dsn=None):
     )
     app.state.db, app.state.wakeups = database, wakeups
     limiter = Limits()
+    # Public entrypoint budgets: per-IP and per-token, independent of the
+    # internal shared budget, so a public flood cannot deny internal agents.
+    pub_ip_limiter = Limits()
+    pub_token_limiter = Limits()
+    # Every per-key bucket a public request touches lives here, never in
+    # limiter: public per-client/per-token/per-IP buckets are fully separate
+    # objects, so public traffic cannot exhaust internal budgets and
+    # internal traffic cannot exhaust public ones. Same limits as internal.
+    pub_limiter = Limits()
     # Never-authenticated traffic draws from a separate small budget, so garbage
     # bearer strings cannot burn the shared budget that health checks and
     # authenticated agents rely on.
     unauth_limiter = Limits(budget=100)
+    # Handles for the bucket-isolation tests: public traffic must not
+    # consume any internal bucket and vice versa.
+    app.state.limiter = limiter
+    app.state.pub_limiter = pub_limiter
 
     @app.exception_handler(Problem)
     async def problem_handler(request, error):
@@ -170,15 +249,23 @@ def create_app(dsn=None):
             else ""
         )
         request.state.attempt = attempt
-        key = (
-            verifier(token)
-            if token
-            else (request.client.host if request.client else "unknown")
-        )
+        key = verifier(token) if token else client_address(request)
         try:
+            # The public entrypoint serves only the launcher/bot stats reads
+            # and liveness; agent/site/admin routes never pass on it, even
+            # with a valid token, so a scoped public token cannot reach
+            # actions, acks or settings from the internet.
+            entry_public = public_entrypoint(request)
+            if entry_public and not public_allowed(request.method, request.url.path):
+                return secure(JSONResponse({"error": "not_found"}, status_code=404))
+            # Public requests draw every per-key bucket from pub_limiter and
+            # the pub_ip/pub_token budgets, never from the internal limiter.
+            budget = pub_limiter if entry_public else limiter
             # Per-key bound only: pre-auth traffic must not burn the shared
             # budget, which counts authenticated requests below.
-            limiter.check(key, global_count=False)
+            budget.check(key, global_count=False)
+            if entry_public:
+                pub_ip_limiter.check(client_address(request), global_count=False)
             if not public:
                 try:
                     async with database.transaction() as conn:
@@ -209,13 +296,27 @@ def create_app(dsn=None):
                                 )
                         raise
             if identity:
+                if entry_public:
+                    # Per-token public budget: one launcher/bot token polls
+                    # stats every tens of seconds; 60/min leaves headroom
+                    # without letting one token burn the shared budget.
+                    pub_token_limiter.check(
+                        ("pub-token", str(identity.credential["id"])),
+                        global_count=False,
+                        limit=60,
+                    )
                 if identity.actor:
-                    limiter.check(("actor", str(identity.actor)), global_count=False)
-                # The shared budget counts authenticated requests only.
-                limiter.check(
-                    ("client", identity.client["id"]), global_count=True, limit=600
+                    budget.check(("actor", str(identity.actor)), global_count=False)
+                # The shared budget counts authenticated internal requests only:
+                # public traffic stays on pub_limiter (plus the pub_ip/pub_token
+                # budgets above), so a public flood cannot deny internal agents
+                # and internal traffic cannot deny public readers.
+                budget.check(
+                    ("client", identity.client["id"]),
+                    global_count=not entry_public,
+                    limit=600,
                 )
-                limiter.check(
+                budget.check(
                     (
                         "resource",
                         str(identity.actor or identity.client["id"]),
@@ -283,7 +384,7 @@ def create_app(dsn=None):
                     )
             response.headers["Cache-Control"] = "no-store"
             response.headers["X-Request-ID"] = str(attempt)
-            return response
+            return secure(response)
         except Problem as error:
             if mutation and error.code != "rate_limit":
                 async with database.transaction() as conn:
@@ -296,11 +397,13 @@ def create_app(dsn=None):
                         "denied",
                         {"code": error.code},
                     )
-            return JSONResponse({"error": error.code}, status_code=error.status)
+            return secure(JSONResponse({"error": error.code}, status_code=error.status))
         except (psycopg.Error, TimeoutError):
-            return JSONResponse(
-                {"error": "control_unavailable", "requestId": str(attempt)},
-                status_code=503,
+            return secure(
+                JSONResponse(
+                    {"error": "control_unavailable", "requestId": str(attempt)},
+                    status_code=503,
+                )
             )
 
     async def write(request, function, *args, **kwargs):
@@ -792,6 +895,47 @@ def create_app(dsn=None):
     async def operation(operation_id: UUID, request: Request):
         async with database.transaction() as conn:
             return await core.read_operation(conn, request.state.identity, operation_id)
+
+    @app.post("/v2/console/logs", status_code=201)
+    async def console_log_push(body: dict, request: Request):
+        # Game log batch over its own agent credential (no new scope, no new
+        # provisioning): core checks the caller IS the consumer it posts for.
+        # The pipeline audits the batch like any other mutation.
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            result = await core.console_log_ingest(
+                conn,
+                identity,
+                request.state.attempt,
+                (body or {}).get("consumerId"),
+                body,
+            )
+            # The ingest wrote its own accepted audit with the batch stats;
+            # the pipeline must not add a second completed row per batch.
+            request.state.completed_audited = True
+            return result
+
+    @app.get("/v2/console/logs")
+    async def console_log_tail(
+        request: Request, consumerId: str = "game", since: int = 0
+    ):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            return await core.console_log_read(conn, identity, consumerId, since)
+
+    @app.post("/v2/console/suggest")
+    async def console_suggest(body: dict, request: Request):
+        # Completion as a request/response op: CP enqueues console.suggest
+        # for the game consumer and waits for its ack output (≤5 s) instead
+        # of returning a receipt the site would have to poll. Scope
+        # console.read: completing a line is not running it.
+        result = await write(request, core.console_suggest, body)
+        output = await core.console_suggest_output(
+            database, wakeups, (body or {}).get("consumerId"), result["operationId"]
+        )
+        if output is None:
+            raise Problem("suggest_timeout", 504)
+        return core.check_suggest_output(output)
 
     @app.get("/v2/audit")
     async def get_audit(

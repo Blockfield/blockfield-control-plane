@@ -438,3 +438,44 @@ def test_site_session_create_rejects_empty_or_oversized_token():
         SiteSessionCreate(sealedToken="x" * 4097, playerUuid="player-1")
     with pytest.raises(ValidationError):
         SiteSessionCreate(sealedToken="tok", playerUuid="")
+
+
+def test_public_per_ip_budget_keys_on_the_forwarded_client_not_the_proxy():
+    from types import SimpleNamespace
+
+    from cpv2.app import client_address
+
+    def request(headers, peer="10.0.0.2"):
+        return SimpleNamespace(headers=headers, client=SimpleNamespace(host=peer))
+
+    public = {"x-cp-public": "1"}
+    # Traefik appends the real peer; a client-supplied left entry is ignored.
+    assert (
+        client_address(
+            request(public | {"x-forwarded-for": "1.1.1.1, 203.0.113.7"}), hops=1
+        )
+        == "203.0.113.7"
+    )
+    # Two trusted proxies: the client is the second entry from the right.
+    assert (
+        client_address(
+            request(public | {"x-forwarded-for": "9.9.9.9, 203.0.113.7, 172.16.0.1"}),
+            hops=2,
+        )
+        == "203.0.113.7"
+    )
+    # Missing, short or malformed chains keep the socket peer.
+    assert client_address(request(public), hops=1) == "10.0.0.2"
+    assert (
+        client_address(request(public | {"x-forwarded-for": "203.0.113.7"}), hops=2)
+        == "10.0.0.2"
+    )
+    assert (
+        client_address(request(public | {"x-forwarded-for": "not-an-ip"}), hops=1)
+        == "10.0.0.2"
+    )
+    # Internal requests never trust the header.
+    assert (
+        client_address(request({"x-forwarded-for": "203.0.113.7"}), hops=1)
+        == "10.0.0.2"
+    )

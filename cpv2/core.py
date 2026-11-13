@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import json
 import math
 import re
 import secrets
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -668,7 +670,12 @@ MODERATION_COMMANDS = (
     "moderation.announce",
 )
 MODERATION_MAINTENANCE_OPS = ("status", "drain", "resume", "interrupt")
-SERVER_WIDE_KINDS = ("console.run", "moderation.maintenance", "moderation.announce")
+SERVER_WIDE_KINDS = (
+    "console.run",
+    "console.suggest",
+    "moderation.maintenance",
+    "moderation.announce",
+)
 # Read-only console lines (scope console.read); anything else needs
 # console.run. The game and the agent MCP enforce the same list.
 CONSOLE_READ_ONLY = re.compile(
@@ -873,7 +880,7 @@ async def action(conn, identity, attempt, kind, body):
         raise Problem("consumer_generation_or_capability", 409)
     unsettled = await one(
         conn,
-        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND (p.kind LIKE 'moderation.%%' OR p.kind='console.run') AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND (p.kind LIKE 'moderation.%%' OR p.kind='console.run' OR p.kind='console.suggest') AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
         (data["consumerId"],),
     )
     if (
@@ -902,6 +909,277 @@ async def action(conn, identity, attempt, kind, body):
             ),
         },
     )
+
+
+# Console streaming + completion (site#135): the site never touches the game
+# directly. Log lines stream game→CP over the agent credential and rest in a
+# bounded DB ring (per-consumer cap + age retention, no files); completion is
+# a console.suggest op the game answers over the agent channel with its ack
+# output, which the site POST waits for.
+CONSOLE_LOG_MAX_BATCH = 200
+CONSOLE_LOG_MAX_KEPT = 2000
+CONSOLE_LOG_RETENTION_HOURS = 24
+CONSOLE_LOG_LEVEL_MAX = 16
+CONSOLE_LOG_LOGGER_MAX = 200
+CONSOLE_LOG_MESSAGE_MAX = 2000
+CONSOLE_SUGGEST_WAIT_SECONDS = 5.0
+CONSOLE_SUGGEST_TEXT_MAX = 200
+CONSOLE_SUGGEST_HINT_MAX = 200
+CONSOLE_SUGGEST_COUNT_MAX = 50
+
+
+async def _server_consumer(conn, consumer_id, generation, capability=None):
+    # Server-wide kinds (console.run/suggest, maintenance, announce) act on
+    # the whole server: same consumer checks as core.action. Log ingest skips
+    # the capability check (capability None) and may skip the generation
+    # check (generation None): logs are not generation-scoped delivery, the
+    # caller's credential match is the authorization.
+    consumer = await one(
+        conn, "SELECT * FROM consumers WHERE id=%s FOR UPDATE", (consumer_id,)
+    )
+    if (
+        not consumer
+        or (generation is not None and str(consumer["generation"]) != str(generation))
+        or (capability is not None and capability not in consumer["capabilities"])
+    ):
+        raise Problem("consumer_generation_or_capability", 409)
+    return consumer
+
+
+async def console_suggest(conn, identity, attempt, body):
+    try:
+        data = models.ConsoleSuggest.model_validate(body).model_dump(mode="json")
+    except ValidationError:
+        raise Problem("invalid_action", 422) from None
+    text = data["input"]
+    if any(unicodedata.category(c) == "Cc" for c in text):
+        raise Problem("invalid_console_input", 422)
+    payload = {"kind": "console.suggest", "target": "*", "input": text}
+    identity.require("console.read", data["environment"], data["backend"], "*")
+    consumer = await _server_consumer(
+        conn, data["consumerId"], data["generation"], "console.suggest"
+    )
+    if (
+        consumer["environment"] != data["environment"]
+        or consumer["backend"] != data["backend"]
+        or consumer["resource"] != "*"
+    ):
+        raise Problem("consumer_generation_or_capability", 409)
+    unsettled = await one(
+        conn,
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND (p.kind LIKE 'moderation.%%' OR p.kind='console.run' OR p.kind='console.suggest') AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
+        (data["consumerId"],),
+    )
+    if (
+        consumer["next_sequence"] - consumer["received_cursor"] > 128
+        or unsettled["n"] >= 128
+    ):
+        raise Problem("consumer_lag", 409)
+    op, duplicate = await operation(
+        conn,
+        identity,
+        "console.suggest",
+        "*",
+        data,
+        "console.read",
+        data["expiresInSeconds"],
+        data["generation"],
+    )
+    if duplicate:
+        return receipt(op)
+    await enqueue(conn, op, [consumer], payload)
+    return await finish(conn, attempt, identity, op, {"input": text})
+
+
+async def console_suggest_output(db, wakeups, consumer_id, operation_id, timeout=None):
+    """Latest ack output for a console.suggest op, or None on timeout.
+
+    The game answers over the agent channel like any other op; the site POST
+    waits here instead of polling. Wakes come from the same LISTEN/NOTIFY
+    machinery the agent SSE streams use (delivery.acknowledge notifies the
+    consumer id on every ack), but from a separate waiter namespace so full
+    agent streams cannot starve completions.
+    """
+    deadline = time.monotonic() + (
+        CONSOLE_SUGGEST_WAIT_SECONDS if timeout is None else timeout
+    )
+    try:
+        waiter = wakeups.subscribe_suggest(consumer_id)
+    except Problem:
+        return None
+    try:
+        while True:
+            waiter.clear()
+            async with db.transaction() as conn:
+                row = await one(
+                    conn,
+                    "SELECT a.result AS result FROM consumer_acks a JOIN outbox o ON o.consumer_id=a.consumer_id AND o.sequence=a.sequence WHERE o.consumer_id=%s AND o.operation_id=%s AND a.result ? 'output' ORDER BY a.recorded_at DESC LIMIT 1",
+                    (consumer_id, operation_id),
+                )
+                if row and isinstance(row["result"].get("output"), str):
+                    return row["result"]["output"]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                await asyncio.wait_for(waiter.wait(), remaining)
+            except TimeoutError:
+                return None
+    finally:
+        wakeups.unsubscribe_suggest(consumer_id, waiter)
+
+
+def check_suggest_output(output):
+    # Same wire shape the game builds and the site validates
+    # (site consoleSuggestPage): offset plus at most 50 text/hint pairs.
+    if not isinstance(output, str):
+        raise Problem("suggest_invalid", 502)
+    try:
+        data = json.loads(output)
+    except ValueError:
+        raise Problem("suggest_invalid", 502) from None
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("from"), int)
+        or data["from"] < 0
+        or not isinstance(data.get("suggestions"), list)
+    ):
+        raise Problem("suggest_invalid", 502)
+    suggestions = []
+    for row in data["suggestions"][:CONSOLE_SUGGEST_COUNT_MAX]:
+        if not isinstance(row, dict) or not row.get("text"):
+            continue
+        suggestions.append(
+            {
+                "text": str(row["text"])[:CONSOLE_SUGGEST_TEXT_MAX],
+                "hint": str(row.get("hint") or "")[:CONSOLE_SUGGEST_HINT_MAX],
+            }
+        )
+    return {"from": data["from"], "suggestions": suggestions}
+
+
+async def console_log_ingest(conn, identity, attempt, consumer_id, body):
+    """One log batch from the game itself, over its agent credential.
+
+    No new scope: the caller must be the consumer it posts for (same check
+    as the agent ack path), so no credential provisioning changes. Entries
+    keep the mod link's wire shape (seq assigned here, at as epoch millis).
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("entries"), list):
+        raise Problem("invalid_console_log", 422)
+    entries = body["entries"]
+    # The game never posts an empty drain; an empty batch is a malformed call.
+    if not entries or len(entries) > CONSOLE_LOG_MAX_BATCH:
+        raise Problem("invalid_console_log", 422)
+    consumer = await _server_consumer(conn, consumer_id, body.get("generation"))
+    # The caller's credential must be the consumer's own, which authenticate
+    # already fenced (revoked tokens 401 before this). Rotation overlap
+    # accepts the previous credential like the agent ack path, so a renewed
+    # game keeps streaming across the switch. An explicit generation still
+    # has to match (checked above), so a stale loop fails closed.
+    if (
+        identity.credential["id"] != consumer["credential_id"]
+        and identity.credential["id"] != consumer["previous_credential_id"]
+    ) or identity.credential["kind"] != "service":
+        raise Problem("consumer_identity_mismatch")
+    if consumer["environment"] != body.get(
+        "environment", consumer["environment"]
+    ) or consumer["backend"] != body.get("backend", consumer["backend"]):
+        raise Problem("consumer_generation_or_capability", 409)
+    cleaned = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise Problem("invalid_console_log", 422)
+        at, level, logger, message = (
+            entry.get("at"),
+            entry.get("level"),
+            entry.get("logger"),
+            entry.get("message"),
+        )
+        if (
+            not isinstance(at, int)
+            or isinstance(at, bool)
+            or at < 0
+            or not isinstance(level, str)
+            or not isinstance(logger, str)
+            or not isinstance(message, str)
+            or len(level) > CONSOLE_LOG_LEVEL_MAX
+            or len(logger) > CONSOLE_LOG_LOGGER_MAX
+            or len(message) > CONSOLE_LOG_MESSAGE_MAX
+        ):
+            raise Problem("invalid_console_log", 422)
+        cleaned.append((at, level.upper(), logger, message))
+    # The cursor lives outside the retained rows: retention may delete every
+    # row and concurrent batches still serialize on this row lock.
+    current = await one(
+        conn,
+        "INSERT INTO console_log_seq(consumer_id,next_seq) VALUES(%s,0) ON CONFLICT(consumer_id) DO UPDATE SET consumer_id=EXCLUDED.consumer_id RETURNING next_seq",
+        (consumer_id,),
+    )
+    seq = current["next_seq"]
+    for at, level, logger, message in cleaned:
+        seq += 1
+        await conn.execute(
+            "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES(%s,%s,to_timestamp(%s/1000.0),%s,%s,%s)",
+            (consumer_id, seq, at, level, logger, message),
+        )
+    await conn.execute(
+        "UPDATE console_log_seq SET next_seq=%s WHERE consumer_id=%s",
+        (seq, consumer_id),
+    )
+    await conn.execute(
+        "DELETE FROM console_log WHERE consumer_id=%s AND (at < now() - make_interval(hours => %s) OR seq <= (SELECT COALESCE(MAX(seq),0) FROM console_log WHERE consumer_id=%s) - %s)",
+        (consumer_id, CONSOLE_LOG_RETENTION_HOURS, consumer_id, CONSOLE_LOG_MAX_KEPT),
+    )
+    await conn.execute("SELECT pg_notify('cp_events',%s)", ("console:" + consumer_id,))
+    await audit(
+        conn,
+        attempt,
+        identity,
+        "console.log",
+        consumer_id,
+        "accepted",
+        {"entries": len(cleaned), "next": seq},
+    )
+    return {"accepted": len(cleaned), "next": seq}
+
+
+async def console_log_read(conn, identity, consumer_id, since):
+    consumer = await one(conn, "SELECT * FROM consumers WHERE id=%s", (consumer_id,))
+    if not consumer:
+        raise Problem("consumer_not_found", 404)
+    identity.require("console.read", consumer["environment"], consumer["backend"], "*")
+    if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+        raise Problem("invalid_console_cursor", 422)
+    # The cursor is read before the page: under read-committed the entries
+    # snapshot is then newer-or-equal, so an empty page can only mean those
+    # rows were pruned, never rows the reader skipped past. Reading the
+    # cursor after the page had the opposite hazard: a batch committing
+    # between the two statements advanced next past unseen rows.
+    latest = await one(
+        conn,
+        "SELECT next_seq AS seq FROM console_log_seq WHERE consumer_id=%s",
+        (consumer_id,),
+    )
+    found = await rows(
+        conn,
+        "SELECT seq,EXTRACT(EPOCH FROM at)::bigint*1000 AS at,level,logger,message FROM console_log WHERE consumer_id=%s AND seq>%s ORDER BY seq LIMIT 500",
+        (consumer_id, since),
+    )
+    latest_seq = latest["seq"] if latest else since
+    return {
+        "entries": [
+            {
+                "seq": row["seq"],
+                "at": row["at"],
+                "level": row["level"],
+                "logger": row["logger"],
+                "message": row["message"],
+            }
+            for row in found
+        ],
+        "next": found[-1]["seq"] if found else latest_seq,
+    }
 
 
 async def delegate(conn, identity, attempt, model):

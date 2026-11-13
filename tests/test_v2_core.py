@@ -47,7 +47,7 @@ from cpv2.auth import (
     now,
     verifier,
 )
-from cpv2.db import migrate, one
+from cpv2.db import MIGRATIONS, migrate, one
 from cpv2.legacy import import_u1
 from cpv2.settings import canonical, digest
 
@@ -290,6 +290,7 @@ async def store(postgres):
                         "moderation.maintenance",
                         "moderation.announce",
                         "console.run",
+                        "console.suggest",
                     ]
                     + (
                         [
@@ -2010,6 +2011,20 @@ async def test_c7_rebind_refuses_capability_or_client_change(store):
         await provision(store["admin"], stolen)
     row = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[0]
     assert row["credential_id"] == first
+    # A migration appended console kinds after the spec was written: the old
+    # spec still rotates, and the stored set keeps the migrated kinds.
+    await sql(
+        store,
+        "UPDATE consumers SET capabilities=array_append(capabilities,'console.suggest') WHERE id='rot2'",
+    )
+    await provision(store["admin"], rot_spec())
+    row = (
+        await sql(
+            store, "SELECT credential_id,capabilities FROM consumers WHERE id='rot2'"
+        )
+    )[0]
+    assert row["credential_id"] != first
+    assert "console.suggest" in row["capabilities"]
 
 
 async def test_c7_second_rotation_refused_while_previous_valid(store):
@@ -2177,6 +2192,21 @@ async def test_renew_grace_expires_old_and_refuses_humans_and_floods(store):
         for _ in range(8)
     ]
     assert 429 in codes
+
+
+def test_suggest_waiters_do_not_consume_stream_slots():
+    # No database: the waiter namespaces are in-memory. With both agent
+    # stream slots taken, completions still get their own namespace.
+    wakeups = delivery.Wakeups("dbname=unused")
+    first, second = wakeups.subscribe("game"), wakeups.subscribe("game")
+    with pytest.raises(Problem):
+        wakeups.subscribe("game")
+    suggest = wakeups.subscribe_suggest("game")
+    wakeups.unsubscribe_suggest("game", suggest)
+    assert not wakeups.suggest_waiters
+    wakeups.unsubscribe("game", first)
+    wakeups.unsubscribe("game", second)
+    assert not wakeups.waiters
 
 
 async def test_notify_wakeup_and_durable_recovery_without_listener(store):
@@ -5902,6 +5932,20 @@ async def test_owner_enroll_names_second_founder_explicitly(store, postgres):
         await enroll_owner(fresh, uuid4(), "first", second)
 
 
+async def test_fresh_database_reaches_latest_schema_and_health(store):
+    # A newly initialized database must end at len(MIGRATIONS) with no
+    # second migrate run: health requires the latest version, and log
+    # ingestion needs the newest tables from the start.
+
+    applied = await sql(store, "SELECT MAX(version) AS version FROM schema_migrations")
+    assert applied[0]["version"] == len(MIGRATIONS)
+    seq = await sql(store, "SELECT to_regclass('control.console_log_seq') AS name")
+    assert seq[0]["name"] == "console_log_seq"
+    health = await request(store, "GET", "/health")
+    assert health.status_code == 200, health.text
+    assert health.json()["schema"] == len(MIGRATIONS)
+
+
 async def test_workshop_rbac_mirrors_moderation_split(store):
     # Builders cannot issue; moderators handle member-level ops only.
     await bind(store, "moderator")
@@ -6099,7 +6143,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 10}
+    assert response.json() == {"status": "ok", "schema": len(MIGRATIONS)}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -6107,7 +6151,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 10}
+    assert broken.json() == {"status": "unavailable", "schema": len(MIGRATIONS)}
 
 
 async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
@@ -9982,3 +10026,516 @@ async def test_stats_diag_ingest_accepts_full_size_report(store):
     )
     assert response.status_code == 200, response.text
     assert response.json() == {"samples": 120, "events": 200}
+
+
+def suggest_body(store, key, text, **extra):
+    return {
+        "idempotencyKey": key,
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "input": text,
+        **extra,
+    }
+
+
+def log_batch(store, key, entries, **extra):
+    return {
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "entries": entries,
+        **extra,
+    }
+
+
+def log_entry(now_ms, message, level="INFO", logger="Minecraft"):
+    return {"at": now_ms, "level": level, "logger": logger, "message": message}
+
+
+async def test_console_suggest_round_trip_and_validation(store):
+    # Moderators hold no console scope; unknown consumers and control
+    # characters are refused before any operation exists.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/console/suggest",
+            suggest_body(store, "s0", "ti"),
+            "moderator",
+        )
+    ).status_code == 403
+    bad_consumer = await request(
+        store,
+        "POST",
+        "/v2/console/suggest",
+        suggest_body(store, "s1", "time set", consumerId="nope"),
+    )
+    assert bad_consumer.status_code == 409, bad_consumer.text
+    bad_input = await request(
+        store, "POST", "/v2/console/suggest", suggest_body(store, "s2", "time\nstop")
+    )
+    assert bad_input.status_code == 422, bad_input.text
+    assert not await sql(store, "SELECT * FROM operations WHERE kind='console.suggest'")
+    # Slow game: the POST waits for the ack instead of returning a receipt.
+    pending = asyncio.create_task(
+        store["client"].post(
+            "/v2/console/suggest",
+            json=suggest_body(store, "s3", "time s"),
+            headers=headers(store),
+        )
+    )
+    await asyncio.sleep(0.2)
+    frames = await envelopes(store)
+    suggest = [f for f in frames if f["payload"].get("kind") == "console.suggest"]
+    assert len(suggest) == 1, [f["payload"].get("kind") for f in frames]
+    assert suggest[0]["payload"] == {
+        "kind": "console.suggest",
+        "target": "*",
+        "input": "time s",
+    }
+    assert suggest[0]["executable"]
+    answer = {"from": 5, "suggestions": [{"text": "set", "hint": "time set"}]}
+    await ack_chain(store, suggest[0], output=json.dumps(answer))
+    response = await asyncio.wait_for(pending, 10)
+    assert response.status_code == 200, response.text
+    assert response.json() == answer
+    # A malformed game answer is a 502, never rendered raw.
+    pending = asyncio.create_task(
+        store["client"].post(
+            "/v2/console/suggest",
+            json=suggest_body(store, "s4", "wea"),
+            headers=headers(store),
+        )
+    )
+    await asyncio.sleep(0.2)
+    frames = await envelopes(store)
+    # Non-executable frames (the acked s3 one) carry no payload.
+    broken = next(f for f in frames if (f["payload"] or {}).get("input") == "wea")
+    await ack_chain(store, broken, output="not-json{{")
+    response = await asyncio.wait_for(pending, 10)
+    assert response.status_code == 502, response.text
+
+
+async def test_console_suggest_timeout_without_game(store):
+    response = await store["client"].post(
+        "/v2/console/suggest",
+        json=suggest_body(store, "s-timeout", "time s"),
+        headers=headers(store),
+        timeout=15,
+    )
+    assert response.status_code == 504, response.text
+
+
+async def test_console_suggest_survives_full_agent_streams(store):
+    # Both agent stream slots taken: the completion waits on its own waiter
+    # namespace instead of 504ing for lack of a stream slot.
+    wakeups = store["app"].state.wakeups
+    first, second = wakeups.subscribe("game"), wakeups.subscribe("game")
+    try:
+        pending = asyncio.create_task(
+            store["client"].post(
+                "/v2/console/suggest",
+                json=suggest_body(store, "s-streams-full", "time s"),
+                headers=headers(store),
+            )
+        )
+        await asyncio.sleep(0.2)
+        frames = await envelopes(store)
+        suggest = [f for f in frames if f["payload"].get("kind") == "console.suggest"]
+        assert len(suggest) == 1, [f["payload"].get("kind") for f in frames]
+        answer = {"from": 5, "suggestions": [{"text": "set", "hint": "time set"}]}
+        await ack_chain(store, suggest[0], output=json.dumps(answer))
+        response = await asyncio.wait_for(pending, 10)
+        assert response.status_code == 200, response.text
+        assert response.json() == answer
+        assert not wakeups.suggest_waiters
+    finally:
+        wakeups.unsubscribe("game", first)
+        wakeups.unsubscribe("game", second)
+
+
+async def test_console_log_push_and_tail(store):
+    now_ms = int(time.time() * 1000)
+    batch = log_batch(
+        store,
+        "log",
+        [log_entry(now_ms - 2000, "Starting server"), log_entry(now_ms, "Done")],
+    )
+    # The game loop sends no generation (only its credential proves it);
+    # an explicit one must still match.
+    del batch["generation"]
+    pushed = await request(store, "POST", "/v2/console/logs", batch, "game-agent")
+    assert pushed.status_code == 201, pushed.text
+    assert pushed.json() == {"accepted": 2, "next": 2}
+    tail = await request(store, "GET", "/v2/console/logs?consumerId=game&since=0")
+    assert tail.status_code == 200, tail.text
+    assert tail.json() == {
+        "entries": [
+            {
+                "seq": 1,
+                "at": (now_ms - 2000) // 1000 * 1000,
+                "level": "INFO",
+                "logger": "Minecraft",
+                "message": "Starting server",
+            },
+            {
+                "seq": 2,
+                "at": now_ms // 1000 * 1000,
+                "level": "INFO",
+                "logger": "Minecraft",
+                "message": "Done",
+            },
+        ],
+        "next": 2,
+    }
+    # Cursors only move forward; an empty page reports the latest sequence.
+    again = await request(store, "GET", "/v2/console/logs?consumerId=game&since=2")
+    assert again.json() == {"entries": [], "next": 2}
+    assert (
+        await request(store, "GET", "/v2/console/logs?consumerId=game&since=-1")
+    ).status_code == 422
+    assert (
+        await request(store, "GET", "/v2/console/logs?consumerId=nope&since=0")
+    ).status_code == 404
+    assert (
+        await request(
+            store, "GET", "/v2/console/logs?consumerId=game&since=0", None, "moderator"
+        )
+    ).status_code == 403
+    # Another consumer's credential cannot append to this ring.
+    foreign = log_batch(store, "log", [log_entry(now_ms, "x")], consumerId="workshop")
+    assert (
+        await request(store, "POST", "/v2/console/logs", foreign, "game-agent")
+    ).status_code == 403
+    # A stale generation fails closed instead of appending.
+    stale = log_batch(store, "log", [log_entry(now_ms, "x")])
+    stale["generation"] = "00000000-0000-0000-0000-000000000000"
+    assert (
+        await request(store, "POST", "/v2/console/logs", stale, "game-agent")
+    ).status_code == 409
+    # Malformed batches never touch the ring.
+    for bad in (
+        {"entries": []} | {"consumerId": "game"},
+        log_batch(store, "log", [{"at": now_ms}]),
+        log_batch(store, "log", [log_entry(now_ms, "x" * 2001)]),
+        log_batch(store, "log", [log_entry(now_ms, "x") for _ in range(201)]),
+    ):
+        response = await request(store, "POST", "/v2/console/logs", bad, "game-agent")
+        assert response.status_code == 422, response.text
+
+
+async def test_console_log_retention_bounds_the_ring(store):
+    now_ms = int(time.time() * 1000)
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"],
+        options="-c search_path=control,pg_catalog",
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        await conn.execute(
+            "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES('game',1,now()-make_interval(hours=>25),'INFO','old','gone')"
+        )
+        await conn.execute(
+            "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES('game',5000,now(),'INFO','new','kept')"
+        )
+        await conn.execute(
+            "INSERT INTO console_log_seq(consumer_id,next_seq) VALUES('game',5000)"
+        )
+        await conn.commit()
+    pushed = await request(
+        store,
+        "POST",
+        "/v2/console/logs",
+        log_batch(store, "log", [log_entry(now_ms, "fresh")]),
+        "game-agent",
+    )
+    assert pushed.json()["next"] == 5001, pushed.text
+    kept = await sql(
+        store,
+        "SELECT seq,message FROM console_log WHERE consumer_id='game' ORDER BY seq",
+    )
+    assert [(r["seq"], r["message"]) for r in kept] == [(5000, "kept"), (5001, "fresh")]
+
+
+async def test_console_log_cursor_survives_full_retention(store):
+    # Retention may age out every row: the next batch must continue the
+    # persisted cursor, not restart at 1 where a polling site would miss it.
+    now_ms = int(time.time() * 1000)
+    first = await request(
+        store,
+        "POST",
+        "/v2/console/logs",
+        log_batch(
+            store,
+            "cursor",
+            [log_entry(now_ms - 2000, "one"), log_entry(now_ms, "two")],
+        ),
+        "game-agent",
+    )
+    assert first.json() == {"accepted": 2, "next": 2}, first.text
+    await sql(store, "DELETE FROM console_log WHERE consumer_id='game'")
+    second = await request(
+        store,
+        "POST",
+        "/v2/console/logs",
+        log_batch(store, "cursor2", [log_entry(now_ms, "three")]),
+        "game-agent",
+    )
+    assert second.json() == {"accepted": 1, "next": 3}, second.text
+    tail = await request(store, "GET", "/v2/console/logs?consumerId=game&since=2")
+    assert tail.status_code == 200, tail.text
+    assert [e["seq"] for e in tail.json()["entries"]] == [3], tail.text
+    assert tail.json()["next"] == 3
+
+
+async def test_console_tail_never_skips_racing_batch(store, monkeypatch):
+    # A batch committing between the page and cursor reads must not be
+    # skipped: the cursor is read first, so the page snapshot always covers
+    # it. The spy injects the commit on the losing side of the race for
+    # both statement orders: before the page fetch when the cursor was
+    # already read (fixed order), after it when the cursor is still pending
+    # (old order, which then advances next past the unseen row).
+    now_ms = int(time.time() * 1000)
+    pushed = await request(
+        store,
+        "POST",
+        "/v2/console/logs",
+        log_batch(store, "log", [log_entry(now_ms, "one"), log_entry(now_ms, "two")]),
+        "game-agent",
+    )
+    assert pushed.json()["next"] == 2, pushed.text
+    real_one, real_rows = core.one, core.rows
+    state = {"cursor_read": False, "injected": False}
+
+    async def inject_batch():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"], options="-c search_path=control,pg_catalog"
+        ) as writer:
+            await writer.execute(
+                "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES('game',3,now(),'INFO','Minecraft','three')"
+            )
+            await writer.execute(
+                "UPDATE console_log_seq SET next_seq=3 WHERE consumer_id='game'"
+            )
+            await writer.commit()
+
+    async def spy_one(conn, query, args=()):
+        result = await real_one(conn, query, args)
+        if "FROM console_log_seq" in query:
+            state["cursor_read"] = True
+        return result
+
+    async def spy_rows(conn, query, args=()):
+        if (
+            "FROM console_log WHERE" in query
+            and state["cursor_read"]
+            and not state["injected"]
+        ):
+            state["injected"] = True
+            await inject_batch()
+        result = await real_rows(conn, query, args)
+        if (
+            "FROM console_log WHERE" in query
+            and not state["cursor_read"]
+            and not state["injected"]
+        ):
+            state["injected"] = True
+            await inject_batch()
+        return result
+
+    monkeypatch.setattr(core, "one", spy_one)
+    monkeypatch.setattr(core, "rows", spy_rows)
+    tail = await request(store, "GET", "/v2/console/logs?consumerId=game&since=2")
+    assert state["injected"], "the racing batch was not injected"
+    assert [e["seq"] for e in tail.json()["entries"]] == [3], tail.text
+    assert tail.json()["next"] == 3, tail.text
+    steady = await request(store, "GET", "/v2/console/logs?consumerId=game&since=3")
+    assert steady.json() == {"entries": [], "next": 3}, steady.text
+
+
+async def test_public_entrypoint_allowlist_limits_and_headers(store):
+    await service_token(store, "launcher", ["stats.read"])
+    extra = {"X-CP-Public": "1"}
+    # Agent/site/admin routes never pass on the public path, even authed.
+    for method, path in (
+        ("POST", "/v2/actions/console.run"),
+        ("POST", "/v2/console/suggest"),
+        ("POST", "/v2/console/logs"),
+        (
+            "GET",
+            "/v2/agents/game/events?epoch=00000000-0000-0000-0000-000000000000&cursor=0",
+        ),
+        ("GET", "/v2/operations/00000000-0000-0000-0000-000000000000"),
+        ("GET", "/v2/settings/catalog"),
+        ("GET", "/v2/openapi.json"),
+    ):
+        response = await request(store, method, path, None, "owner", extra)
+        assert response.status_code == 404, (method, path, response.text)
+    # The same routes stay reachable on the internal path (auth decides).
+    internal = await request(store, "GET", "/v2/settings/catalog", None, "owner")
+    assert internal.status_code == 200, internal.text
+    # Launcher stats reads pass on the public path; unscoped ones do not.
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 200
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "ordinary", extra)
+    ).status_code == 403
+    # Per-token public budget: 60/min; the 61st is refused, while the same
+    # token still passes internally (separate budgets).
+    for _ in range(59):
+        response = await request(
+            store, "GET", "/v2/stats/seasons", None, "launcher", extra
+        )
+        assert response.status_code == 200, response.text
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 429
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+    ).status_code == 200
+    # Every response carries the hardening headers.
+    health = await request(store, "GET", "/health", None, "ordinary", extra)
+    assert health.status_code == 200, health.text
+    for header, value in (
+        ("strict-transport-security", "max-age=3153600; includeSubDomains"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        ("content-security-policy", "default-src 'none'; frame-ancestors 'none'"),
+        ("cache-control", "no-store"),
+    ):
+        assert health.headers[header] == value, header
+
+
+async def test_public_entrypoint_rejects_stats_mutations(store):
+    # Method-scoped allowlist: even a credential holding the mutation scope
+    # cannot invoke it through the public entrypoint.
+    server = "22222222-2222-2222-2222-222222222222"
+    await _stats_token(store, server)
+    await _stats_token(store, _DIAG_SERVER, "stats-diag")
+    extra = {"X-CP-Public": "1"}
+    created = await request(
+        store,
+        "POST",
+        "/v2/stats/results",
+        _stats_campaign_body(),
+        "stats-producer",
+        extra,
+    )
+    assert created.status_code == 404, created.text
+    assert created.json() == {"error": "not_found"}
+    diag = await request(
+        store, "POST", "/v2/stats/diagnostics", _diag_body(), "stats-diag", extra
+    )
+    assert diag.status_code == 404, diag.text
+    assert diag.json() == {"error": "not_found"}
+    # Same mutations stay reachable on the internal path (auth decides).
+    assert (
+        await request(
+            store, "POST", "/v2/stats/results", _stats_campaign_body(), "stats-producer"
+        )
+    ).status_code == 201
+    void = await request(
+        store,
+        "POST",
+        "/v2/stats/results/void",
+        {
+            "serverId": server,
+            "eventId": "11111111-1111-1111-1111-111111111111",
+            "voided": True,
+        },
+        "admin",
+        extra,
+    )
+    assert void.status_code == 404, void.text
+    assert void.json() == {"error": "not_found"}
+
+
+@pytest.fixture
+def frozen_limits_window(monkeypatch):
+    """Pin the Limits minute window: a rollover mid-test clears every bucket."""
+    fixed = time.monotonic()
+
+    class Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        @staticmethod
+        def monotonic():
+            return fixed
+
+    monkeypatch.setattr(cpv2_app, "time", Clock())
+
+
+async def test_public_traffic_does_not_consume_shared_budget(
+    store, frozen_limits_window
+):
+    await service_token(store, "launcher", ["stats.read"])
+    extra = {"X-CP-Public": "1"}
+    for _ in range(10):
+        response = await request(
+            store, "GET", "/v2/stats/seasons", None, "launcher", extra
+        )
+        assert response.status_code == 200, response.text
+    assert store["app"].state.limiter.total == 0
+    internal = await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+    assert internal.status_code == 200, internal.text
+    assert store["app"].state.limiter.total == 1
+
+
+async def test_public_and_internal_buckets_are_fully_isolated(
+    store, frozen_limits_window
+):
+    # Public traffic must never consume an internal bucket and vice versa:
+    # each side 429s on its own exhausted budget while the other still
+    # passes. Buckets are filled directly (same 600/request limits the
+    # pipeline enforces) to keep the test to a handful of requests.
+    await service_token(store, "launcher", ["stats.read"])
+    await service_token(store, "launcher-b", ["stats.read"])
+    extra = {"X-CP-Public": "1"}
+    app = store["app"]
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 200
+    assert ("client", "launcher") not in app.state.limiter.buckets
+    assert app.state.limiter.total == 0
+    assert ("client", "launcher") in app.state.pub_limiter.buckets
+    before = dict(app.state.pub_limiter.buckets)
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+    ).status_code == 200
+    assert dict(app.state.pub_limiter.buckets) == before
+    assert ("client", "launcher") in app.state.limiter.buckets
+    # Exhausting the internal per-client bucket denies internal requests
+    # while the same client still passes over the public entrypoint.
+    for _ in range(600):
+        try:
+            app.state.limiter.check(
+                ("client", "launcher"), global_count=False, limit=600
+            )
+        except Problem:
+            break
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+    ).status_code == 429
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 200
+    # Exhausting the public per-client bucket denies public requests
+    # while internal requests from another client still pass.
+    for _ in range(600):
+        try:
+            app.state.pub_limiter.check(
+                ("client", "launcher-b"), global_count=False, limit=600
+            )
+        except Problem:
+            break
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher-b", extra)
+    ).status_code == 429
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher-b")
+    ).status_code == 200
