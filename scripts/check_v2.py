@@ -1,5 +1,6 @@
 """Pinned gate; ephemeral PostgreSQL comes from the locked pgserver wheel."""
 
+import os
 import signal
 import subprocess
 import sys
@@ -35,19 +36,32 @@ def main():
     # The full suite reports every failure (no --maxfail), so it gets a longer
     # budget; on timeout pytest gets SIGINT first so its fixtures tear the
     # ephemeral PostgreSQL down instead of being killed mid-run.
+    # Own session: the final kill takes pytest and its PostgreSQL child
+    # together, so a hung run never leaves the backend behind.
     pytest = subprocess.Popen(
-        [sys.executable, "-m", "pytest", "-q", *pytest_args], cwd=ROOT
+        [sys.executable, "-m", "pytest", "-q", *pytest_args],
+        cwd=ROOT,
+        start_new_session=True,
     )
-    try:
-        code = pytest.wait(timeout=1200)
-    except subprocess.TimeoutExpired:
-        pytest.send_signal(signal.SIGINT)
+
+    def stop():
+        # SIGINT first so fixtures tear the backend down; then the group.
+        os.killpg(pytest.pid, signal.SIGINT)
         try:
             pytest.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            pytest.kill()
+            os.killpg(pytest.pid, signal.SIGKILL)
             pytest.wait()
+
+    try:
+        code = pytest.wait(timeout=1200)
+    except subprocess.TimeoutExpired:
+        stop()
         raise SystemExit("pytest exceeded 20 minutes")
+    except KeyboardInterrupt:
+        # Ctrl+C reaches only this process (pytest has its own session).
+        stop()
+        raise
     if code:
         raise SystemExit(code)
 
