@@ -803,9 +803,17 @@ async def action(conn, identity, attempt, kind, body):
         else kind
     )
     identity.require(scope, data["environment"], data["backend"], data_target)
-    # Announce carries no human: its text is fixed in the game. Console lines
-    # may come from an owner-provisioned agent token without an actor.
-    actorless = kind in ("moderation.announce", "console.run")
+    # Announce carries no human: its text is fixed in the game. Read-only
+    # console lines need no actor either: the scope already restricts them
+    # to the allowlist (same privilege as a read). Any other console line
+    # may come from an owner-provisioned agent token without an actor, but
+    # only on an agent client (via "mcp", e.g. the approval-relay token): a
+    # bare service credential (the site console principal) must assert the
+    # logged-in human, or a site bug or compromise would run any command.
+    actorless = kind == "moderation.announce" or (
+        kind == "console.run"
+        and (payload["readOnly"] or identity.client["via"] == "mcp")
+    )
     if kind == "moderation.announce" and data["actorAccountId"] is not None:
         raise Problem("actor_forbidden")
     if identity.credential["kind"] == "service" and (
@@ -991,22 +999,28 @@ async def console_suggest(conn, identity, attempt, body):
     return await finish(conn, attempt, identity, op, {"input": text})
 
 
-async def console_suggest_output(db, wakeups, consumer_id, operation_id, timeout=None):
+async def console_suggest_output(
+    db, wakeups, consumer_id, operation_id, timeout=None, waiter=None
+):
     """Latest ack output for a console.suggest op, or None on timeout.
 
     The game answers over the agent channel like any other op; the site POST
     waits here instead of polling. Wakes come from the same LISTEN/NOTIFY
     machinery the agent SSE streams use (delivery.acknowledge notifies the
     consumer id on every ack), but from a separate waiter namespace so full
-    agent streams cannot starve completions.
+    agent streams cannot starve completions. The caller takes the waiter
+    slot before enqueueing (see the app handler): without it a request
+    would queue a frame it cannot wait for and fill the consumer lag window.
     """
     deadline = time.monotonic() + (
         CONSOLE_SUGGEST_WAIT_SECONDS if timeout is None else timeout
     )
-    try:
-        waiter = wakeups.subscribe_suggest(consumer_id)
-    except Problem:
-        return None
+    owned = waiter is None
+    if owned:
+        try:
+            waiter = wakeups.subscribe_suggest(consumer_id)
+        except Problem:
+            return None
     try:
         while True:
             waiter.clear()
@@ -1108,7 +1122,10 @@ async def console_log_ingest(conn, identity, attempt, consumer_id, body):
             or len(message) > CONSOLE_LOG_MESSAGE_MAX
         ):
             raise Problem("invalid_console_log", 422)
-        cleaned.append((at, level.upper(), logger, message))
+        # Raw server lines may carry player addresses or echoed owner
+        # commands: redact on ingest like the diagnostics path, so the ring
+        # never stores them in the clear.
+        cleaned.append((at, level.upper(), logger, _diag_redact(message)))
     # The cursor lives outside the retained rows: retention may delete every
     # row and concurrent batches still serialize on this row lock.
     current = await one(
@@ -1163,7 +1180,7 @@ async def console_log_read(conn, identity, consumer_id, since):
     )
     found = await rows(
         conn,
-        "SELECT seq,EXTRACT(EPOCH FROM at)::bigint*1000 AS at,level,logger,message FROM console_log WHERE consumer_id=%s AND seq>%s ORDER BY seq LIMIT 500",
+        "SELECT seq,FLOOR(EXTRACT(EPOCH FROM at))::bigint*1000 AS at,level,logger,message FROM console_log WHERE consumer_id=%s AND seq>%s ORDER BY seq LIMIT 500",
         (consumer_id, since),
     )
     latest_seq = latest["seq"] if latest else since

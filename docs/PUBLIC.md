@@ -1,90 +1,118 @@
 # Публичная точка входа control plane
 
-CP держит доступ из интернета на отдельной публичной точке входа, а не на
-приватном приложении. Приложение Dokploy `blockfield-control-plane` остаётся
-private network only, без ingress: публичный домен ведёт на CP только через
-маршрут Traefik, который ставит заголовок `X-CP-Public: 1` (код:
-[`app.py`](../cpv2/app.py) `PUBLIC_ENTRYPOINT_HEADER`, `public_allowed`).
+CP работает дважды из одного образа:
+
+- внутренний экземпляр (по умолчанию): полный API, заголовок `X-CP-Public`
+  игнорируется полностью — перевести его в публичный режим запросом нельзя;
+- публичный экземпляр (`CP_PUBLIC_ONLY=1`): только точный allowlist ниже,
+  со своими лимитами соединений, пулом БД и бюджетами.
+
+Публичный домен ведёт только на публичный экземпляр (маршрут Traefik, см.
+настройку ниже). Внутренний экземпляр остаётся private network only, без
+домена и без опубликованного порта.
 
 ## Что разрешено снаружи
 
-Allowlist публичного маршрута — только пробы и чтения статистики:
+Точный список, ничего сверх (хит-рег и диагностика — только для персонала,
+никогда не публичны):
 
-- `GET /health`
-- `GET /v2/stats/*`
+- `GET`/`HEAD /health`
+- `GET`/`HEAD /v2/stats/seasons`, `/v2/stats/leaderboard`, `/v2/stats/players/{uuid}`
+  — анонимно, без токена (решение владельца «Без токена»); токен бота со
+  скопом `stats.read` тоже работает;
+- `POST /v2/actions/console.run` — только аутентифицированно; скоп решает:
+  `console.read` выполняет лишь read-only allowlist, остальное — `403`
+  (исполнение не-read-only строк идёт через approval-relay, см. ниже);
+- `GET /v2/operations/{id}` — только аутентифицированно, только своя операция
+  (читает выпустивший креденшел; чужое — `403`/`404`).
 
-Всё остальное (actions, acks, operations, settings, console, agents, audit,
-openapi) на публичном маршруте отвечает `404`, даже с валидным токеном.
-Тот же запрос внутри приватной сети работает как обычно — решает аутентификация.
+Всё остальное на публичном экземпляре отвечает `404`, даже с валидным
+токеном. Тот же запрос внутри приватной сети работает как обычно — решает
+аутентификация. Продление креденшела (`/v2/credentials/renew`) снаружи
+недоступно.
 
-## Лимиты публичного маршрута
+## Лимиты публичного экземпляра
 
-Независимо от общего бюджета (1000/мин на аутентифицированные запросы):
+Независимо от внутреннего бюджета (1000/мин на аутентифицированные запросы):
 
-- per-IP: 120/мин;
-- per-token: 60/мин (одного токена лаунчера/бота хватает с запасом: опрос статистики идёт раз в десятки секунд).
+- pre-auth бюджет до любых проверок и обращений к БД: per-IP 120/мин плюс
+  общий публичный 2000/мин (тот же счётчик);
+- per-ключ: 120/мин; per-token: 60/мин;
+- неверная аутентификация списывается с отдельного малого бюджета (100/мин):
+  внутренний вызов с неверным bearer получает `401` от внутреннего бюджета,
+  флуд снаружи на это не влияет;
+- пул БД публичного экземпляра — свой (`CP_DB_POOL_MAX`, по умолчанию 4
+  против 8 у внутреннего), соединения/лимиты — свои
+  (`CP_LIMIT_CONCURRENCY`, по умолчанию 32 против 96);
+- анонимные чтения статистики кешируются на 20 с.
 
-Флуд снаружи не сжигает бюджет внутренних агентов: бюджеты не пересекаются.
+## Переменные окружения
 
-## Заголовки и лимиты тела
+| Переменная                  | Внутренний | Публичный            |
+| --------------------------- | ---------- | -------------------- |
+| `CP_PUBLIC_ONLY`            | unset      | `1`                  |
+| `CP_LIMIT_CONCURRENCY`      | `96`       | `32`                 |
+| `CP_DB_POOL_MAX`            | `8`        | `4`                  |
+| `CP_PUBLIC_TRUSTED_PROXIES` | —          | список прокси (ниже) |
 
-Каждый ответ несёт:
-
-- `Strict-Transport-Security: max-age=3153600; includeSubDomains`
-- `X-Content-Type-Options: nosniff`
-- `X-Frame-Options: DENY`
-- `Referrer-Policy: no-referrer`
-- `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
-- `Cache-Control: no-store`
-
-Лимиты тела запроса (413 сверх лимита):
-
-| Путь                    | Лимит |
-| ----------------------- | ----- |
-| `/v2/stats/results`     | 1 МБ  |
-| `/v2/stats/diagnostics` | 1 МБ  |
-| `/v2/console/logs`      | 64 КБ |
-| `/v2/console/suggest`   | 4 КБ  |
-| остальные мутации       | 32 КБ |
+`CP_PUBLIC_TRUSTED_PROXIES` — адреса/CIDR прокси перед CP через запятую
+(обычно адрес Traefik в docker-сети). Пусто по умолчанию: все запросы
+кладутся на адрес соединения. IPv6 ключируется по /64 (один /64 — один
+бакет), `::ffff:1.2.3.4` — как IPv4, записи с портом разбираются, мусор в
+цепочке — откат на адрес соединения.
 
 ## Настройка Traefik/Dokploy (делает владелец, в этом PR не применено)
 
-1. Публичный домен ведёт на CP отдельным маршрутом Traefik (не ingress
-   приватного приложения, оно остаётся без домена).
-2. Маршрут снимает клиентское значение `X-CP-Public`, если оно пришло
-   снаружи, и ставит `X-CP-Public: 1` — только этот маршрут вправе его ставить.
-   Заголовку можно доверять: прямой доступ в контейнер требует root homeserver.
-3. Пример фрагмента file provider (имена — под стенд владельца):
+1. Второй Dokploy-сервис из того же образа с `CP_PUBLIC_ONLY=1` и своим
+   `CP_PORT`; внутренний сервис остаётся без домена.
+2. Один роутер: точное `Host`-правило публичного домена на HTTPS entrypoint,
+   сервис — только публичный экземпляр. Никакого Dokploy-домена на CP,
+   никакого catch-all/path-only роутера, никакого опубликованного порта
+   контейнера.
+3. Клиентское значение `X-CP-Public` снимать (на всякий случай: CP его
+   игнорирует, но пусть не путешествует дальше).
+4. Фильтр метода и пути на краю, чтобы ошибка роутинга ничего не открыла:
+   `Method(GET,HEAD)` + точные пути, отдельным правилом — `Method(POST)` +
+   `Path(/v2/actions/console.run)` и `Method(GET)` + `PathPrefix(/v2/operations/)`.
+5. Доверенные адреса: на публичном entrypoint в `forwardedHeaders.trustedIPs`
+   указать реальные апстрим-прокси, и те же адреса — в
+   `CP_PUBLIC_TRUSTED_PROXIES` публичного экземпляра.
+6. Лимиты раньше CP: `inFlightReq` (существенно ниже 32, по хосту) плюс
+   `rateLimit` по адресу клиента.
+7. Таймауты read/write/idle на entrypoint — явно (у uvicorn нет таймаута
+   заголовка). Только HTTPS (редирект/отказ plain HTTP). Access log без
+   заголовков; без retry и CORS middlewares на этом роутере. Заголовки
+   безопасности ставит сам CP; 503 Traefik/uvicorn их не несут — при желании
+   продублировать `headers` middleware на роутере.
 
-   ```yaml
-   http:
-     routers:
-       cp-public:
-         rule: "Host(`cp.example.com`)"
-         service: blockfield-control-plane
-         middlewares: [cp-public-headers]
-     middlewares:
-       cp-public-headers:
-         headers:
-           customRequestHeaders:
-             X-CP-Public: "1"
-   ```
+```yaml
+http:
+  routers:
+    cp-public-get:
+      rule: "Host(`<public-domain>`) && (Method(`GET`) || Method(`HEAD`)) && (Path(`/health`) || Path(`/v2/stats/seasons`) || Path(`/v2/stats/leaderboard`) || PathPrefix(`/v2/stats/players/`) || PathPrefix(`/v2/operations/`))"
+      entryPoints: [websecure]
+      service: <cp-public-service>
+      middlewares: [cp-public-strip, cp-public-inflight, cp-public-rate]
+    cp-public-console-run:
+      rule: "Host(`<public-domain>`) && Method(`POST`) && Path(`/v2/actions/console.run`)"
+      entryPoints: [websecure]
+      service: <cp-public-service>
+      middlewares: [cp-public-strip, cp-public-inflight, cp-public-rate]
+  middlewares:
+    cp-public-strip:
+      headers:
+        customRequestHeaders:
+          X-CP-Public: ""
+    cp-public-inflight:
+      inFlightReq:
+        amount: 16
+        sourceCriterion:
+          requestHost: true
+    cp-public-rate:
+      rateLimit:
+        average: 4
+        burst: 20
+```
 
-   Если между клиентом и Traefik есть ещё прокси, он тоже должен снимать
-   входящий `X-CP-Public` до Traefik.
-
-4. Лимит per-IP считает адрес клиента из `X-Forwarded-For`: берётся запись,
-   которую дописал доверенный прокси, записи левее игнорируются. Число
-   доверенных прокси перед CP задаёт `CP_PUBLIC_TRUSTED_HOPS` (по умолчанию 1 —
-   только Traefik). Если перед Traefik стоит ещё один прокси, нужны оба шага,
-   иначе все клиенты за ним разделят один лимит:
-   - в Traefik на публичном entrypoint указать адреса этого прокси в
-     `forwardedHeaders.trustedIPs` — без этого Traefik отбрасывает пришедший
-     `X-Forwarded-For` и CP видит цепочку из одной записи (адрес прокси);
-   - поставить `CP_PUBLIC_TRUSTED_HOPS=2`.
-
-   При цепочке короче, чем число доверенных прокси, CP берёт адрес соединения
-   (общий лимит), а не клиентское значение.
-
-5. Health check Dokploy остаётся внутренним `GET /health` (см. [DEPLOY](DEPLOY.md));
-   публичный маршрут его не заменяет.
+8. Health check Dokploy остаётся внутренним `GET /health` (см. [DEPLOY](DEPLOY.md));
+   на публичном экземпляре `/health` отдаёт только `{"status":"ok"}` без версии схемы.
