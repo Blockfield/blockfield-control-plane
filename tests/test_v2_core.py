@@ -10513,7 +10513,9 @@ async def test_public_and_internal_buckets_are_fully_isolated(
     # while the same client still passes over the public entrypoint.
     for _ in range(600):
         try:
-            app.state.limiter.check(("client", "launcher"), global_count=False)
+            app.state.limiter.check(
+                ("client", "launcher"), global_count=False, limit=600
+            )
         except Problem:
             break
     assert (
@@ -10526,7 +10528,9 @@ async def test_public_and_internal_buckets_are_fully_isolated(
     # while internal requests from another client still pass.
     for _ in range(600):
         try:
-            app.state.pub_limiter.check(("client", "launcher-b"), global_count=False)
+            app.state.pub_limiter.check(
+                ("client", "launcher-b"), global_count=False, limit=600
+            )
         except Problem:
             break
     assert (
