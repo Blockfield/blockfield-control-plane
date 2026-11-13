@@ -673,7 +673,9 @@ SERVER_WIDE_KINDS = ("console.run", "moderation.maintenance", "moderation.announ
 # console.run. The game and the agent MCP enforce the same list.
 CONSOLE_READ_ONLY = re.compile(
     r"list( uuids)?|tick query|bf maintenance status|banlist( players| ips)?"
-    r"|whitelist list|spark (tps|health|gc|tickmonitor)( --?[a-z-]+| [0-9]+)*"
+    # spark health only with local flags: --upload sends the report off-site;
+    # tickmonitor is out: it starts and stops a monitor.
+    r"|whitelist list|spark (tps|gc)|spark health( --(memory|network))*"
 )
 MODERATION_PLAYER = re.compile(r"[A-Za-z0-9_]{3,16}")
 MODERATION_CLASS = re.compile(r"[a-z0-9_]{1,32}")

@@ -1137,8 +1137,15 @@ async def test_maintenance_kinds_and_ack_output_round_trip(store):
 
 async def test_console_run_scopes_allowlist_and_audit(store):
     assert core.CONSOLE_READ_ONLY.fullmatch("spark health --memory")
-    assert core.CONSOLE_READ_ONLY.fullmatch("spark tickmonitor --threshold 100")
-    for unsafe in ("op Steve", "list; stop", "listx", "spark profiler start", "stop"):
+    for unsafe in (
+        "op Steve",
+        "list; stop",
+        "listx",
+        "spark profiler start",
+        "stop",
+        "spark tickmonitor --stop",
+        "spark health --upload",
+    ):
         assert not core.CONSOLE_READ_ONLY.fullmatch(unsafe), unsafe
     # Admins hold only console.read; moderators no console scope at all.
     assert (
