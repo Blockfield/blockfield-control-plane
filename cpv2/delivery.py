@@ -30,6 +30,9 @@ class Wakeups:
     def __init__(self, dsn):
         self.dsn = dsn
         self.waiters = defaultdict(set)
+        # Completion waiters never take agent stream slots: with the stream
+        # limit reached, a completion would otherwise 504 immediately.
+        self.suggest_waiters = defaultdict(set)
         self.ready = asyncio.Event()
         self.task = None
 
@@ -51,7 +54,10 @@ class Wakeups:
                 ) as conn:
                     await conn.execute("LISTEN cp_events")
                     self.ready.set()
-                    for waiters in self.waiters.values():
+                    for waiters in (
+                        *self.waiters.values(),
+                        *self.suggest_waiters.values(),
+                    ):
                         for waiter in waiters:
                             waiter.set()
                     async for notification in conn.notifies():
@@ -62,6 +68,8 @@ class Wakeups:
                         )
                         for cid in ids:
                             for waiter in self.waiters.get(cid, ()):
+                                waiter.set()
+                            for waiter in self.suggest_waiters.get(cid, ()):
                                 waiter.set()
             except psycopg.Error:
                 # Bounded stream recovery sweep also drains while LISTEN reconnects.
@@ -81,6 +89,18 @@ class Wakeups:
         self.waiters[consumer].discard(waiter)
         if not self.waiters[consumer]:
             del self.waiters[consumer]
+
+    def subscribe_suggest(self, consumer):
+        if sum(len(items) for items in self.suggest_waiters.values()) >= 64:
+            raise Problem("stream_limit", 429)
+        waiter = asyncio.Event()
+        self.suggest_waiters[consumer].add(waiter)
+        return waiter
+
+    def unsubscribe_suggest(self, consumer, waiter):
+        self.suggest_waiters[consumer].discard(waiter)
+        if not self.suggest_waiters[consumer]:
+            del self.suggest_waiters[consumer]
 
 
 async def consumer_for(conn, identity, consumer_id, scope):

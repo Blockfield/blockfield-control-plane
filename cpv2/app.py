@@ -52,7 +52,12 @@ def public_entrypoint(request):
     return request.headers.get(PUBLIC_ENTRYPOINT_HEADER) == "1"
 
 
-def public_allowed(path):
+def public_allowed(method, path):
+    # Reads only: mutations (POST stats ingest/diagnostics/void, console,
+    # actions, acks, settings) 404 on the public entrypoint even with a
+    # valid token, per docs/PUBLIC.md.
+    if method not in ("GET", "HEAD"):
+        return False
     return path == "/health" or path.startswith("/v2/stats/")
 
 
@@ -179,6 +184,9 @@ def create_app(dsn=None):
     # bearer strings cannot burn the shared budget that health checks and
     # authenticated agents rely on.
     unauth_limiter = Limits(budget=100)
+    # Handle for the shared-budget isolation test: public traffic must not
+    # consume the internal budget (see the pipeline's global_count below).
+    app.state.limiter = limiter
 
     @app.exception_handler(Problem)
     async def problem_handler(request, error):
@@ -217,7 +225,7 @@ def create_app(dsn=None):
             # with a valid token, so a scoped public token cannot reach
             # actions, acks or settings from the internet.
             entry_public = public_entrypoint(request)
-            if entry_public and not public_allowed(request.url.path):
+            if entry_public and not public_allowed(request.method, request.url.path):
                 return secure(JSONResponse({"error": "not_found"}, status_code=404))
             # Per-key bound only: pre-auth traffic must not burn the shared
             # budget, which counts authenticated requests below.
@@ -268,9 +276,13 @@ def create_app(dsn=None):
                     )
                 if identity.actor:
                     limiter.check(("actor", str(identity.actor)), global_count=False)
-                # The shared budget counts authenticated requests only.
+                # The shared budget counts authenticated internal requests only:
+                # public traffic stays on the pub_ip/pub_token budgets above,
+                # so a public flood cannot deny internal agents.
                 limiter.check(
-                    ("client", identity.client["id"]), global_count=True, limit=600
+                    ("client", identity.client["id"]),
+                    global_count=not entry_public,
+                    limit=600,
                 )
                 limiter.check(
                     (

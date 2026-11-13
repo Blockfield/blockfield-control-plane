@@ -22,6 +22,7 @@ MIGRATIONS = [
     "009_credential_renewals.sql",
     "010_console_capabilities.sql",
     "011_console_stream.sql",
+    "012_console_seq.sql",
 ]
 
 

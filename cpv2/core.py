@@ -997,13 +997,14 @@ async def console_suggest_output(db, wakeups, consumer_id, operation_id, timeout
     The game answers over the agent channel like any other op; the site POST
     waits here instead of polling. Wakes come from the same LISTEN/NOTIFY
     machinery the agent SSE streams use (delivery.acknowledge notifies the
-    consumer id on every ack).
+    consumer id on every ack), but from a separate waiter namespace so full
+    agent streams cannot starve completions.
     """
     deadline = time.monotonic() + (
         CONSOLE_SUGGEST_WAIT_SECONDS if timeout is None else timeout
     )
     try:
-        waiter = wakeups.subscribe(consumer_id)
+        waiter = wakeups.subscribe_suggest(consumer_id)
     except Problem:
         return None
     try:
@@ -1025,7 +1026,7 @@ async def console_suggest_output(db, wakeups, consumer_id, operation_id, timeout
             except TimeoutError:
                 return None
     finally:
-        wakeups.unsubscribe(consumer_id, waiter)
+        wakeups.unsubscribe_suggest(consumer_id, waiter)
 
 
 def check_suggest_output(output):
@@ -1107,18 +1108,24 @@ async def console_log_ingest(conn, identity, attempt, consumer_id, body):
         ):
             raise Problem("invalid_console_log", 422)
         cleaned.append((at, level.upper(), logger, message))
+    # The cursor lives outside the retained rows: retention may delete every
+    # row and concurrent batches still serialize on this row lock.
     current = await one(
         conn,
-        "SELECT COALESCE(MAX(seq),0) AS seq FROM console_log WHERE consumer_id=%s",
+        "INSERT INTO console_log_seq(consumer_id,next_seq) VALUES(%s,0) ON CONFLICT(consumer_id) DO UPDATE SET consumer_id=EXCLUDED.consumer_id RETURNING next_seq",
         (consumer_id,),
     )
-    seq = current["seq"]
+    seq = current["next_seq"]
     for at, level, logger, message in cleaned:
         seq += 1
         await conn.execute(
             "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES(%s,%s,to_timestamp(%s/1000.0),%s,%s,%s)",
             (consumer_id, seq, at, level, logger, message),
         )
+    await conn.execute(
+        "UPDATE console_log_seq SET next_seq=%s WHERE consumer_id=%s",
+        (seq, consumer_id),
+    )
     await conn.execute(
         "DELETE FROM console_log WHERE consumer_id=%s AND (at < now() - make_interval(hours => %s) OR seq <= (SELECT COALESCE(MAX(seq),0) FROM console_log WHERE consumer_id=%s) - %s)",
         (consumer_id, CONSOLE_LOG_RETENTION_HOURS, consumer_id, CONSOLE_LOG_MAX_KEPT),
@@ -1150,9 +1157,10 @@ async def console_log_read(conn, identity, consumer_id, since):
     )
     latest = await one(
         conn,
-        "SELECT COALESCE(MAX(seq),%s) AS seq FROM console_log WHERE consumer_id=%s",
-        (since, consumer_id),
+        "SELECT next_seq AS seq FROM console_log_seq WHERE consumer_id=%s",
+        (consumer_id,),
     )
+    latest_seq = latest["seq"] if latest else since
     return {
         "entries": [
             {
@@ -1164,7 +1172,7 @@ async def console_log_read(conn, identity, consumer_id, since):
             }
             for row in found
         ],
-        "next": found[-1]["seq"] if found else latest["seq"],
+        "next": found[-1]["seq"] if found else latest_seq,
     }
 
 
