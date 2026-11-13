@@ -180,13 +180,19 @@ def create_app(dsn=None):
     # internal shared budget, so a public flood cannot deny internal agents.
     pub_ip_limiter = Limits()
     pub_token_limiter = Limits()
+    # Every per-key bucket a public request touches lives here, never in
+    # limiter: public per-client/per-token/per-IP buckets are fully separate
+    # objects, so public traffic cannot exhaust internal budgets and
+    # internal traffic cannot exhaust public ones. Same limits as internal.
+    pub_limiter = Limits()
     # Never-authenticated traffic draws from a separate small budget, so garbage
     # bearer strings cannot burn the shared budget that health checks and
     # authenticated agents rely on.
     unauth_limiter = Limits(budget=100)
-    # Handle for the shared-budget isolation test: public traffic must not
-    # consume the internal budget (see the pipeline's global_count below).
+    # Handles for the bucket-isolation tests: public traffic must not
+    # consume any internal bucket and vice versa.
     app.state.limiter = limiter
+    app.state.pub_limiter = pub_limiter
 
     @app.exception_handler(Problem)
     async def problem_handler(request, error):
@@ -227,9 +233,12 @@ def create_app(dsn=None):
             entry_public = public_entrypoint(request)
             if entry_public and not public_allowed(request.method, request.url.path):
                 return secure(JSONResponse({"error": "not_found"}, status_code=404))
+            # Public requests draw every per-key bucket from pub_limiter and
+            # the pub_ip/pub_token budgets, never from the internal limiter.
+            budget = pub_limiter if entry_public else limiter
             # Per-key bound only: pre-auth traffic must not burn the shared
             # budget, which counts authenticated requests below.
-            limiter.check(key, global_count=False)
+            budget.check(key, global_count=False)
             if entry_public:
                 pub_ip_limiter.check(
                     request.client.host if request.client else "unknown",
@@ -275,16 +284,17 @@ def create_app(dsn=None):
                         limit=60,
                     )
                 if identity.actor:
-                    limiter.check(("actor", str(identity.actor)), global_count=False)
+                    budget.check(("actor", str(identity.actor)), global_count=False)
                 # The shared budget counts authenticated internal requests only:
-                # public traffic stays on the pub_ip/pub_token budgets above,
-                # so a public flood cannot deny internal agents.
-                limiter.check(
+                # public traffic stays on pub_limiter (plus the pub_ip/pub_token
+                # budgets above), so a public flood cannot deny internal agents
+                # and internal traffic cannot deny public readers.
+                budget.check(
                     ("client", identity.client["id"]),
                     global_count=not entry_public,
                     limit=600,
                 )
-                limiter.check(
+                budget.check(
                     (
                         "resource",
                         str(identity.actor or identity.client["id"]),

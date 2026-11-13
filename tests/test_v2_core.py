@@ -5918,6 +5918,21 @@ async def test_owner_enroll_names_second_founder_explicitly(store, postgres):
         await enroll_owner(fresh, uuid4(), "first", second)
 
 
+async def test_fresh_database_reaches_latest_schema_and_health(store):
+    # A newly initialized database must end at len(MIGRATIONS) with no
+    # second migrate run: health requires the latest version, and log
+    # ingestion needs the newest tables from the start.
+    from cpv2.db import MIGRATIONS
+
+    applied = await sql(store, "SELECT MAX(version) AS version FROM schema_migrations")
+    assert applied[0]["version"] == len(MIGRATIONS)
+    seq = await sql(store, "SELECT to_regclass('control.console_log_seq') AS name")
+    assert seq[0]["name"] == "console_log_seq"
+    health = await request(store, "GET", "/health")
+    assert health.status_code == 200, health.text
+    assert health.json()["schema"] == len(MIGRATIONS)
+
+
 async def test_workshop_rbac_mirrors_moderation_split(store):
     # Builders cannot issue; moderators handle member-level ops only.
     await bind(store, "moderator")
@@ -10261,6 +10276,71 @@ async def test_console_log_cursor_survives_full_retention(store):
     assert tail.json()["next"] == 3
 
 
+async def test_console_tail_never_skips_racing_batch(store, monkeypatch):
+    # A batch committing between the page and cursor reads must not be
+    # skipped: the cursor is read first, so the page snapshot always covers
+    # it. The spy injects the commit on the losing side of the race for
+    # both statement orders: before the page fetch when the cursor was
+    # already read (fixed order), after it when the cursor is still pending
+    # (old order, which then advances next past the unseen row).
+    now_ms = int(time.time() * 1000)
+    pushed = await request(
+        store,
+        "POST",
+        "/v2/console/logs",
+        log_batch(store, "log", [log_entry(now_ms, "one"), log_entry(now_ms, "two")]),
+        "game-agent",
+    )
+    assert pushed.json()["next"] == 2, pushed.text
+    real_one, real_rows = core.one, core.rows
+    state = {"cursor_read": False, "injected": False}
+
+    async def inject_batch():
+        async with await psycopg.AsyncConnection.connect(
+            store["admin"], options="-c search_path=control,pg_catalog"
+        ) as writer:
+            await writer.execute(
+                "INSERT INTO console_log(consumer_id,seq,at,level,logger,message) VALUES('game',3,now(),'INFO','Minecraft','three')"
+            )
+            await writer.execute(
+                "UPDATE console_log_seq SET next_seq=3 WHERE consumer_id='game'"
+            )
+            await writer.commit()
+
+    async def spy_one(conn, query, args=()):
+        result = await real_one(conn, query, args)
+        if "FROM console_log_seq" in query:
+            state["cursor_read"] = True
+        return result
+
+    async def spy_rows(conn, query, args=()):
+        if (
+            "FROM console_log WHERE" in query
+            and state["cursor_read"]
+            and not state["injected"]
+        ):
+            state["injected"] = True
+            await inject_batch()
+        result = await real_rows(conn, query, args)
+        if (
+            "FROM console_log WHERE" in query
+            and not state["cursor_read"]
+            and not state["injected"]
+        ):
+            state["injected"] = True
+            await inject_batch()
+        return result
+
+    monkeypatch.setattr(core, "one", spy_one)
+    monkeypatch.setattr(core, "rows", spy_rows)
+    tail = await request(store, "GET", "/v2/console/logs?consumerId=game&since=2")
+    assert state["injected"], "the racing batch was not injected"
+    assert [e["seq"] for e in tail.json()["entries"]] == [3], tail.text
+    assert tail.json()["next"] == 3, tail.text
+    steady = await request(store, "GET", "/v2/console/logs?consumerId=game&since=3")
+    assert steady.json() == {"entries": [], "next": 3}, steady.text
+
+
 async def test_public_entrypoint_allowlist_limits_and_headers(store):
     await service_token(store, "launcher", ["stats.read"])
     extra = {"X-CP-Public": "1"}
@@ -10372,3 +10452,52 @@ async def test_public_traffic_does_not_consume_shared_budget(store):
     internal = await request(store, "GET", "/v2/stats/seasons", None, "launcher")
     assert internal.status_code == 200, internal.text
     assert store["app"].state.limiter.total == 1
+
+
+async def test_public_and_internal_buckets_are_fully_isolated(store):
+    # Public traffic must never consume an internal bucket and vice versa:
+    # each side 429s on its own exhausted budget while the other still
+    # passes. Buckets are filled directly (same 600/request limits the
+    # pipeline enforces) to keep the test to a handful of requests.
+    await service_token(store, "launcher", ["stats.read"])
+    await service_token(store, "launcher-b", ["stats.read"])
+    extra = {"X-CP-Public": "1"}
+    app = store["app"]
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 200
+    assert ("client", "launcher") not in app.state.limiter.buckets
+    assert app.state.limiter.total == 0
+    assert ("client", "launcher") in app.state.pub_limiter.buckets
+    before = dict(app.state.pub_limiter.buckets)
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+    ).status_code == 200
+    assert dict(app.state.pub_limiter.buckets) == before
+    assert ("client", "launcher") in app.state.limiter.buckets
+    # Exhausting the internal per-client bucket denies internal requests
+    # while the same client still passes over the public entrypoint.
+    for _ in range(600):
+        try:
+            app.state.limiter.check(("client", "launcher"), global_count=False)
+        except Problem:
+            break
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+    ).status_code == 429
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
+    ).status_code == 200
+    # Exhausting the public per-client bucket denies public requests
+    # while internal requests from another client still pass.
+    for _ in range(600):
+        try:
+            app.state.pub_limiter.check(("client", "launcher-b"), global_count=False)
+        except Problem:
+            break
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher-b", extra)
+    ).status_code == 429
+    assert (
+        await request(store, "GET", "/v2/stats/seasons", None, "launcher-b")
+    ).status_code == 200

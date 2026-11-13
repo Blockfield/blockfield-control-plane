@@ -1150,15 +1150,20 @@ async def console_log_read(conn, identity, consumer_id, since):
     identity.require("console.read", consumer["environment"], consumer["backend"], "*")
     if not isinstance(since, int) or isinstance(since, bool) or since < 0:
         raise Problem("invalid_console_cursor", 422)
-    found = await rows(
-        conn,
-        "SELECT seq,EXTRACT(EPOCH FROM at)::bigint*1000 AS at,level,logger,message FROM console_log WHERE consumer_id=%s AND seq>%s ORDER BY seq LIMIT 500",
-        (consumer_id, since),
-    )
+    # The cursor is read before the page: under read-committed the entries
+    # snapshot is then newer-or-equal, so an empty page can only mean those
+    # rows were pruned, never rows the reader skipped past. Reading the
+    # cursor after the page had the opposite hazard: a batch committing
+    # between the two statements advanced next past unseen rows.
     latest = await one(
         conn,
         "SELECT next_seq AS seq FROM console_log_seq WHERE consumer_id=%s",
         (consumer_id,),
+    )
+    found = await rows(
+        conn,
+        "SELECT seq,EXTRACT(EPOCH FROM at)::bigint*1000 AS at,level,logger,message FROM console_log WHERE consumer_id=%s AND seq>%s ORDER BY seq LIMIT 500",
+        (consumer_id, since),
     )
     latest_seq = latest["seq"] if latest else since
     return {

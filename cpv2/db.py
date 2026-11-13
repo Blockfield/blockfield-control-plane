@@ -153,83 +153,13 @@ async def migrate(dsn, expected_database):
                     definition.sensitivity,
                 ),
             )
-        await conn.execute(
-            (ROOT / "migrations/002_site_sessions.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(2,%s)",
-            (checksums["002_site_sessions.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/003_site_stats.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(3,%s)",
-            (checksums["003_site_stats.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/004_schema_migrations_read.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(4,%s)",
-            (checksums["004_schema_migrations_read.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/005_site_stats_reads.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(5,%s)",
-            (checksums["005_site_stats_reads.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/006_stat_rating_rebuilds.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(6,%s)",
-            (checksums["006_stat_rating_rebuilds.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/007_site_diagnostics.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(7,%s)",
-            (checksums["007_site_diagnostics.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/008_consumer_rotation.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(8,%s)",
-            (checksums["008_consumer_rotation.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/009_credential_renewals.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(9,%s)",
-            (checksums["009_credential_renewals.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/010_console_capabilities.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(10,%s)",
-            (checksums["010_console_capabilities.sql"],),
-        )
-        await conn.execute(
-            (ROOT / "migrations/011_console_stream.sql").read_bytes().decode(),
-            prepare=False,
-        )
-        await conn.execute(
-            "INSERT INTO control.schema_migrations VALUES(11,%s)",
-            (checksums["011_console_stream.sql"],),
-        )
+        for version, name in enumerate(migrations[1:], start=2):
+            # Every migration after the seeded core, definitions included:
+            # the fresh schema always ends at len(MIGRATIONS) by construction.
+            await conn.execute(
+                (ROOT / "migrations" / name).read_bytes().decode(), prepare=False
+            )
+            await conn.execute(
+                "INSERT INTO control.schema_migrations VALUES(%s,%s)",
+                (version, checksums[name]),
+            )
