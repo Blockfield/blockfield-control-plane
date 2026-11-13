@@ -1205,6 +1205,10 @@ async def test_console_run_scopes_allowlist_and_audit(store):
         "SELECT detail FROM audit_events WHERE action='console.run' AND outcome='accepted' AND detail ? 'command'",
     )
     assert {row["detail"]["command"] for row in trail} == {"list", "op Steve"}
+    # Receipts are contiguous: the first frame settles before the second.
+    await ack_chain(
+        store, frames[0], output="There are 0 of a max of 40 players online:"
+    )
     await ack_chain(store, frames[1], output="Made Steve a server operator")
     result = await request(
         store, "GET", f"/v2/operations/{run.json()['operationId']}", role="owner"
