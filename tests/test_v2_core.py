@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import random
 import secrets
@@ -12,8 +13,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import cbor2
@@ -36,7 +39,7 @@ from cpv2.admin import (
     provision,
     revoke as revoke_credential,
 )
-from cpv2.app import create_app
+from cpv2.app import create_app, raw_path
 from cpv2.auth import (
     OWNER_SCOPES,
     ROLE_SCOPES,
@@ -1034,11 +1037,11 @@ def console_body(store, key, command, **extra):
     }
 
 
-async def service_token(store, client, ceiling):
+async def service_token(store, client, ceiling, via="game"):
     store["tokens"][client] = await provision(
         store["admin"],
         {
-            "client": {"id": client, "via": "game", "ceiling": ceiling},
+            "client": {"id": client, "via": via, "ceiling": ceiling},
             "ceiling": ceiling,
             "environment": "prod",
             "backend": "game",
@@ -1255,7 +1258,7 @@ async def test_console_service_tokens_read_only_and_owner_assertion(store):
         store, "GET", f"/v2/operations/{tick.json()['operationId']}", role="agent-read"
     )
     assert own.status_code == 200, own.text
-    await service_token(store, "agent-run", ["console.read", "console.run"])
+    await service_token(store, "agent-run", ["console.read", "console.run"], via="mcp")
     stop = await request(
         store,
         "POST",
@@ -10351,103 +10354,547 @@ async def test_console_tail_never_skips_racing_batch(store, monkeypatch):
     assert steady.json() == {"entries": [], "next": 3}, steady.text
 
 
-async def test_public_entrypoint_allowlist_limits_and_headers(store):
+@asynccontextmanager
+async def public_app(store, monkeypatch, **env):
+    """A second create_app from the same image with CP_PUBLIC_ONLY=1: the
+    deployment under test, sharing the store database."""
+    for name, value in {"CP_PUBLIC_ONLY": "1", **env}.items():
+        monkeypatch.setenv(name, value)
+    app = create_app(store["runtime"])
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="https://control.example.test",
+        ) as client:
+            yield {"app": app, "client": client}
+
+
+async def pub_request(pub, store, method, path, body=None, role=None, extra=None):
+    test_headers = {}
+    if role is not None:
+        test_headers["Authorization"] = "Bearer " + store["tokens"][role]
+    test_headers.update(extra or {})
+    return await pub["client"].request(method, path, json=body, headers=test_headers)
+
+
+async def test_public_instance_serves_only_exact_allowlist(store, monkeypatch):
     await service_token(store, "launcher", ["stats.read"])
-    extra = {"X-CP-Public": "1"}
-    # Agent/site/admin routes never pass on the public path, even authed.
-    for method, path in (
-        ("POST", "/v2/actions/console.run"),
-        ("POST", "/v2/console/suggest"),
-        ("POST", "/v2/console/logs"),
-        (
-            "GET",
-            "/v2/agents/game/events?epoch=00000000-0000-0000-0000-000000000000&cursor=0",
-        ),
-        ("GET", "/v2/operations/00000000-0000-0000-0000-000000000000"),
-        ("GET", "/v2/settings/catalog"),
-        ("GET", "/v2/openapi.json"),
-    ):
-        response = await request(store, method, path, None, "owner", extra)
-        assert response.status_code == 404, (method, path, response.text)
-    # The same routes stay reachable on the internal path (auth decides).
-    internal = await request(store, "GET", "/v2/settings/catalog", None, "owner")
-    assert internal.status_code == 200, internal.text
-    # Launcher stats reads pass on the public path; unscoped ones do not.
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
-    ).status_code == 200
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "ordinary", extra)
-    ).status_code == 403
-    # Per-token public budget: 60/min; the 61st is refused, while the same
-    # token still passes internally (separate budgets).
-    for _ in range(59):
-        response = await request(
-            store, "GET", "/v2/stats/seasons", None, "launcher", extra
+    await service_token(store, "agent-read", ["console.read"])
+    await service_token(store, "agent-run", ["console.read", "console.run"], via="mcp")
+    epoch = "00000000-0000-0000-0000-000000000000"
+    async with public_app(store, monkeypatch) as pub:
+        # Agent/site/admin routes never pass on the public instance, even
+        # with the owner token.
+        for method, path in (
+            ("POST", "/v2/actions/moderation.say"),
+            ("POST", "/v2/console/suggest"),
+            ("POST", "/v2/console/logs"),
+            ("GET", "/v2/console/logs"),
+            ("GET", f"/v2/agents/game/events?epoch={epoch}&cursor=0"),
+            ("GET", "/v2/agents/game/snapshot"),
+            ("POST", "/v2/agents/game/acks"),
+            ("GET", f"/v2/operations/{epoch}"),
+            ("GET", "/v2/settings/catalog"),
+            ("GET", "/v2/openapi.json"),
+            ("GET", "/v1/openapi.json"),
+            ("GET", "/v2/stats/hitreg"),
+            ("GET", "/v2/stats/diagnostics"),
+            ("POST", "/v2/stats/results"),
+            ("GET", "/v2/me"),
+            ("GET", "/v1/gate"),
+        ):
+            response = await pub_request(pub, store, method, path, None, "owner")
+            assert response.status_code == 404, (method, path, response.text)
+        # The read-only console line passes with the read token and its own
+        # operation polls on the public instance too.
+        line = await pub_request(
+            pub,
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, "p1", "list"),
+            "agent-read",
         )
-        assert response.status_code == 200, response.text
+        assert line.status_code == 202, line.text
+        op_id = line.json()["operationId"]
+        op = await pub_request(
+            pub, store, "GET", f"/v2/operations/{op_id}", None, "agent-read"
+        )
+        assert op.status_code == 200, op.text
+        # A read-scoped credential cannot run a non-read-only line there.
+        denied = await pub_request(
+            pub,
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, "p2", "save-all"),
+            "agent-read",
+        )
+        assert denied.status_code == 403, denied.text
+        # Someone else's operation does not read back.
+        foreign = await pub_request(
+            pub, store, "GET", f"/v2/operations/{op_id}", None, "agent-run"
+        )
+        assert foreign.status_code == 403, foreign.text
+        # Per-token public budget: 60/min; the 61st is refused, while the
+        # same token still passes internally (separate budgets).
+        await service_token(store, "flooder", ["stats.read"])
+        for _ in range(60):
+            response = await pub_request(
+                pub, store, "GET", "/v2/stats/seasons", None, "flooder"
+            )
+            assert response.status_code == 200, response.text
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/seasons", None, "flooder")
+        ).status_code == 429
+        assert (
+            await request(store, "GET", "/v2/stats/seasons", None, "flooder")
+        ).status_code == 200
+        # Every response carries the hardening headers.
+        health = await pub_request(pub, store, "GET", "/health")
+        assert health.status_code == 200, health.text
+        assert health.json() == {"status": "ok"}, health.text
+        for header, value in (
+            ("strict-transport-security", "max-age=31536000; includeSubDomains"),
+            ("x-content-type-options", "nosniff"),
+            ("x-frame-options", "DENY"),
+            ("referrer-policy", "no-referrer"),
+            ("content-security-policy", "default-src 'none'; frame-ancestors 'none'"),
+            ("cache-control", "no-store"),
+        ):
+            assert health.headers[header] == value, header
+
+
+async def test_internal_instance_ignores_public_header(store):
+    # The header is meaningless to the internal instance: deployment decides.
+    for marker in ("1", "0", "true", " 1 ", "1, 1"):
+        extra = {"X-CP-Public": marker}
+        me = await request(store, "GET", "/v2/me", None, "owner", extra)
+        assert me.status_code == 200, (marker, me.text)
+        run = await request(
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, f"h-{marker[:2]}", "list"),
+            "owner",
+            extra,
+        )
+        assert run.status_code == 202, (marker, run.text)
+        # And anonymous stats reads stay internal-only: 401, not 200.
+        anon = await store["client"].get("/v2/stats/seasons", headers=extra)
+        assert anon.status_code == 401, (marker, anon.text)
+
+
+async def test_public_hitreg_and_diagnostics_stay_staff_only(store, monkeypatch):
+    await service_token(store, "analyst", ["stats.read"])
+    async with public_app(store, monkeypatch) as pub:
+        for path in ("/v2/stats/hitreg", "/v2/stats/diagnostics"):
+            response = await pub_request(pub, store, "GET", path, None, "analyst")
+            assert response.status_code == 404, (path, response.text)
+    # Same token, same reads stay reachable on the internal instance.
     assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
-    ).status_code == 429
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+        await request(store, "GET", "/v2/stats/hitreg", None, "analyst")
     ).status_code == 200
-    # Every response carries the hardening headers.
-    health = await request(store, "GET", "/health", None, "ordinary", extra)
-    assert health.status_code == 200, health.text
-    for header, value in (
-        ("strict-transport-security", "max-age=3153600; includeSubDomains"),
-        ("x-content-type-options", "nosniff"),
-        ("x-frame-options", "DENY"),
-        ("referrer-policy", "no-referrer"),
-        ("content-security-policy", "default-src 'none'; frame-ancestors 'none'"),
-        ("cache-control", "no-store"),
+
+
+async def test_public_anonymous_stats_reads(store, monkeypatch):
+    async with public_app(store, monkeypatch) as pub:
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/seasons")
+        ).status_code == 200
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/leaderboard")
+        ).status_code == 200
+        # Unknown player: the route is reached without a token (404 from the
+        # lookup, not 401 from auth).
+        player = await pub_request(pub, store, "GET", f"/v2/stats/players/{uuid4()}")
+        assert player.status_code == 404, player.text
+        assert player.json() == {"error": "player_not_found"}, player.text
+        # A scoped-but-wrong token still 403s: anonymous does not launder scope.
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/seasons", None, "ordinary")
+        ).status_code == 403
+    # Internal stays authenticated: no token, no read.
+    assert (await store["client"].get("/v2/stats/seasons")).status_code == 401
+
+
+async def test_public_auth_failures_do_not_touch_internal_budget(store, monkeypatch):
+    async with public_app(store, monkeypatch) as pub:
+        # 101 garbage bearers burn the public unauthenticated budget (100):
+        # the last ones 429 while the internal budget stays untouched.
+        statuses = [
+            (
+                await pub["client"].get(
+                    "/v2/stats/seasons",
+                    headers={"Authorization": f"Bearer junk-{i}"},
+                )
+            ).status_code
+            for i in range(101)
+        ]
+        assert 429 in statuses, statuses[-5:]
+        # An internal caller with a wrong bearer still gets 401, never 429
+        # from public traffic.
+        wrong = await store["client"].get(
+            "/v2/me", headers={"Authorization": "Bearer wrong"}
+        )
+        assert wrong.status_code == 401, wrong.text
+        assert wrong.json() == {"error": "unauthorized"}, wrong.text
+
+
+def _fake_request(*, public, xff="", peer="198.51.100.9"):
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(public_only=public, public_trusted=())
+        ),
+        headers={"x-forwarded-for": xff},
+        client=SimpleNamespace(host=peer),
+    )
+
+
+def test_public_client_address_trust_and_ipv6_buckets():
+    proxy = ipaddress.ip_network("10.0.0.0/8")
+    direct = _fake_request(public=False, xff="203.0.113.9", peer="10.1.2.3")
+    assert cpv2_app.client_address(direct) == "10.1.2.3"
+    untrusted = _fake_request(public=True, xff="203.0.113.9", peer="10.1.2.3")
+    assert cpv2_app.client_address(untrusted) == "10.1.2.3"
+    req = _fake_request(public=True, xff="203.0.113.9, 10.1.2.3", peer="10.9.9.9")
+    req.app.state.public_trusted = (proxy,)
+    assert cpv2_app.client_address(req) == "203.0.113.9"
+    # Entries left of the rightmost untrusted one are client-supplied.
+    req = _fake_request(
+        public=True, xff="192.0.2.1, 203.0.113.9, 10.1.2.3", peer="10.9.9.9"
+    )
+    req.app.state.public_trusted = (proxy,)
+    assert cpv2_app.client_address(req) == "203.0.113.9"
+    # A chain shorter than the trusted set falls back to the socket peer.
+    req = _fake_request(public=True, xff="", peer="10.9.9.9")
+    req.app.state.public_trusted = (proxy,)
+    assert cpv2_app.client_address(req) == "10.9.9.9"
+    # One /64 is one bucket: distinct addresses in it key together, the
+    # next /64 keys apart; mapped v4 keys as v4; ports strip; garbage fails
+    # closed to the peer.
+    req = _fake_request(public=True, xff="2001:db8:1:1::a", peer="10.9.9.9")
+    req.app.state.public_trusted = (proxy,)
+    first = cpv2_app.client_address(req)
+    req.headers["x-forwarded-for"] = "2001:db8:1:1::b"
+    assert cpv2_app.client_address(req) == first
+    req.headers["x-forwarded-for"] = "2001:db8:1:2::a"
+    assert cpv2_app.client_address(req) != first
+    req.headers["x-forwarded-for"] = "::ffff:203.0.113.9"
+    assert cpv2_app.client_address(req) == "203.0.113.9"
+    req.headers["x-forwarded-for"] = "203.0.113.9:51234"
+    assert cpv2_app.client_address(req) == "203.0.113.9"
+    req.headers["x-forwarded-for"] = "not-an-ip, 10.1.2.3"
+    assert cpv2_app.client_address(req) == "10.9.9.9"
+
+
+def test_public_allowlist_is_exact_and_uses_raw_scope():
+    allowed = cpv2_app.public_allowed
+    assert allowed("GET", "/health")
+    assert allowed("HEAD", "/v2/stats/seasons")
+    assert allowed("GET", "/v2/stats/players/12345678-1234-1234-1234-123456789abc")
+    assert allowed("POST", "/v2/actions/console.run")
+    assert allowed("GET", "/v2/operations/12345678-1234-1234-1234-123456789abc")
+    for method, path in (
+        ("GET", "/v2/stats/hitreg"),
+        ("GET", "/v2/stats/diagnostics"),
+        ("GET", "/openapi.json"),
+        ("GET", "/v1/openapi.json"),
+        ("POST", "/v2/stats/results"),
+        ("POST", "/v2/console/suggest"),
+        ("GET", "/v2/stats/players/a/b"),
+        ("GET", "/v2/stats/players/"),
+        ("GET", "/v2/operations/a/b"),
+        ("GET", "/hea%09lth"),
+        ("OPTIONS", "/health"),
+        ("POST", "/v2/stats/seasons"),
     ):
-        assert health.headers[header] == value, header
+        assert not allowed(method, path), (method, path)
+    # The policy path is the raw scope path: the URL parser drops the tab,
+    # the scope keeps it, and the allowlist never sees "/health".
+    scope = {"path": "/hea%09lth", "headers": []}
+    assert raw_path(SimpleNamespace(scope=scope)) == "/hea%09lth"
+    assert not allowed("GET", raw_path(SimpleNamespace(scope=scope)))
 
 
-async def test_public_entrypoint_rejects_stats_mutations(store):
+async def test_public_operation_reads_are_own_credential_only(store, monkeypatch):
+    op = await queued(store)
+    path = "/v2/operations/" + op["operationId"]
+    # Internal policy is unchanged: privileged readers read foreign operations.
+    assert (await request(store, "GET", path, role="owner")).status_code == 200
+    assert (await request(store, "GET", path, role="admin")).status_code == 200
+    assert (await request(store, "GET", path, role="moderator")).status_code == 200
+    async with public_app(store, monkeypatch) as pub:
+        # The issuing credential reads its own operation on the public instance.
+        own = await pub_request(pub, store, "GET", path, None, "moderator")
+        assert own.status_code == 200, own.text
+        # operations.read (admin) and audit.read (owner) never widen it there.
+        for role in ("owner", "admin", "builder"):
+            foreign = await pub_request(pub, store, "GET", path, None, role)
+            assert foreign.status_code == 403, (role, foreign.text)
+            assert foreign.json() == {"error": "forbidden"}, (role, foreign.text)
+
+
+async def test_public_stats_cache_ignores_unknown_params(store, monkeypatch):
+    calls = 0
+    real = core.stat_leaderboard
+
+    async def counting(conn, query):
+        nonlocal calls
+        calls += 1
+        return await real(conn, query)
+
+    monkeypatch.setattr(core, "stat_leaderboard", counting)
+    async with public_app(store, monkeypatch) as pub:
+        first = await pub_request(pub, store, "GET", "/v2/stats/leaderboard?zzz=1")
+        assert first.status_code == 200, first.text
+        # A different junk param names the same effective query: a cache hit,
+        # not a fresh aggregate.
+        second = await pub_request(pub, store, "GET", "/v2/stats/leaderboard?zzz=2")
+        assert second.status_code == 200, second.text
+        assert calls == 1, calls
+        assert second.json() == first.json()
+        # Effective filters still key apart.
+        third = await pub_request(pub, store, "GET", "/v2/stats/leaderboard?limit=1")
+        assert third.status_code == 200, third.text
+        assert calls == 2, calls
+
+
+async def test_public_stats_concurrent_misses_share_one_aggregate(store, monkeypatch):
+    calls = 0
+    entered, release = asyncio.Event(), asyncio.Event()
+    real = core.stat_leaderboard
+
+    async def gated(conn, query):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+        return await real(conn, query)
+
+    monkeypatch.setattr(core, "stat_leaderboard", gated)
+    async with public_app(store, monkeypatch) as pub:
+
+        async def opener():
+            await asyncio.wait_for(entered.wait(), 10)
+            release.set()
+
+        task = asyncio.create_task(opener())
+        try:
+            first, second = await asyncio.gather(
+                pub_request(pub, store, "GET", "/v2/stats/leaderboard"),
+                pub_request(pub, store, "GET", "/v2/stats/leaderboard"),
+            )
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert calls == 1, calls
+        assert first.json() == second.json()
+
+
+async def test_public_stats_cache_serves_anonymous(store, monkeypatch):
+    calls = 0
+    real_seasons = core.stat_seasons
+
+    def counting():
+        nonlocal calls
+        calls += 1
+        return real_seasons()
+
+    monkeypatch.setattr(core, "stat_seasons", counting)
+    async with public_app(store, monkeypatch) as pub:
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/seasons")
+        ).status_code == 200
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/seasons")
+        ).status_code == 200
+        assert calls == 1
+        await service_token(store, "reader", ["stats.read"])
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/seasons", None, "reader")
+        ).status_code == 200
+        assert calls == 2
+
+
+async def test_console_run_requires_actor_unless_agent_client(store):
+    await service_token(store, "bare", ["console.read", "console.run"])
+    denied = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "m1", "save-all"),
+        "bare",
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json() == {"error": "service_actor_required"}, denied.text
+    # Read-only lines still run actorless on any service credential.
+    tick = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "m2", "tick query"),
+        "bare",
+    )
+    assert tick.status_code == 202, tick.text
+    # The agent client (via "mcp", e.g. the approval-relay token) runs
+    # actorless lines; the site principal must assert its human.
+    await service_token(store, "agent", ["console.read", "console.run"], via="mcp")
+    run = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "m3", "save-all"),
+        "agent",
+    )
+    assert run.status_code == 202, run.text
+
+
+def test_observer_stream_pool_is_separate():
+    wakeups = delivery.Wakeups("dbname=unused")
+    held = []
+    try:
+        for i in range(32):
+            held.append((f"game-{i}", wakeups.subscribe(f"game-{i}")))
+            held.append((f"game-{i}", wakeups.subscribe(f"game-{i}")))
+        with pytest.raises(Problem):
+            wakeups.subscribe("game-new")
+        # Observers draw from their own pool while agents are full.
+        for i in range(16):
+            held.append((f"observer:{i}", wakeups.subscribe(f"observer:{i}")))
+            held.append((f"observer:{i}", wakeups.subscribe(f"observer:{i}")))
+        with pytest.raises(Problem):
+            wakeups.subscribe("observer:full")
+        with pytest.raises(Problem):
+            wakeups.subscribe("observer:0")
+    finally:
+        for consumer, waiter in held:
+            wakeups.unsubscribe(consumer, waiter)
+    assert not wakeups.waiters
+
+
+async def test_suggest_cancellation_releases_waiter(store, monkeypatch):
+    # A cancellation while write waits on the database must release the
+    # preallocated waiter: 64 such cancellations used to exhaust the slots.
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hanging(conn, identity, attempt, body):
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+        raise AssertionError("unreachable: cancelled first")
+
+    monkeypatch.setattr(core, "console_suggest", hanging)
+    wakeups = store["app"].state.wakeups
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            store["client"].post(
+                "/v2/console/suggest",
+                json=suggest_body(store, "s-cancel", "time s"),
+                headers=headers(store),
+            ),
+            5,
+        )
+    release.set()
+    assert not wakeups.suggest_waiters
+
+
+async def test_suggest_takes_waiter_slot_before_enqueue(store):
+    wakeups = store["app"].state.wakeups
+    held = [wakeups.subscribe_suggest("game") for _ in range(64)]
+    try:
+        response = await store["client"].post(
+            "/v2/console/suggest",
+            json=suggest_body(store, "s-full", "time s"),
+            headers=headers(store),
+        )
+        assert response.status_code == 429, response.text
+        # Nothing was enqueued for a completion that could never wait.
+        assert not await sql(
+            store, "SELECT * FROM operations WHERE kind='console.suggest'"
+        ), response.text
+    finally:
+        for waiter in held:
+            wakeups.unsubscribe_suggest("game", waiter)
+    assert not wakeups.suggest_waiters
+
+
+async def test_trailing_slash_never_redirects(store, monkeypatch):
+    await service_token(store, "slash", ["stats.read"])
+    internal = await request(store, "GET", "/v2/stats/seasons/", None, "slash")
+    assert internal.status_code == 404, internal.text
+    assert "location" not in internal.headers
+    async with public_app(store, monkeypatch) as pub:
+        public = await pub_request(
+            pub, store, "GET", "/v2/stats/seasons/", None, "slash"
+        )
+        assert public.status_code == 404, public.text
+        assert "location" not in public.headers
+
+
+async def test_console_log_ingest_redacts_addresses(store):
+    now_ms = int(time.time() * 1000)
+    message = (
+        "conn from 203.0.113.9 password=Hunter2Hunter2Hunter2Hunter2Hunter2 "
+        "see https://internal/x and 2001:db8::5"
+    )
+    batch = log_batch(store, "log", [log_entry(now_ms, message)])
+    assert (
+        await request(store, "POST", "/v2/console/logs", batch, "game-agent")
+    ).status_code == 201
+    tail = await request(store, "GET", "/v2/console/logs?consumerId=game&since=0")
+    assert tail.status_code == 200, tail.text
+    stored = tail.json()["entries"][0]["message"]
+    assert "203.0.113.9" not in stored, stored
+    assert "2001:db8::5" not in stored, stored
+    assert "Hunter2" not in stored, stored
+    assert "https://internal/x" not in stored, stored
+    assert "[ip]" in stored and "[secret]" in stored and "[url]" in stored, stored
+
+
+async def test_public_entrypoint_rejects_stats_mutations(store, monkeypatch):
     # Method-scoped allowlist: even a credential holding the mutation scope
     # cannot invoke it through the public entrypoint.
     server = "22222222-2222-2222-2222-222222222222"
     await _stats_token(store, server)
     await _stats_token(store, _DIAG_SERVER, "stats-diag")
-    extra = {"X-CP-Public": "1"}
-    created = await request(
-        store,
-        "POST",
-        "/v2/stats/results",
-        _stats_campaign_body(),
-        "stats-producer",
-        extra,
-    )
-    assert created.status_code == 404, created.text
-    assert created.json() == {"error": "not_found"}
-    diag = await request(
-        store, "POST", "/v2/stats/diagnostics", _diag_body(), "stats-diag", extra
-    )
-    assert diag.status_code == 404, diag.text
-    assert diag.json() == {"error": "not_found"}
-    # Same mutations stay reachable on the internal path (auth decides).
+    async with public_app(store, monkeypatch) as pub:
+        created = await pub_request(
+            pub,
+            store,
+            "POST",
+            "/v2/stats/results",
+            _stats_campaign_body(),
+            "stats-producer",
+        )
+        assert created.status_code == 404, created.text
+        assert created.json() == {"error": "not_found"}
+        diag = await pub_request(
+            pub, store, "POST", "/v2/stats/diagnostics", _diag_body(), "stats-diag"
+        )
+        assert diag.status_code == 404, diag.text
+        assert diag.json() == {"error": "not_found"}
+        void = await pub_request(
+            pub,
+            store,
+            "POST",
+            "/v2/stats/results/void",
+            {
+                "serverId": server,
+                "eventId": "11111111-1111-1111-1111-111111111111",
+                "voided": True,
+            },
+            "admin",
+        )
+        assert void.status_code == 404, void.text
+        assert void.json() == {"error": "not_found"}
+    # Same mutations stay reachable on the internal instance (auth decides).
     assert (
         await request(
             store, "POST", "/v2/stats/results", _stats_campaign_body(), "stats-producer"
         )
     ).status_code == 201
-    void = await request(
-        store,
-        "POST",
-        "/v2/stats/results/void",
-        {
-            "serverId": server,
-            "eventId": "11111111-1111-1111-1111-111111111111",
-            "voided": True,
-        },
-        "admin",
-        extra,
-    )
-    assert void.status_code == 404, void.text
-    assert void.json() == {"error": "not_found"}
 
 
 @pytest.fixture
@@ -10467,23 +10914,23 @@ def frozen_limits_window(monkeypatch):
 
 
 async def test_public_traffic_does_not_consume_shared_budget(
-    store, frozen_limits_window
+    store, monkeypatch, frozen_limits_window
 ):
     await service_token(store, "launcher", ["stats.read"])
-    extra = {"X-CP-Public": "1"}
-    for _ in range(10):
-        response = await request(
-            store, "GET", "/v2/stats/seasons", None, "launcher", extra
-        )
-        assert response.status_code == 200, response.text
-    assert store["app"].state.limiter.total == 0
+    async with public_app(store, monkeypatch) as pub:
+        for _ in range(10):
+            response = await pub_request(
+                pub, store, "GET", "/v2/stats/seasons", None, "launcher"
+            )
+            assert response.status_code == 200, response.text
+        assert pub["app"].state.limiter.total == 0
     internal = await request(store, "GET", "/v2/stats/seasons", None, "launcher")
     assert internal.status_code == 200, internal.text
     assert store["app"].state.limiter.total == 1
 
 
 async def test_public_and_internal_buckets_are_fully_isolated(
-    store, frozen_limits_window
+    store, monkeypatch, frozen_limits_window
 ):
     # Public traffic must never consume an internal bucket and vice versa:
     # each side 429s on its own exhausted budget while the other still
@@ -10491,47 +10938,34 @@ async def test_public_and_internal_buckets_are_fully_isolated(
     # pipeline enforces) to keep the test to a handful of requests.
     await service_token(store, "launcher", ["stats.read"])
     await service_token(store, "launcher-b", ["stats.read"])
-    extra = {"X-CP-Public": "1"}
-    app = store["app"]
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
-    ).status_code == 200
-    assert ("client", "launcher") not in app.state.limiter.buckets
-    assert app.state.limiter.total == 0
-    assert ("client", "launcher") in app.state.pub_limiter.buckets
-    before = dict(app.state.pub_limiter.buckets)
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
-    ).status_code == 200
-    assert dict(app.state.pub_limiter.buckets) == before
-    assert ("client", "launcher") in app.state.limiter.buckets
-    # Exhausting the internal per-client bucket denies internal requests
-    # while the same client still passes over the public entrypoint.
-    for _ in range(600):
-        try:
-            app.state.limiter.check(
-                ("client", "launcher"), global_count=False, limit=600
+    async with public_app(store, monkeypatch) as pub:
+        app = pub["app"]
+        assert (
+            await pub_request(pub, store, "GET", "/v2/stats/seasons", None, "launcher")
+        ).status_code == 200
+        assert ("client", "launcher") not in store["app"].state.limiter.buckets
+        assert store["app"].state.limiter.total == 0
+        assert ("client", "launcher") in app.state.pub_limiter.buckets
+        before = dict(app.state.pub_limiter.buckets)
+        assert (
+            await request(store, "GET", "/v2/stats/seasons", None, "launcher")
+        ).status_code == 200
+        assert dict(app.state.pub_limiter.buckets) == before
+        assert ("client", "launcher") in store["app"].state.limiter.buckets
+        # Exhausting the public per-client bucket denies public requests
+        # while internal requests from another client still pass.
+        for _ in range(600):
+            try:
+                app.state.pub_limiter.check(
+                    ("client", "launcher-b"), global_count=False, limit=600
+                )
+            except Problem:
+                break
+        assert (
+            await pub_request(
+                pub, store, "GET", "/v2/stats/seasons", None, "launcher-b"
             )
-        except Problem:
-            break
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher")
-    ).status_code == 429
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher", extra)
-    ).status_code == 200
-    # Exhausting the public per-client bucket denies public requests
-    # while internal requests from another client still pass.
-    for _ in range(600):
-        try:
-            app.state.pub_limiter.check(
-                ("client", "launcher-b"), global_count=False, limit=600
-            )
-        except Problem:
-            break
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher-b", extra)
-    ).status_code == 429
-    assert (
-        await request(store, "GET", "/v2/stats/seasons", None, "launcher-b")
-    ).status_code == 200
+        ).status_code == 429
+        assert (
+            await request(store, "GET", "/v2/stats/seasons", None, "launcher-b")
+        ).status_code == 200
