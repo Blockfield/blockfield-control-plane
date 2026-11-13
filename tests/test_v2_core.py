@@ -47,7 +47,7 @@ from cpv2.auth import (
     now,
     verifier,
 )
-from cpv2.db import migrate, one
+from cpv2.db import MIGRATIONS, migrate, one
 from cpv2.legacy import import_u1
 from cpv2.settings import canonical, digest
 
@@ -5936,7 +5936,6 @@ async def test_fresh_database_reaches_latest_schema_and_health(store):
     # A newly initialized database must end at len(MIGRATIONS) with no
     # second migrate run: health requires the latest version, and log
     # ingestion needs the newest tables from the start.
-    from cpv2.db import MIGRATIONS
 
     applied = await sql(store, "SELECT MAX(version) AS version FROM schema_migrations")
     assert applied[0]["version"] == len(MIGRATIONS)
@@ -6144,7 +6143,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 10}
+    assert response.json() == {"status": "ok", "schema": len(MIGRATIONS)}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -6152,7 +6151,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 10}
+    assert broken.json() == {"status": "unavailable", "schema": len(MIGRATIONS)}
 
 
 async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
