@@ -668,6 +668,7 @@ MODERATION_COMMANDS = (
     "moderation.announce",
 )
 MODERATION_MAINTENANCE_OPS = ("status", "drain", "resume", "interrupt")
+SERVER_WIDE_KINDS = ("console.run", "moderation.maintenance", "moderation.announce")
 # Read-only console lines (scope console.read); anything else needs
 # console.run. The game and the agent MCP enforce the same list.
 CONSOLE_READ_ONLY = re.compile(
@@ -775,13 +776,18 @@ async def action(conn, identity, attempt, kind, body):
         read_only = CONSOLE_READ_ONLY.fullmatch(command) is not None
         payload = {
             "kind": kind,
-            "target": data["target"],
+            "target": "*",
             "command": command,
             "readOnly": read_only,
         }
     else:
         raise Problem("unknown_action", 404)
     data_target = payload["target"]
+    # Console lines, maintenance and the restart notice act on the whole
+    # server: a resource-scoped grant or credential must never reach them
+    # through a server-wide consumer.
+    if kind in SERVER_WIDE_KINDS and data_target != "*":
+        raise Problem("server_wide_target", 422)
     scope = (
         ("console.read" if payload["readOnly"] else "console.run")
         if kind == "console.run"
@@ -962,10 +968,16 @@ async def read_operation(conn, identity, op_id):
     op = await one(conn, "SELECT * FROM operations WHERE id=%s FOR UPDATE", (op_id,))
     if not op:
         raise Problem("operation_not_found", 404)
-    # The issuing credential may always read its own operation: a service
-    # caller (site, agent MCP) polls console/list output without holding
-    # operations.read or audit.read.
-    if op["credential_id"] != identity.credential["id"]:
+    # The issuing credential reads its own operation while it still holds
+    # every scope the operation required, at the operation's bounds: a
+    # service caller (site, agent MCP) polls console/list output without
+    # operations.read or audit.read, but a narrowed credential falls back to
+    # the ordinary checks below.
+    issuer = op["credential_id"] == identity.credential["id"] and all(
+        identity.allows(scope, op["environment"], op["backend"], op["resource"])
+        for scope in op["required_scope"].split(",")
+    )
+    if not issuer:
         identity.require(
             "operations.read", op["environment"], op["backend"], op["resource"]
         )

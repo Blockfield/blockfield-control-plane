@@ -1079,6 +1079,7 @@ async def test_maintenance_kinds_and_ack_output_round_trip(store):
     for body, code in (
         (base | {"idempotencyKey": "mnt-bad", "op": "pause"}, 422),
         (base | {"idempotencyKey": "mnt-noreason", "op": "interrupt"}, 422),
+        (base | {"idempotencyKey": "mnt-arena", "op": "drain", "target": "arena"}, 422),
     ):
         response = await request(
             store, "POST", "/v2/actions/moderation.maintenance", body, "admin"
@@ -1157,6 +1158,15 @@ async def test_console_run_scopes_allowlist_and_audit(store):
             "moderator",
         )
     ).status_code == 403
+    # Console lines are server-wide: no target field, so no scoped target.
+    scoped = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "c-arena", "list", target="arena"),
+        "owner",
+    )
+    assert scoped.status_code == 422, scoped.text
     for command in ("say hi\nstop", "   ", "/"):
         response = await request(
             store,
@@ -1296,6 +1306,25 @@ async def test_console_service_tokens_read_only_and_owner_assertion(store):
     )
     assert polled.json()["status"] == "effective"
     assert polled.json()["receipts"][-1]["result"]["output"].startswith("The game")
+    # A narrowed issuer loses the exception (no operations.read to fall back on).
+    issued_by = (
+        await sql(
+            store,
+            "SELECT credential_id FROM operations WHERE id=%s",
+            (tick.json()["operationId"],),
+        )
+    )[0]["credential_id"]
+    await sql(
+        store, "UPDATE credentials SET resource='arena' WHERE id=%s", (issued_by,)
+    )
+    assert (
+        await request(
+            store,
+            "GET",
+            f"/v2/operations/{tick.json()['operationId']}",
+            role="agent-read",
+        )
+    ).status_code == 403
     # Another service credential cannot read it.
     assert (
         await request(

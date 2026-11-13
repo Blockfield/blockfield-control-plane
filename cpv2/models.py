@@ -105,9 +105,10 @@ class ConsoleRun(Mutation):
     # Owner console line for one game consumer (coordination#35). core.action
     # classifies it against the read-only allowlist: console.read covers the
     # allowlist, console.run anything else.
+    # No target: a console line acts on the whole server, so it is always
+    # authorized at resource "*" (core.action).
     consumerId: str = Field(min_length=1, max_length=128)
     generation: ID
-    target: str = Field(default="*", min_length=1, max_length=128)
     command: str = Field(min_length=1, max_length=1000)
     expiresInSeconds: int = Field(default=30, ge=1, le=60)
     # Service-asserted acting account (site principal only); the actor must be
