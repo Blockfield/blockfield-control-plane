@@ -161,8 +161,8 @@ class Ack(Strict):
         "ok", "invalid_schema", "stale_generation", "apply_failed", "effect_uncertain"
     ] = "ok"
     # Command output (list, maintenance status, console lines). Informational:
-    # stored with the receipt, excluded from its fingerprint, so a repost
-    # after an executor crash (which no longer has it) stays a duplicate.
+    # stored with the receipt, excluded from its fingerprint, so the same
+    # receipt resent without the text (the executor keeps none) still matches.
     output: str | None = Field(default=None, max_length=65536)
 
     @field_validator("actualAt")

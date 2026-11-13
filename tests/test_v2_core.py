@@ -1109,16 +1109,20 @@ async def test_maintenance_kinds_and_ack_output_round_trip(store):
         },
     ]
     line = "draining=false rooms=2 drained=false"
-    await ack_chain(store, frames[0], output=line)
-    # A repost without output (executor restarted) is the same receipt.
-    again = await request(
-        store,
-        "POST",
-        "/v2/agents/game/acks",
-        ack_body(frames[0], "effective"),
-        "game-agent",
-    )
-    assert again.status_code == 200, again.text
+    for state in ("received", "validated", "applied"):
+        acked = await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frames[0], state),
+            "game-agent",
+        )
+        assert acked.status_code == 200, (state, acked.text)
+    effective = ack_body(frames[0], "effective") | {"output": line}
+    for body in (effective, {k: v for k, v in effective.items() if k != "output"}):
+        # The same receipt resent without its text still matches.
+        acked = await request(store, "POST", "/v2/agents/game/acks", body, "game-agent")
+        assert acked.status_code == 200, acked.text
     read = await request(
         store, "GET", f"/v2/operations/{accepted.json()['operationId']}", role="admin"
     )

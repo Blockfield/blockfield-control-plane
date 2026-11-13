@@ -36,8 +36,7 @@ disagree, fix the code.
 | effective / rejected / unknown | exact duplicate only | same persisted receipt fingerprint succeeds; changed duplicate or new transition conflicts |
 
 The receipt fingerprint covers every ack field except `output` (command text
-stored with the receipt): an executor that restarted reposts its decided state
-without it and still matches.
+stored with the receipt): the same receipt resent without it still matches.
 
 Post-policy `received`/`validated` are recorded as historical facts: the
 executor reports what it did before losing authorization. Recording grants
