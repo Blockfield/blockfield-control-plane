@@ -1363,7 +1363,9 @@ async def test_console_migration_extends_game_consumers_only(store):
     ).read_text()
     # The helper connection already sets search_path; one statement per call.
     migration = "\n".join(
-        line for line in migration.splitlines() if not line.startswith("SET ")
+        line
+        for line in migration.splitlines()
+        if not line.startswith("SET search_path")
     )
     for _ in range(2):  # idempotent: no duplicate capabilities
         await sql(store, migration)
