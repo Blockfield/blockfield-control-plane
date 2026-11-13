@@ -32,8 +32,19 @@ MODERATION_SCOPES = {
     "moderation.range",
     "moderation.stop-room",
 }
-# Pardon needs the site `ban` permission: admin only, like moderation.ban.
-MODERATION_ADMIN_SCOPES = {"moderation.pardon"}
+# Pardon needs the site `ban` permission and maintenance (`bf maintenance
+# status|drain|resume|interrupt`) the site `maintenance` one: admin only.
+MODERATION_ADMIN_SCOPES = {"moderation.pardon", "moderation.maintenance"}
+# Deploy restart notice: fixed text the game holds, issued by a service
+# credential with no human actor (see core.action). In no role.
+ANNOUNCE_SCOPES = {"moderation.announce"}
+# Owner console (coordination#35): console.read runs only the read-only
+# allowlist (core.CONSOLE_READ_ONLY), console.run any command line. Admins
+# hold console.read (the site live tick check is an admin view); console.run
+# is in no role, so only owners hold it. A service credential holds them only
+# when an owner provisions it (the site console principal asserting the
+# actor, the agent MCP tokens).
+CONSOLE_SCOPES = {"console.read", "console.run"}
 # Site moderation via the service principal: a service credential may hold
 # any moderation kind, but every call must assert the acting human account
 # (see core.action, mirroring grant_change) — the actor's own grants then
@@ -82,6 +93,7 @@ ROLE_SCOPES = {
         # The workshop controller reports its own gate leg (gate settings at
         # target "workshop"); admins keep manual PATCH access to the same leg.
         "workshop.gate",
+        "console.read",
     },
 }
 OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
@@ -95,6 +107,7 @@ OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
     # Site player sessions: the site stores sealed Drasl tokens in CP and can
     # revoke them; founders keep revocation when the site is unavailable.
     "site.sessions",
+    *CONSOLE_SCOPES,
 }
 SERVICE_SCOPES = {
     "agents.events",
@@ -111,6 +124,8 @@ SERVICE_SCOPES = {
     # Site moderation kinds: every service call asserts the acting account,
     # so the actor's own grants still decide (see core.action).
     *SERVICE_MODERATION_SCOPES,
+    *ANNOUNCE_SCOPES,
+    *CONSOLE_SCOPES,
 }
 # Site principal only: provisioned solely on a resource="*" service credential,
 # since a staff write asserts an acting account (see core.grant_change).

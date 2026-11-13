@@ -664,6 +664,18 @@ MODERATION_COMMANDS = (
     "moderation.class-unlock",
     "moderation.range",
     "moderation.stop-room",
+    "moderation.maintenance",
+    "moderation.announce",
+)
+MODERATION_MAINTENANCE_OPS = ("status", "drain", "resume", "interrupt")
+SERVER_WIDE_KINDS = ("console.run", "moderation.maintenance", "moderation.announce")
+# Read-only console lines (scope console.read); anything else needs
+# console.run. The game and the agent MCP enforce the same list.
+CONSOLE_READ_ONLY = re.compile(
+    r"list( uuids)?|tick query|bf maintenance status|banlist( players| ips)?"
+    # spark health only with local flags: --upload sends the report off-site;
+    # tickmonitor is out: it starts and stops a monitor.
+    r"|whitelist list|spark (tps|gc)|spark health( --(memory|network))*"
 )
 MODERATION_PLAYER = re.compile(r"[A-Za-z0-9_]{3,16}")
 MODERATION_CLASS = re.compile(r"[a-z0-9_]{1,32}")
@@ -697,8 +709,15 @@ def _moderation_payload(kind, data):
     name = kind[len("moderation.") :]
     if name == "say":
         return base | {"text": _moderation_text(data["text"])}
-    if name == "list":
+    if name in ("list", "announce"):
         return base
+    if name == "maintenance":
+        op = data["op"]
+        if op not in MODERATION_MAINTENANCE_OPS:
+            raise Problem("invalid_moderation_maintenance", 422)
+        if op != "interrupt":
+            return base | {"op": op}
+        return base | {"op": op, "reason": _moderation_text(data["reason"])}
     if name in ("pardon", "team-kick"):
         player = data["player"]
         if not isinstance(player, str) or MODERATION_PLAYER.fullmatch(player) is None:
@@ -746,11 +765,45 @@ async def action(conn, identity, attempt, kind, body):
         except ValidationError:
             raise Problem("invalid_action", 422) from None
         payload = _moderation_payload(kind, data)
+    elif kind == "console.run":
+        try:
+            data = models.ConsoleRun.model_validate(body).model_dump(mode="json")
+        except ValidationError:
+            raise Problem("invalid_action", 422) from None
+        # One line as typed: a control character could smuggle a second
+        # command or forge log lines (same rule as the site console).
+        command = data["command"].strip().lstrip("/").strip()
+        if not command or any(unicodedata.category(c) == "Cc" for c in command):
+            raise Problem("invalid_console_command", 422)
+        read_only = CONSOLE_READ_ONLY.fullmatch(command) is not None
+        payload = {
+            "kind": kind,
+            "target": "*",
+            "command": command,
+            "readOnly": read_only,
+        }
     else:
         raise Problem("unknown_action", 404)
     data_target = payload["target"]
-    identity.require(kind, data["environment"], data["backend"], data_target)
-    if identity.credential["kind"] == "service":
+    # Console lines, maintenance and the restart notice act on the whole
+    # server: a resource-scoped grant or credential must never reach them
+    # through a server-wide consumer.
+    if kind in SERVER_WIDE_KINDS and data_target != "*":
+        raise Problem("server_wide_target", 422)
+    scope = (
+        ("console.read" if payload["readOnly"] else "console.run")
+        if kind == "console.run"
+        else kind
+    )
+    identity.require(scope, data["environment"], data["backend"], data_target)
+    # Announce carries no human: its text is fixed in the game. Console lines
+    # may come from an owner-provisioned agent token without an actor.
+    actorless = kind in ("moderation.announce", "console.run")
+    if kind == "moderation.announce" and data["actorAccountId"] is not None:
+        raise Problem("actor_forbidden")
+    if identity.credential["kind"] == "service" and (
+        data["actorAccountId"] is not None or not actorless
+    ):
         # The site principal asserts the logged-in human; the same scope,
         # peer and grant rules below then evaluate that actor like a direct
         # call. role_grants-independent moderation still needs an actor, so
@@ -789,8 +842,10 @@ async def action(conn, identity, attempt, kind, body):
                 )
             ),
         )
-        identity.require(kind, data["environment"], data["backend"], data_target)
-    elif data["actorAccountId"] is not None:
+        identity.require(scope, data["environment"], data["backend"], data_target)
+    elif (
+        identity.credential["kind"] != "service" and data["actorAccountId"] is not None
+    ):
         raise Problem("actor_forbidden")
     op, duplicate = await operation(
         conn,
@@ -798,7 +853,7 @@ async def action(conn, identity, attempt, kind, body):
         kind,
         data_target,
         data,
-        kind,
+        scope,
         data["expiresInSeconds"],
         data["generation"],
     )
@@ -818,7 +873,7 @@ async def action(conn, identity, attempt, kind, body):
         raise Problem("consumer_generation_or_capability", 409)
     unsettled = await one(
         conn,
-        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND p.kind LIKE 'moderation.%%' AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id WHERE o.consumer_id=%s AND (p.kind LIKE 'moderation.%%' OR p.kind='console.run') AND p.deadline>now() AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
         (data["consumerId"],),
     )
     if (
@@ -839,6 +894,12 @@ async def action(conn, identity, attempt, kind, body):
         op,
         {
             "payloadHash": digest(payload),
+            # The audit row keeps the console line itself, not only its hash.
+            **(
+                {"command": payload["command"], "readOnly": payload["readOnly"]}
+                if kind == "console.run"
+                else {}
+            ),
         },
     )
 
@@ -909,13 +970,23 @@ async def read_operation(conn, identity, op_id):
     op = await one(conn, "SELECT * FROM operations WHERE id=%s FOR UPDATE", (op_id,))
     if not op:
         raise Problem("operation_not_found", 404)
-    identity.require(
-        "operations.read", op["environment"], op["backend"], op["resource"]
+    # The issuing credential reads its own operation while it still holds
+    # every scope the operation required, at the operation's bounds: a
+    # service caller (site, agent MCP) polls console/list output without
+    # operations.read or audit.read, but a narrowed credential falls back to
+    # the ordinary checks below.
+    issuer = op["credential_id"] == identity.credential["id"] and all(
+        identity.allows(scope, op["environment"], op["backend"], op["resource"])
+        for scope in op["required_scope"].split(",")
     )
-    if op["account_id"] != identity.actor and not identity.allows(
-        "audit.read", op["environment"], op["backend"], op["resource"]
-    ):
-        raise Problem("forbidden")
+    if not issuer:
+        identity.require(
+            "operations.read", op["environment"], op["backend"], op["resource"]
+        )
+        if op["account_id"] != identity.actor and not identity.allows(
+            "audit.read", op["environment"], op["backend"], op["resource"]
+        ):
+            raise Problem("forbidden")
     if op["deadline"] <= now() and op["status"] in (
         "accepted",
         "received",

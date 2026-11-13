@@ -287,6 +287,9 @@ async def store(postgres):
                         "moderation.class-unlock",
                         "moderation.range",
                         "moderation.stop-room",
+                        "moderation.maintenance",
+                        "moderation.announce",
+                        "console.run",
                     ]
                     + (
                         [
@@ -1020,6 +1023,404 @@ async def test_moderation_commands_reject_bad_shapes(store):
         assert response.status_code == status, (kind, extra, response.text)
     assert not await sql(store, "SELECT * FROM operations")
     assert not await sql(store, "SELECT * FROM outbox")
+
+
+def console_body(store, key, command, **extra):
+    return {
+        "idempotencyKey": key,
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "command": command,
+        **extra,
+    }
+
+
+async def service_token(store, client, ceiling):
+    store["tokens"][client] = await provision(
+        store["admin"],
+        {
+            "client": {"id": client, "via": "game", "ceiling": ceiling},
+            "ceiling": ceiling,
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+
+
+async def ack_chain(store, frame, *, output=None, last="effective"):
+    states = ["received", "validated", "applied", "effective"]
+    if last == "rejected":
+        states = ["received", "rejected"]
+    for state in states:
+        body = ack_body(frame, state)
+        if state == last and output is not None:
+            body["output"] = output
+        acked = await request(store, "POST", "/v2/agents/game/acks", body, "game-agent")
+        assert acked.status_code == 200, (state, acked.text)
+
+
+async def test_maintenance_kinds_and_ack_output_round_trip(store):
+    base = {
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "target": "*",
+    }
+    status = base | {"idempotencyKey": "mnt-status", "op": "status"}
+    assert (
+        await request(
+            store, "POST", "/v2/actions/moderation.maintenance", status, "moderator"
+        )
+    ).status_code == 403
+    for body, code in (
+        (base | {"idempotencyKey": "mnt-bad", "op": "pause"}, 422),
+        (base | {"idempotencyKey": "mnt-noreason", "op": "interrupt"}, 422),
+        (base | {"idempotencyKey": "mnt-arena", "op": "drain", "target": "arena"}, 422),
+    ):
+        response = await request(
+            store, "POST", "/v2/actions/moderation.maintenance", body, "admin"
+        )
+        assert response.status_code == code, response.text
+    accepted = await request(
+        store, "POST", "/v2/actions/moderation.maintenance", status, "admin"
+    )
+    assert accepted.status_code == 202, accepted.text
+    interrupt = base | {
+        "idempotencyKey": "mnt-int",
+        "op": "interrupt",
+        "reason": "hotfix",
+    }
+    assert (
+        await request(
+            store, "POST", "/v2/actions/moderation.maintenance", interrupt, "admin"
+        )
+    ).status_code == 202
+    frames = await envelopes(store)
+    assert [f["payload"] for f in frames] == [
+        {"kind": "moderation.maintenance", "target": "*", "op": "status"},
+        {
+            "kind": "moderation.maintenance",
+            "target": "*",
+            "op": "interrupt",
+            "reason": "hotfix",
+        },
+    ]
+    line = "draining=false rooms=2 drained=false"
+    for state in ("received", "validated", "applied"):
+        acked = await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frames[0], state),
+            "game-agent",
+        )
+        assert acked.status_code == 200, (state, acked.text)
+    effective = ack_body(frames[0], "effective") | {"output": line}
+    for body in (effective, {k: v for k, v in effective.items() if k != "output"}):
+        # The same receipt resent without its text still matches.
+        acked = await request(store, "POST", "/v2/agents/game/acks", body, "game-agent")
+        assert acked.status_code == 200, acked.text
+    read = await request(
+        store, "GET", f"/v2/operations/{accepted.json()['operationId']}", role="admin"
+    )
+    assert read.json()["status"] == "effective"
+    assert read.json()["receipts"][-1]["result"] == {"code": "ok", "output": line}
+    oversized = ack_body(frames[1], "received") | {"output": "x" * 16385}
+    assert (
+        await request(store, "POST", "/v2/agents/game/acks", oversized, "game-agent")
+    ).status_code == 422
+
+
+async def test_console_run_scopes_allowlist_and_audit(store):
+    assert core.CONSOLE_READ_ONLY.fullmatch("spark health --memory")
+    for unsafe in (
+        "op Steve",
+        "list; stop",
+        "listx",
+        "spark profiler start",
+        "stop",
+        "spark tickmonitor --stop",
+        "spark health --upload",
+    ):
+        assert not core.CONSOLE_READ_ONLY.fullmatch(unsafe), unsafe
+    # Admins hold only console.read; moderators no console scope at all.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, "c0", "op Steve"),
+        )
+    ).status_code == 403
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, "c0m", "list"),
+            "moderator",
+        )
+    ).status_code == 403
+    # Console lines are server-wide: no target field, so no scoped target.
+    scoped = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "c-arena", "list", target="arena"),
+        "owner",
+    )
+    assert scoped.status_code == 422, scoped.text
+    for command in ("say hi\nstop", "   ", "/"):
+        response = await request(
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, f"c-bad-{len(command)}", command),
+            "owner",
+        )
+        assert response.status_code == 422, (command, response.text)
+    read = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "c1", "/list"),
+        "owner",
+    )
+    run = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "c2", "op Steve"),
+        "owner",
+    )
+    assert read.status_code == run.status_code == 202, (read.text, run.text)
+    frames = await envelopes(store)
+    assert [f["payload"] for f in frames] == [
+        {"kind": "console.run", "target": "*", "command": "list", "readOnly": True},
+        {
+            "kind": "console.run",
+            "target": "*",
+            "command": "op Steve",
+            "readOnly": False,
+        },
+    ]
+    assert all(f["executable"] for f in frames)
+    audited = await sql(
+        store,
+        "SELECT required_scope, result FROM operations WHERE kind='console.run' ORDER BY created_at",
+    )
+    assert [(a["required_scope"], a["result"]["command"]) for a in audited] == [
+        ("console.read", "list"),
+        ("console.run", "op Steve"),
+    ]
+    trail = await sql(
+        store,
+        "SELECT detail FROM audit_events WHERE action='console.run' AND outcome='accepted' AND detail ? 'command'",
+    )
+    assert {row["detail"]["command"] for row in trail} == {"list", "op Steve"}
+    # Receipts are contiguous: the first frame settles before the second.
+    await ack_chain(
+        store, frames[0], output="There are 0 of a max of 40 players online:"
+    )
+    await ack_chain(store, frames[1], output="Made Steve a server operator")
+    result = await request(
+        store, "GET", f"/v2/operations/{run.json()['operationId']}", role="owner"
+    )
+    assert result.json()["receipts"][-1]["result"]["output"] == (
+        "Made Steve a server operator"
+    )
+
+
+async def test_console_service_tokens_read_only_and_owner_assertion(store):
+    await service_token(store, "agent-read", ["console.read"])
+    tick = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "a1", "tick query"),
+        "agent-read",
+    )
+    assert tick.status_code == 202, tick.text
+    denied = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "a2", "stop"),
+        "agent-read",
+    )
+    assert denied.status_code == 403, denied.text
+    # The issuing credential reads its own operation without operations.read.
+    own = await request(
+        store, "GET", f"/v2/operations/{tick.json()['operationId']}", role="agent-read"
+    )
+    assert own.status_code == 200, own.text
+    await service_token(store, "agent-run", ["console.read", "console.run"])
+    stop = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(store, "a3", "save-all"),
+        "agent-run",
+    )
+    assert stop.status_code == 202, stop.text
+    # Site console principal: asserts the logged-in user, who must be an owner.
+    await service_token(store, "site-console", ["console.read", "console.run"])
+    as_admin = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(
+            store, "s1", "save-all", actorAccountId=str(store["accounts"]["admin"])
+        ),
+        "site-console",
+    )
+    assert as_admin.status_code == 403, as_admin.text
+    admin_tick = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(
+            store, "s1t", "tick query", actorAccountId=str(store["accounts"]["admin"])
+        ),
+        "site-console",
+    )
+    assert admin_tick.status_code == 202, admin_tick.text
+    as_owner = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(
+            store, "s2", "save-all", actorAccountId=str(store["accounts"]["owner"])
+        ),
+        "site-console",
+    )
+    assert as_owner.status_code == 202, as_owner.text
+    frames = await envelopes(store)
+    # Service-issued and owner-asserted lines both survive the delivery recheck.
+    assert [(f["payload"]["command"], f["executable"]) for f in frames] == [
+        ("tick query", True),
+        ("save-all", True),
+        ("tick query", True),
+        ("save-all", True),
+    ]
+    await ack_chain(store, frames[0], output="The game is running normally")
+    polled = await request(
+        store, "GET", f"/v2/operations/{tick.json()['operationId']}", role="agent-read"
+    )
+    assert polled.json()["status"] == "effective"
+    assert polled.json()["receipts"][-1]["result"]["output"].startswith("The game")
+    # A narrowed issuer loses the exception (no operations.read to fall back on).
+    issued_by = (
+        await sql(
+            store,
+            "SELECT credential_id FROM operations WHERE id=%s",
+            (tick.json()["operationId"],),
+        )
+    )[0]["credential_id"]
+    await sql(
+        store, "UPDATE credentials SET resource='arena' WHERE id=%s", (issued_by,)
+    )
+    assert (
+        await request(
+            store,
+            "GET",
+            f"/v2/operations/{tick.json()['operationId']}",
+            role="agent-read",
+        )
+    ).status_code == 403
+    # Another service credential cannot read it.
+    assert (
+        await request(
+            store,
+            "GET",
+            f"/v2/operations/{tick.json()['operationId']}",
+            role="agent-run",
+        )
+    ).status_code == 403
+
+
+async def test_announce_is_service_only_without_actor(store):
+    await service_token(store, "deploy", ["moderation.announce"])
+    body = {
+        "idempotencyKey": "announce-1",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "target": "*",
+    }
+    assert (
+        await request(store, "POST", "/v2/actions/moderation.announce", body, "admin")
+    ).status_code == 403
+    asserted = await request(
+        store,
+        "POST",
+        "/v2/actions/moderation.announce",
+        body | {"actorAccountId": str(store["accounts"]["admin"])},
+        "deploy",
+    )
+    assert asserted.json()["error"] == "actor_forbidden", asserted.text
+    accepted = await request(
+        store, "POST", "/v2/actions/moderation.announce", body, "deploy"
+    )
+    assert accepted.status_code == 202, accepted.text
+    [frame] = await envelopes(store)
+    assert frame["executable"]
+    assert frame["payload"] == {"kind": "moderation.announce", "target": "*"}
+
+
+async def test_console_migration_extends_game_consumers_only(store):
+    generation = str(store["generation"])
+    for cid, caps in (
+        ("legacy-game", ["settings.gameplay", "moderation.say", "moderation.kick"]),
+        ("legacy-proxy", ["settings.gate"]),
+    ):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": cid,
+                    "via": "game",
+                    "ceiling": ["agents.acks", "agents.events"],
+                },
+                "ceiling": ["agents.acks", "agents.events"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": "*",
+                "consumer": {"id": cid, "generation": generation, "capabilities": caps},
+            },
+        )
+    migration = (
+        Path(__file__).resolve().parents[1] / "migrations/010_console_capabilities.sql"
+    ).read_text()
+    # The helper connection already sets search_path; one statement per call.
+    migration = "\n".join(
+        line
+        for line in migration.splitlines()
+        if not line.startswith("SET search_path")
+    )
+    for _ in range(2):  # idempotent: no duplicate capabilities
+        await sql(store, migration)
+    rows_ = {
+        r["id"]: r["capabilities"]
+        for r in await sql(
+            store,
+            "SELECT id, capabilities FROM consumers WHERE id LIKE 'legacy-%%'",
+        )
+    }
+    assert rows_["legacy-proxy"] == ["settings.gate"]
+    assert rows_["legacy-game"] == [
+        "settings.gameplay",
+        "moderation.say",
+        "moderation.kick",
+        "moderation.maintenance",
+        "moderation.announce",
+        "console.run",
+    ]
 
 
 async def test_service_moderation_asserts_actor_and_executes(store):
@@ -5698,7 +6099,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     # CP-H5: the probe fails closed (503, no internals) when the DB is gone.
     response = await store["client"].get("/health")
     assert response.status_code == 200, response.text
-    assert response.json() == {"status": "ok", "schema": 9}
+    assert response.json() == {"status": "ok", "schema": 10}
     await store["app"].state.db.close()
     # Success is cached briefly so public probe floods skip the DB.
     assert (await store["client"].get("/health")).status_code == 200
@@ -5706,7 +6107,7 @@ async def test_c20_health_reports_database_outage(store, monkeypatch):
     monkeypatch.setattr(cpv2_app, "_health_clock", lambda: now + 6)
     broken = await store["client"].get("/health")
     assert broken.status_code == 503, broken.text
-    assert broken.json() == {"status": "unavailable", "schema": 9}
+    assert broken.json() == {"status": "unavailable", "schema": 10}
 
 
 async def test_health_reports_applied_schema_version_before_stats_migration(postgres):
