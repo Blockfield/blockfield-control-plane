@@ -1,49 +1,18 @@
 """Pinned gate; ephemeral PostgreSQL comes from the locked pgserver wheel."""
 
 import os
-import shutil
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def sweep_stale_backends():
-    """Stop and remove ephemeral PostgreSQL left by an interrupted earlier run.
-
-    pgserver daemonizes postgres into its own session, so a run killed before
-    its fixture teardown leaves it behind. Only directories older than any
-    legal run (20 min + grace) are touched, and only a postgres whose command
-    line names that directory is signalled.
-    """
-    cutoff = time.time() - 25 * 60
-    for data in (ROOT / ".cache").glob("cp-pg-*"):
-        if data.stat().st_mtime > cutoff:
-            continue
-        pid_file = next(data.rglob("postmaster.pid"), None)
-        if pid_file:
-            try:
-                pid = int(pid_file.read_text().split()[0])
-                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-            except (OSError, ValueError, IndexError):
-                pid = None
-            if pid and str(data).encode() in cmdline:
-                os.kill(pid, signal.SIGTERM)
-                for _ in range(60):
-                    if not Path(f"/proc/{pid}").exists():
-                        break
-                    time.sleep(0.5)
-        shutil.rmtree(data, ignore_errors=True)
 
 
 def main():
     if sys.argv[1:] not in ([], ["--review-regressions"]):
         raise SystemExit("usage: check_v2.py [--review-regressions]")
     pytest_args = ["-k", "c3_"] if sys.argv[1:] else []
-    sweep_stale_backends()
     for command in (
         [
             "ruff",
