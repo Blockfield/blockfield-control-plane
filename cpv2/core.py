@@ -1068,7 +1068,8 @@ async def console_log_ingest(conn, identity, attempt, consumer_id, body):
     if not isinstance(body, dict) or not isinstance(body.get("entries"), list):
         raise Problem("invalid_console_log", 422)
     entries = body["entries"]
-    if len(entries) > CONSOLE_LOG_MAX_BATCH:
+    # The game never posts an empty drain; an empty batch is a malformed call.
+    if not entries or len(entries) > CONSOLE_LOG_MAX_BATCH:
         raise Problem("invalid_console_log", 422)
     consumer = await _server_consumer(conn, consumer_id, body.get("generation"))
     # The caller's credential must be the consumer's own, which authenticate
