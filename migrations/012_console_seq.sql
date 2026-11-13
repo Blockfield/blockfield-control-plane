@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS console_log_seq(
  consumer_id text PRIMARY KEY REFERENCES consumers ON DELETE CASCADE,
  next_seq bigint NOT NULL DEFAULT 0
 );
+GRANT SELECT,INSERT,UPDATE ON console_log_seq TO cp_runtime;
 INSERT INTO console_log_seq(consumer_id, next_seq)
  SELECT consumer_id, COALESCE(MAX(seq),0) FROM console_log GROUP BY consumer_id
  ON CONFLICT DO NOTHING;

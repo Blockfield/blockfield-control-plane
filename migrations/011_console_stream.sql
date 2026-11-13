@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS console_log(
  PRIMARY KEY(consumer_id,seq)
 );
 CREATE INDEX IF NOT EXISTS console_log_consumer_seq ON console_log(consumer_id,seq);
+GRANT SELECT,INSERT,DELETE ON console_log TO cp_runtime;
 UPDATE consumers
 SET capabilities = array_append(capabilities, 'console.suggest')
 WHERE 'console.run' = ANY(capabilities)
