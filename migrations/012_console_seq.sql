@@ -3,7 +3,7 @@
 -- new logs until the sequence passed their cursor). The counter only moves
 -- forward on ingest, under a row lock, so concurrent batches serialize.
 SET search_path = control, pg_catalog, pg_temp;
-CREATE TABLE console_log_seq(
+CREATE TABLE IF NOT EXISTS console_log_seq(
  consumer_id text PRIMARY KEY REFERENCES consumers ON DELETE CASCADE,
  next_seq bigint NOT NULL DEFAULT 0
 );
