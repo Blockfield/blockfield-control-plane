@@ -76,8 +76,30 @@ class Wakeups:
                 await asyncio.sleep(1)
 
     def subscribe(self, consumer):
-        if (
-            sum(len(items) for items in self.waiters.values()) >= 64
+        # Agents and observers draw from separate pools: a staff session
+        # mints delegation credentials with two observer slots each, so
+        # without the split a builder could fill the 64 agent slots and
+        # block agent reconnects. Observers (the "observer:" user-events
+        # streams) cap at 32 total, agents at 64; two slots per consumer
+        # on either side.
+        if consumer.startswith("observer:"):
+            if (
+                sum(
+                    len(items)
+                    for name, items in self.waiters.items()
+                    if name.startswith("observer:")
+                )
+                >= 32
+                or len(self.waiters.get(consumer, ())) >= 2
+            ):
+                raise Problem("stream_limit", 429)
+        elif (
+            sum(
+                len(items)
+                for name, items in self.waiters.items()
+                if not name.startswith("observer:")
+            )
+            >= 64
             or len(self.waiters.get(consumer, ())) >= 2
         ):
             raise Problem("stream_limit", 429)
@@ -150,6 +172,14 @@ async def valid_operation(conn, op):
         if c["revoked_at"] or c["expires_at"] <= now():
             return "rejected"
         client = await one(conn, "SELECT * FROM clients WHERE id=%s", (c["client_id"],))
+        if (
+            op["kind"] == "console.run"
+            and op["required_scope"] == "console.run"
+            and client["via"] != "mcp"
+        ):
+            # M5 delivery recheck: read-only lines stay actorless for any
+            # service holder; other lines need an agent client, else an actor.
+            return "rejected"
         identity = Identity(c, client, None, [], False)
     else:
         account = await one(

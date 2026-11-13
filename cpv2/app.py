@@ -39,61 +39,135 @@ BODY_LIMITS = {
     "/v2/console/suggest": 4096,
 }
 
-# Public HTTPS entrypoint (coordination#35 owner decision «Публичный HTTPS»):
-# CP stays private-network-only (no Dokploy ingress); Traefik routes the
-# public domain to it and sets X-CP-Public: 1 on that router only, after
-# stripping any client-sent value. Direct container access needs homeserver
-# root, so the header is trustworthy: when present the request came through
-# the public router. Only the launcher/bot stats reads and liveness may pass.
-PUBLIC_ENTRYPOINT_HEADER = "x-cp-public"
-PUBLIC_ROUTES = ("/health", "/v2/stats/")
+# Public HTTPS entrypoint (coordination#35): CP runs twice from the same
+# image. The internal instance (default) serves the full API and ignores
+# X-CP-Public entirely; the public instance (CP_PUBLIC_ONLY=1) serves only
+# the exact allowlist in public_allowed, with its own connection limits,
+# DB pool and budgets. Traefik routes the public domain at the public
+# instance only (see docs/PUBLIC.md); no header value can flip either side.
+PUBLIC_EXACT_GET = ("/health", "/v2/stats/seasons", "/v2/stats/leaderboard")
+PUBLIC_PLAYERS_PREFIX = "/v2/stats/players/"
+PUBLIC_OPERATIONS_PREFIX = "/v2/operations/"
+PUBLIC_CONSOLE_RUN = "/v2/actions/console.run"
 
 
 def public_entrypoint(request):
-    return request.headers.get(PUBLIC_ENTRYPOINT_HEADER) == "1"
+    # Deployment decides, never a request header: the public instance runs
+    # with CP_PUBLIC_ONLY=1 and serves only the allowlist; the internal
+    # instance never enters public mode, so X-CP-Public is ignored outright.
+    return bool(getattr(request.app.state, "public_only", False))
 
 
-def client_address(request, hops=None):
+def _parse_client_entry(entry):
+    # X-Forwarded-For entries sometimes carry a port ("1.2.3.4:51234",
+    # "[2001:db8::1]:443"); strip it. Unparseable entries are
+    # client-controlled, so the caller fails closed to the socket peer.
+    entry = entry.strip()
+    try:
+        return ipaddress.ip_address(entry)
+    except ValueError:
+        pass
+    if entry.startswith("[") and "]" in entry:
+        try:
+            return ipaddress.ip_address(entry[1 : entry.index("]")])
+        except ValueError:
+            return None
+    if entry.count(":") == 1 and "." in entry:
+        try:
+            return ipaddress.ip_address(entry.rsplit(":", 1)[0])
+        except ValueError:
+            return None
+    return None
+
+
+def _ip_bucket(address):
+    # One IPv6 /64 is one bucket: per-address keying would hand every
+    # client an unlimited supply. IPv4-mapped addresses key as IPv4.
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            return str(mapped)
+        return str(
+            ipaddress.ip_network((int(address), 64), strict=False).network_address
+        )
+    return str(address)
+
+
+def client_address(request):
     """Address the per-IP public budget keys on.
 
     Behind Traefik request.client is the proxy, so every public client would
-    share one bucket. Each trusted proxy appends the peer it saw to
-    X-Forwarded-For; entries further left are client-supplied and ignored.
-    CP_PUBLIC_TRUSTED_HOPS is the number of trusted proxies in front
-    (1 = Traefik alone, see docs/PUBLIC.md). Internal requests and a missing
-    or malformed chain keep the socket peer.
+    share one bucket. Each trusted proxy appends the peer it saw, so the
+    chain reads client-first; entries left of the rightmost untrusted one
+    are client-supplied and ignored. CP_PUBLIC_TRUSTED_PROXIES lists the
+    proxies in front (the public-only instance knows its single trusted
+    hop); empty means every request keys on the socket peer. Internal
+    requests and a malformed chain keep the socket peer.
     """
     peer = request.client.host if request.client else "unknown"
     if not public_entrypoint(request):
         return peer
-    if hops is None:
-        hops = int(os.environ.get("CP_PUBLIC_TRUSTED_HOPS", "1"))
     chain = [
-        part.strip()
+        part
         for part in request.headers.get("x-forwarded-for", "").split(",")
         if part.strip()
     ]
-    if hops < 1 or len(chain) < hops:
-        return peer
     try:
-        return str(ipaddress.ip_address(chain[-hops]))
+        peer_ip = ipaddress.ip_address(peer)
     except ValueError:
         return peer
+    trusted = getattr(request.app.state, "public_trusted", ())
+    entries = [_parse_client_entry(part) for part in chain] + [peer_ip]
+    for entry in reversed(entries):
+        if entry is None:
+            return peer
+        if any(entry in network for network in trusted):
+            continue
+        return _ip_bucket(entry)
+    return peer
+
+
+def _single_segment(path, prefix):
+    rest = path[len(prefix) :]
+    return bool(rest) and "/" not in rest
 
 
 def public_allowed(method, path):
-    # Reads only: mutations (POST stats ingest/diagnostics/void, console,
-    # actions, acks, settings) 404 on the public entrypoint even with a
-    # valid token, per docs/PUBLIC.md.
-    if method not in ("GET", "HEAD"):
-        return False
-    return path == "/health" or path.startswith("/v2/stats/")
+    # Exact routes only: hit-reg and diagnostics are staff-only and never
+    # pass here (M1), and mutations other than console.run 404 before the
+    # body is read. Console lines and operation reads still authenticate:
+    # a console.read credential runs only the read-only allowlist (core
+    # re-checks the scope), and an operation read serves only the operation
+    # the caller's own credential issued.
+    if method in ("GET", "HEAD"):
+        if path in PUBLIC_EXACT_GET:
+            return True
+        if path.startswith(PUBLIC_PLAYERS_PREFIX) and _single_segment(
+            path, PUBLIC_PLAYERS_PREFIX
+        ):
+            return True
+        return path.startswith(PUBLIC_OPERATIONS_PREFIX) and _single_segment(
+            path, PUBLIC_OPERATIONS_PREFIX
+        )
+    return method == "POST" and path == PUBLIC_CONSOLE_RUN
+
+
+def public_anonymous(path):
+    # Owner decision «Без токена»: leaderboard, player profiles and seasons
+    # read anonymously on the public instance, under the per-IP limits.
+    if path in PUBLIC_EXACT_GET:
+        return True
+    return path.startswith(PUBLIC_PLAYERS_PREFIX) and _single_segment(
+        path, PUBLIC_PLAYERS_PREFIX
+    )
 
 
 def secure(response):
     # The API is JSON-only: no sniffing, no framing, no referrer, and HSTS
     # for the public domain (internal loopback callers ignore it).
-    response.headers["Strict-Transport-Security"] = "max-age=3153600; includeSubDomains"
+    response.headers["Strict-Transport-Security"] = (
+        "max-age=31536000; includeSubDomains"
+    )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -129,8 +203,29 @@ class Limits:
         self.buckets[key] = count + 1
 
 
+def raw_path(request):
+    # Policy checks use the raw scope path, never the re-parsed URL: the
+    # URL parser drops characters like tabs, so /hea%09lth passed the
+    # allowlist while the router 404'd it. The guarantee must not rest on
+    # the framework's normalization.
+    return request.scope.get("route_path", request.scope["path"])
+
+
 def create_app(dsn=None):
-    database = Database(dsn or os.environ["CP_DATABASE_URL"])
+    public_only = os.environ.get("CP_PUBLIC_ONLY") == "1"
+    trusted = []
+    for part in os.environ.get("CP_PUBLIC_TRUSTED_PROXIES", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            trusted.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            raise RuntimeError(f"bad CP_PUBLIC_TRUSTED_PROXIES entry: {part!r}")
+    pool_max = int(
+        os.environ.get("CP_DB_POOL_MAX", "4" if public_only else "8"),
+    )
+    database = Database(dsn or os.environ["CP_DATABASE_URL"], max_size=pool_max)
     wakeups = delivery.Wakeups(dsn or os.environ["CP_DATABASE_URL"])
 
     @asynccontextmanager
@@ -202,12 +297,25 @@ def create_app(dsn=None):
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
+        # A trailing slash must never 307 to an http:// URL built from the
+        # Host header: unknown suffixed paths 404 like everything else.
+        redirect_slashes=False,
     )
     app.state.db, app.state.wakeups = database, wakeups
+    app.state.public_only = public_only
+    app.state.public_trusted = tuple(trusted)
+    # Anonymous public stats reads are cached briefly, so a probe flood
+    # costs one aggregate per TTL window instead of one per request.
+    app.state.pub_cache = {}
+    # Per-key singleflight locks for the cache above, same bound: anonymous
+    # misses for one effective query share a single aggregate.
+    app.state.pub_locks = {}
     limiter = Limits()
-    # Public entrypoint budgets: per-IP and per-token, independent of the
-    # internal shared budget, so a public flood cannot deny internal agents.
-    pub_ip_limiter = Limits()
+    # Public pre-auth budget: per-IP plus a public-global total, checked
+    # before the allowlist and before any DB lookup, so anonymous floods
+    # cannot reach the pool. A separate object from the internal limiter,
+    # so public traffic never consumes internal budgets and vice versa.
+    pub_pre_limiter = Limits(budget=2000)
     pub_token_limiter = Limits()
     # Every per-key bucket a public request touches lives here, never in
     # limiter: public per-client/per-token/per-IP buckets are fully separate
@@ -218,10 +326,15 @@ def create_app(dsn=None):
     # bearer strings cannot burn the shared budget that health checks and
     # authenticated agents rely on.
     unauth_limiter = Limits(budget=100)
+    # The public instance accounts its own auth failures here: an internal
+    # caller with a wrong bearer gets 401 from the internal budget alone,
+    # never 429 from public traffic.
+    pub_unauth_limiter = Limits(budget=100)
     # Handles for the bucket-isolation tests: public traffic must not
     # consume any internal bucket and vice versa.
     app.state.limiter = limiter
     app.state.pub_limiter = pub_limiter
+    app.state.pub_pre_limiter = pub_pre_limiter
 
     @app.exception_handler(Problem)
     async def problem_handler(request, error):
@@ -240,8 +353,9 @@ def create_app(dsn=None):
     @app.middleware("http")
     async def pipeline(request, call_next):
         attempt, identity = uuid4(), None
+        path = raw_path(request)
         mutation = request.method not in ("GET", "HEAD", "OPTIONS")
-        public = request.url.path in ("/openapi.json", "/v1/openapi.json", "/health")
+        public = path in ("/openapi.json", "/v1/openapi.json", "/health")
         auth_header = request.headers.get("authorization", "")
         token = (
             auth_header[7:]
@@ -249,30 +363,38 @@ def create_app(dsn=None):
             else ""
         )
         request.state.attempt = attempt
-        key = verifier(token) if token else client_address(request)
+        entry_public = public_entrypoint(request)
+        ip = client_address(request) if entry_public else None
+        key = (
+            verifier(token)
+            if token
+            else (ip if entry_public else client_address(request))
+        )
         try:
-            # The public entrypoint serves only the launcher/bot stats reads
-            # and liveness; agent/site/admin routes never pass on it, even
-            # with a valid token, so a scoped public token cannot reach
-            # actions, acks or settings from the internet.
-            entry_public = public_entrypoint(request)
-            if entry_public and not public_allowed(request.method, request.url.path):
-                return secure(JSONResponse({"error": "not_found"}, status_code=404))
-            # Public requests draw every per-key bucket from pub_limiter and
-            # the pub_ip/pub_token budgets, never from the internal limiter.
+            # The public instance serves only the exact allowlist; everything
+            # else 404s, even with a valid token. The internal instance never
+            # enters this branch: it does not trust the header at all.
+            if entry_public:
+                # Pre-auth budget first: per-IP plus a public-global total,
+                # before the allowlist and before any DB lookup, so floods
+                # cannot reach the pool.
+                pub_pre_limiter.check(ip, global_count=True, limit=120)
+                if not public_allowed(request.method, path):
+                    return secure(JSONResponse({"error": "not_found"}, status_code=404))
+            # Public requests draw every per-key bucket from pub_limiter,
+            # never from the internal limiter.
             budget = pub_limiter if entry_public else limiter
             # Per-key bound only: pre-auth traffic must not burn the shared
             # budget, which counts authenticated requests below.
             budget.check(key, global_count=False)
-            if entry_public:
-                pub_ip_limiter.check(client_address(request), global_count=False)
-            if not public:
+            anonymous = entry_public and not token and public_anonymous(path)
+            if not public and not anonymous:
                 try:
                     async with database.transaction() as conn:
                         identity = await authenticate(conn, token)
                 except Problem:
                     # Legacy tokens only retain the temporary read-only compatibility route.
-                    if request.method == "GET" and request.url.path == "/v1/gate":
+                    if request.method == "GET" and path == "/v1/gate":
                         async with database.transaction() as conn:
                             legacy = await one(
                                 conn,
@@ -280,10 +402,14 @@ def create_app(dsn=None):
                                 (verifier(token),),
                             )
                         if not legacy:
-                            unauth_limiter.check(key)
+                            (
+                                pub_unauth_limiter if entry_public else unauth_limiter
+                            ).check(key if token else ip)
                             raise
                     else:
-                        unauth_limiter.check(key)
+                        (pub_unauth_limiter if entry_public else unauth_limiter).check(
+                            key if token else ip
+                        )
                         if mutation:
                             async with database.transaction() as conn:
                                 await audit(
@@ -291,15 +417,15 @@ def create_app(dsn=None):
                                     attempt,
                                     None,
                                     request.method,
-                                    request.url.path,
+                                    path,
                                     "pending",
                                 )
                         raise
             if identity:
                 if entry_public:
-                    # Per-token public budget: one launcher/bot token polls
-                    # stats every tens of seconds; 60/min leaves headroom
-                    # without letting one token burn the shared budget.
+                    # Per-token public budget: a bot token polls stats every
+                    # tens of seconds; 60/min leaves headroom without letting
+                    # one token burn the shared budget.
                     pub_token_limiter.check(
                         ("pub-token", str(identity.credential["id"])),
                         global_count=False,
@@ -308,9 +434,10 @@ def create_app(dsn=None):
                 if identity.actor:
                     budget.check(("actor", str(identity.actor)), global_count=False)
                 # The shared budget counts authenticated internal requests only:
-                # public traffic stays on pub_limiter (plus the pub_ip/pub_token
-                # budgets above), so a public flood cannot deny internal agents
-                # and internal traffic cannot deny public readers.
+                # public traffic stays on pub_limiter (plus the pub_pre and
+                # pub_token budgets above), so a public flood cannot deny
+                # internal agents and internal traffic cannot deny public
+                # readers.
                 budget.check(
                     ("client", identity.client["id"]),
                     global_count=not entry_public,
@@ -320,11 +447,12 @@ def create_app(dsn=None):
                     (
                         "resource",
                         str(identity.actor or identity.client["id"]),
-                        request.url.path,
+                        path,
                     ),
                     global_count=False,
                 )
             request.state.identity, request.state.token = identity, token
+            request.state.entry_public = entry_public
             if mutation:
                 async with database.transaction() as conn:
                     await audit(
@@ -332,11 +460,11 @@ def create_app(dsn=None):
                         attempt,
                         identity,
                         request.method,
-                        request.url.path,
+                        path,
                         "pending",
                     )
                 chunks, size = [], 0
-                limit = BODY_LIMITS.get(request.url.path, 32768)
+                limit = BODY_LIMITS.get(path, 32768)
                 async with asyncio.timeout(5):
                     async for chunk in request.stream():
                         size += len(chunk)
@@ -350,7 +478,7 @@ def create_app(dsn=None):
                     != "application/json"
                 ):
                     raise Problem("json_required", 415)
-            if request.url.path.endswith("/events"):
+            if path.endswith("/events"):
                 response = await call_next(request)
             else:
                 async with asyncio.timeout(10):
@@ -362,7 +490,7 @@ def create_app(dsn=None):
                         attempt,
                         identity,
                         request.method,
-                        request.url.path,
+                        path,
                         "denied" if response.status_code in (401, 403) else "invalid",
                         {"httpStatus": response.status_code},
                     )
@@ -377,7 +505,7 @@ def create_app(dsn=None):
                         attempt,
                         identity,
                         request.method,
-                        request.url.path,
+                        path,
                         "completed",
                         {"httpStatus": response.status_code},
                         getattr(request.state, "operation", None),
@@ -393,7 +521,7 @@ def create_app(dsn=None):
                         attempt,
                         identity,
                         request.method,
-                        request.url.path,
+                        path,
                         "denied",
                         {"code": error.code},
                     )
@@ -441,7 +569,7 @@ def create_app(dsn=None):
                 request.state.attempt,
                 audit_identity,
                 request.method,
-                request.url.path,
+                raw_path(request),
                 "completed",
                 None,
                 request.state.operation,
@@ -462,15 +590,22 @@ def create_app(dsn=None):
     health_schema = len(MIGRATIONS)
 
     @app.get("/health")
-    async def health():
+    async def health(request: Request):
         # CP-H5: unauthenticated liveness + readiness. 200 only when the
         # control database answers, the owner bootstrap is present, and the
         # stats migration is applied. Never leak DSNs, errors or gate state.
+        # On the public instance the schema version stays hidden: liveness
+        # alone answers the probe.
         nonlocal health_ok_until, health_schema
+        hide_schema = request.state.entry_public
         # Public route: cache success so probe floods cannot drain the DB pool;
         # failures re-check, since an outage has no pool left to protect.
         if _health_clock() < health_ok_until:
-            return {"status": "ok", "schema": health_schema}
+            return (
+                {"status": "ok"}
+                if hide_schema
+                else {"status": "ok", "schema": health_schema}
+            )
         try:
             async with database.transaction() as conn:
                 bootstrapped = await one(
@@ -480,6 +615,8 @@ def create_app(dsn=None):
                     conn, "SELECT MAX(version) AS version FROM schema_migrations"
                 )
         except Exception:
+            if hide_schema:
+                return JSONResponse({"status": "unavailable"}, status_code=503)
             return JSONResponse(
                 {"status": "unavailable", "schema": health_schema}, status_code=503
             )
@@ -488,11 +625,13 @@ def create_app(dsn=None):
         )
         health_schema = version
         if not bootstrapped or not bootstrapped["ok"] or version < len(MIGRATIONS):
+            if hide_schema:
+                return JSONResponse({"status": "unavailable"}, status_code=503)
             return JSONResponse(
                 {"status": "unavailable", "schema": version}, status_code=503
             )
         health_ok_until = _health_clock() + 5
-        return {"status": "ok", "schema": version}
+        return {"status": "ok"} if hide_schema else {"status": "ok", "schema": version}
 
     @app.get("/v1/openapi.json")
     async def openapi():
@@ -628,7 +767,7 @@ def create_app(dsn=None):
             target,
             body,
             assertion=assertion(request),
-            path=request.url.path,
+            path=raw_path(request),
         )
 
     @app.post("/v2/settings/{namespace}/{target}/validate")
@@ -660,7 +799,7 @@ def create_app(dsn=None):
             target,
             body,
             assertion=assertion(request),
-            path=request.url.path,
+            path=raw_path(request),
             rollback=True,
         )
 
@@ -719,7 +858,7 @@ def create_app(dsn=None):
     )
     async def grants(body: models.GrantChange, request: Request):
         return await write(
-            request, core.grant_change, body, assertion(request), request.url.path
+            request, core.grant_change, body, assertion(request), raw_path(request)
         )
 
     @app.post(
@@ -734,7 +873,7 @@ def create_app(dsn=None):
             account_id,
             body,
             assertion(request),
-            request.url.path,
+            raw_path(request),
         )
 
     @app.post(
@@ -757,7 +896,7 @@ def create_app(dsn=None):
             kind,
             body,
             assertion(request),
-            request.url.path,
+            raw_path(request),
         )
 
     @app.post("/v2/delegations", status_code=201)
@@ -809,29 +948,106 @@ def create_app(dsn=None):
             params["period"] = default_period
         return params
 
+    # Anonymous public stats cache: one aggregate per effective query per
+    # TTL window instead of one per request. Authenticated reads bypass it;
+    # failures never cache.
+    PUB_STATS_TTL = 20.0
+
+    def pub_stats_key(request, params, query, extra=None):
+        # Key on the validated, effective filters only: unknown query params
+        # never enter it, so junk-param floods cannot bypass the cache, and
+        # normalization (defaults applied, limit/page parsed) means
+        # equivalent URLs share one entry. Volatile windows (since/until)
+        # stay out: a season id or period name names the window; the TTL
+        # absorbs rows ingested between two reads of the same window.
+        period = None if query["season"] is not None else params.get("period", "all")
+        key = (
+            raw_path(request),
+            query["mode"],
+            query["season"],
+            period,
+            query["sort"],
+            query["limit"],
+            query["page"],
+        )
+        return key if extra is None else key + (extra,)
+
+    async def pub_aggregate(request, key, compute):
+        # Anonymous-public singleflight around compute(): concurrent misses
+        # for one key share a single database aggregate instead of
+        # stampeding the pool. Authenticated callers bypass the cache
+        # entirely (their reads stay unshared); failures never store.
+        if request.state.identity is not None or not request.state.entry_public:
+            return await compute()
+        entry = app.state.pub_cache.get(key)
+        if entry and entry[0] > time.monotonic():
+            return JSONResponse(entry[1])
+        lock = app.state.pub_locks.get(key)
+        if lock is None:
+            if len(app.state.pub_locks) > 512:
+                app.state.pub_locks.pop(next(iter(app.state.pub_locks)))
+            lock = app.state.pub_locks[key] = asyncio.Lock()
+        async with lock:
+            entry = app.state.pub_cache.get(key)
+            if entry and entry[0] > time.monotonic():
+                return JSONResponse(entry[1])
+            payload = await compute()
+            app.state.pub_cache[key] = (time.monotonic() + PUB_STATS_TTL, payload)
+            if len(app.state.pub_cache) > 512:
+                app.state.pub_cache.pop(next(iter(app.state.pub_cache)))
+            return payload
+
+    def stats_require(request):
+        # Anonymous on the public instance (owner decision «Без токена»);
+        # everywhere else the stats.read scope decides.
+        identity = request.state.identity
+        if identity is None:
+            if not request.state.entry_public:
+                raise Problem("unauthorized", 401)
+            return
+        identity.require("stats.read", "prod", "game", "*")
+
     @app.get("/v2/stats/seasons")
     async def stats_seasons(request: Request):
-        request.state.identity.require("stats.read", "prod", "game", "*")
-        seasons = core.stat_seasons()
-        return {
-            "schemaVersion": 1,
-            "current": seasons[-1]["id"] if seasons else None,
-            "seasons": seasons,
-        }
+        stats_require(request)
+
+        async def compute():
+            seasons = core.stat_seasons()
+            return {
+                "schemaVersion": 1,
+                "current": seasons[-1]["id"] if seasons else None,
+                "seasons": seasons,
+            }
+
+        return await pub_aggregate(request, (raw_path(request),), compute)
 
     @app.get("/v2/stats/leaderboard")
     async def stats_leaderboard(request: Request):
-        request.state.identity.require("stats.read", "prod", "game", "*")
-        query = core.stat_filters(stats_query(request))
-        async with database.transaction() as conn:
-            return await core.stat_leaderboard(conn, query)
+        stats_require(request)
+        params = stats_query(request)
+        query = core.stat_filters(params)
+
+        async def compute():
+            async with database.transaction() as conn:
+                return await core.stat_leaderboard(conn, query)
+
+        return await pub_aggregate(
+            request, pub_stats_key(request, params, query), compute
+        )
 
     @app.get("/v2/stats/players/{player_uuid}")
     async def stats_player(player_uuid: str, request: Request):
-        request.state.identity.require("stats.read", "prod", "game", "*")
-        query = core.stat_filters(stats_query(request))
-        async with database.transaction() as conn:
-            return await core.stat_player(conn, query, player_uuid)
+        stats_require(request)
+        params = stats_query(request)
+        query = core.stat_filters(params)
+
+        async def compute():
+            async with database.transaction() as conn:
+                return await core.stat_player(conn, query, player_uuid)
+
+        return await pub_aggregate(
+            request, pub_stats_key(request, params, query, player_uuid), compute
+        )
 
     @app.get("/v2/stats/hitreg")
     async def stats_hitreg(request: Request):
@@ -894,7 +1110,14 @@ def create_app(dsn=None):
     @app.get("/v2/operations/{operation_id}")
     async def operation(operation_id: UUID, request: Request):
         async with database.transaction() as conn:
-            return await core.read_operation(conn, request.state.identity, operation_id)
+            return await core.read_operation(
+                conn,
+                request.state.identity,
+                operation_id,
+                # Public reads are own-credential-only (coordination#35): the
+                # general operations.read/audit.read policy stays internal.
+                issuer_only=request.state.entry_public,
+            )
 
     @app.post("/v2/console/logs", status_code=201)
     async def console_log_push(body: dict, request: Request):
@@ -929,10 +1152,31 @@ def create_app(dsn=None):
         # for the game consumer and waits for its ack output (≤5 s) instead
         # of returning a receipt the site would have to poll. Scope
         # console.read: completing a line is not running it.
-        result = await write(request, core.console_suggest, body)
-        output = await core.console_suggest_output(
-            database, wakeups, (body or {}).get("consumerId"), result["operationId"]
+        # The waiter slot is taken before the enqueue: with 64 waiters busy
+        # the request 429s here instead of queueing a frame it cannot wait
+        # for and filling the lag window.
+        consumer_id = body.get("consumerId") if isinstance(body, dict) else None
+        waiter = (
+            wakeups.subscribe_suggest(consumer_id)
+            if isinstance(consumer_id, str)
+            else None
         )
+        # Cancellation-safe ownership: a cancellation while write waits on
+        # the database must release the preallocated waiter (CancelledError
+        # is not an Exception, so the old handler leaked it and 64
+        # cancellations exhausted the slots permanently). Ownership moves to
+        # console_suggest_output — whose finally releases it — only once
+        # write returns.
+        transferred = False
+        try:
+            result = await write(request, core.console_suggest, body)
+            transferred = True
+            output = await core.console_suggest_output(
+                database, wakeups, consumer_id, result["operationId"], waiter=waiter
+            )
+        finally:
+            if not transferred and waiter is not None:
+                wakeups.unsubscribe_suggest(consumer_id, waiter)
         if output is None:
             raise Problem("suggest_timeout", 504)
         return core.check_suggest_output(output)

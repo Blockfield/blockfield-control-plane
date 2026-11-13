@@ -50,11 +50,11 @@ async def record(conn, query, args):
 
 
 class Database:
-    def __init__(self, dsn):
+    def __init__(self, dsn, max_size=8):
         self.pool = AsyncConnectionPool(
             dsn,
             min_size=1,
-            max_size=8,
+            max_size=max_size,
             open=False,
             timeout=5,
             kwargs={
