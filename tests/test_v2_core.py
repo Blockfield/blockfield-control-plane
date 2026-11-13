@@ -4,7 +4,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import os
 import random
 import secrets
 import sqlite3
@@ -173,9 +172,6 @@ def test_docker_default_runs_cpv2():
 
 @pytest.fixture(scope="session")
 def postgres():
-    assert (
-        os.environ.get("BLOCKFIELD_BOAT_VM") == "1" or os.environ.get("CI") == "true"
-    ), "VM/CI only"
     Path(".cache").mkdir(exist_ok=True)
     subprocess.run(["ss", "-ltnp"], check=True, capture_output=True, timeout=5)
     with tempfile.TemporaryDirectory(prefix="cp-pg-", dir=".cache") as temp:
