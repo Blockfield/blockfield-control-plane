@@ -13,6 +13,6 @@ CREATE TABLE console_log(
 );
 CREATE INDEX console_log_consumer_seq ON console_log(consumer_id,seq);
 UPDATE consumers
-SET capabilities = capabilities || 'console.suggest'
+SET capabilities = array_append(capabilities, 'console.suggest')
 WHERE 'console.run' = ANY(capabilities)
 AND NOT 'console.suggest' = ANY(capabilities);
