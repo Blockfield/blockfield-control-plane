@@ -44,6 +44,12 @@ def main():
         start_new_session=True,
     )
 
+    def terminated(signum, frame):
+        # CI cancels by SIGTERM; route it through the same cleanup as Ctrl+C.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, terminated)
+
     def stop():
         # SIGINT first so fixtures tear the backend down; then the group.
         os.killpg(pytest.pid, signal.SIGINT)
@@ -59,7 +65,7 @@ def main():
         stop()
         raise SystemExit("pytest exceeded 20 minutes")
     except KeyboardInterrupt:
-        # Ctrl+C reaches only this process (pytest has its own session).
+        # Ctrl+C and SIGTERM reach only this process (pytest has its own session).
         stop()
         raise
     if code:
