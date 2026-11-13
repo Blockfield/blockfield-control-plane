@@ -33,12 +33,12 @@ permissions:
   pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
   actions: read # same-tree lookup reads earlier runs and their artifacts
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
   # A review must never cancel the run it gates.
   cancel-in-progress: false
 jobs:
   bot-gate:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'bot-gate (skipped review)' || 'bot-gate' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'bot-gate (skipped review)' || 'bot-gate' }}
     # Enforcing: `check` runs on a PR head only when this job reports
     # verdict=permit with sha_match=true for the CURRENT head SHA, resolved
     # from the API at gate runtime (a push may have landed after the
@@ -51,7 +51,7 @@ jobs:
     # own `bot-review` commit status blocks merge.
     runs-on: tenki-standard-autoscale
     timeout-minutes: 5
-    if: github.event_name == 'pull_request_review' && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
+    if: github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
     outputs:
       verdict: ${{ steps.gate.outputs.verdict }}
       sha_match: ${{ steps.gate.outputs.sha_match }}
@@ -102,7 +102,7 @@ jobs:
             echo "sha=$HEAD_SHA"
           } >> "$GITHUB_OUTPUT"
   test:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'test (skipped review)' || 'test' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'test (skipped review)' || 'test' }}
     # Main pushes and maintainer dispatches always run; PR heads run only
     # on a gate permit for the exact head SHA.
     needs: [bot-gate]
