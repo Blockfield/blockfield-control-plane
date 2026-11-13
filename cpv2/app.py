@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import os
 import time
@@ -50,6 +51,34 @@ PUBLIC_ROUTES = ("/health", "/v2/stats/")
 
 def public_entrypoint(request):
     return request.headers.get(PUBLIC_ENTRYPOINT_HEADER) == "1"
+
+
+def client_address(request, hops=None):
+    """Address the per-IP public budget keys on.
+
+    Behind Traefik request.client is the proxy, so every public client would
+    share one bucket. Each trusted proxy appends the peer it saw to
+    X-Forwarded-For; entries further left are client-supplied and ignored.
+    CP_PUBLIC_TRUSTED_HOPS is the number of trusted proxies in front
+    (1 = Traefik alone, see docs/PUBLIC.md). Internal requests and a missing
+    or malformed chain keep the socket peer.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if not public_entrypoint(request):
+        return peer
+    if hops is None:
+        hops = int(os.environ.get("CP_PUBLIC_TRUSTED_HOPS", "1"))
+    chain = [
+        part.strip()
+        for part in request.headers.get("x-forwarded-for", "").split(",")
+        if part.strip()
+    ]
+    if hops < 1 or len(chain) < hops:
+        return peer
+    try:
+        return str(ipaddress.ip_address(chain[-hops]))
+    except ValueError:
+        return peer
 
 
 def public_allowed(method, path):
@@ -220,11 +249,7 @@ def create_app(dsn=None):
             else ""
         )
         request.state.attempt = attempt
-        key = (
-            verifier(token)
-            if token
-            else (request.client.host if request.client else "unknown")
-        )
+        key = verifier(token) if token else client_address(request)
         try:
             # The public entrypoint serves only the launcher/bot stats reads
             # and liveness; agent/site/admin routes never pass on it, even
@@ -240,10 +265,7 @@ def create_app(dsn=None):
             # budget, which counts authenticated requests below.
             budget.check(key, global_count=False)
             if entry_public:
-                pub_ip_limiter.check(
-                    request.client.host if request.client else "unknown",
-                    global_count=False,
-                )
+                pub_ip_limiter.check(client_address(request), global_count=False)
             if not public:
                 try:
                     async with database.transaction() as conn:
