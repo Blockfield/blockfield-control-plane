@@ -1261,7 +1261,7 @@ async def delegate(conn, identity, attempt, model):
     return {**result, "credentialId": str(cid), "token": token}
 
 
-async def read_operation(conn, identity, op_id):
+async def read_operation(conn, identity, op_id, *, issuer_only=False):
     op = await one(conn, "SELECT * FROM operations WHERE id=%s FOR UPDATE", (op_id,))
     if not op:
         raise Problem("operation_not_found", 404)
@@ -1275,6 +1275,12 @@ async def read_operation(conn, identity, op_id):
         for scope in op["required_scope"].split(",")
     )
     if not issuer:
+        # The public operation endpoint serves only the caller's own
+        # credential: operations.read/audit.read never widen it, so one
+        # credential cannot poll another's operations (and console output)
+        # through the public domain.
+        if issuer_only:
+            raise Problem("forbidden")
         identity.require(
             "operations.read", op["environment"], op["backend"], op["resource"]
         )

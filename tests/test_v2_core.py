@@ -10621,6 +10621,83 @@ def test_public_allowlist_is_exact_and_uses_raw_scope():
     assert not allowed("GET", raw_path(SimpleNamespace(scope=scope)))
 
 
+async def test_public_operation_reads_are_own_credential_only(store, monkeypatch):
+    op = await queued(store)
+    path = "/v2/operations/" + op["operationId"]
+    # Internal policy is unchanged: privileged readers read foreign operations.
+    assert (await request(store, "GET", path, role="owner")).status_code == 200
+    assert (await request(store, "GET", path, role="admin")).status_code == 200
+    assert (await request(store, "GET", path, role="moderator")).status_code == 200
+    async with public_app(store, monkeypatch) as pub:
+        # The issuing credential reads its own operation on the public instance.
+        own = await pub_request(pub, store, "GET", path, None, "moderator")
+        assert own.status_code == 200, own.text
+        # operations.read (admin) and audit.read (owner) never widen it there.
+        for role in ("owner", "admin", "builder"):
+            foreign = await pub_request(pub, store, "GET", path, None, role)
+            assert foreign.status_code == 403, (role, foreign.text)
+            assert foreign.json() == {"error": "forbidden"}, (role, foreign.text)
+
+
+async def test_public_stats_cache_ignores_unknown_params(store, monkeypatch):
+    calls = 0
+    real = core.stat_leaderboard
+
+    async def counting(conn, query):
+        nonlocal calls
+        calls += 1
+        return await real(conn, query)
+
+    monkeypatch.setattr(core, "stat_leaderboard", counting)
+    async with public_app(store, monkeypatch) as pub:
+        first = await pub_request(pub, store, "GET", "/v2/stats/leaderboard?zzz=1")
+        assert first.status_code == 200, first.text
+        # A different junk param names the same effective query: a cache hit,
+        # not a fresh aggregate.
+        second = await pub_request(pub, store, "GET", "/v2/stats/leaderboard?zzz=2")
+        assert second.status_code == 200, second.text
+        assert calls == 1, calls
+        assert second.json() == first.json()
+        # Effective filters still key apart.
+        third = await pub_request(pub, store, "GET", "/v2/stats/leaderboard?limit=1")
+        assert third.status_code == 200, third.text
+        assert calls == 2, calls
+
+
+async def test_public_stats_concurrent_misses_share_one_aggregate(store, monkeypatch):
+    calls = 0
+    entered, release = asyncio.Event(), asyncio.Event()
+    real = core.stat_leaderboard
+
+    async def gated(conn, query):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+        return await real(conn, query)
+
+    monkeypatch.setattr(core, "stat_leaderboard", gated)
+    async with public_app(store, monkeypatch) as pub:
+
+        async def opener():
+            await asyncio.wait_for(entered.wait(), 10)
+            release.set()
+
+        task = asyncio.create_task(opener())
+        try:
+            first, second = await asyncio.gather(
+                pub_request(pub, store, "GET", "/v2/stats/leaderboard"),
+                pub_request(pub, store, "GET", "/v2/stats/leaderboard"),
+            )
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert calls == 1, calls
+        assert first.json() == second.json()
+
+
 async def test_public_stats_cache_serves_anonymous(store, monkeypatch):
     calls = 0
     real_seasons = core.stat_seasons
@@ -10700,6 +10777,31 @@ def test_observer_stream_pool_is_separate():
         for consumer, waiter in held:
             wakeups.unsubscribe(consumer, waiter)
     assert not wakeups.waiters
+
+
+async def test_suggest_cancellation_releases_waiter(store, monkeypatch):
+    # A cancellation while write waits on the database must release the
+    # preallocated waiter: 64 such cancellations used to exhaust the slots.
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hanging(conn, identity, attempt, body):
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+        raise AssertionError("unreachable: cancelled first")
+
+    monkeypatch.setattr(core, "console_suggest", hanging)
+    wakeups = store["app"].state.wakeups
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            store["client"].post(
+                "/v2/console/suggest",
+                json=suggest_body(store, "s-cancel", "time s"),
+                headers=headers(store),
+            ),
+            5,
+        )
+    release.set()
+    assert not wakeups.suggest_waiters
 
 
 async def test_suggest_takes_waiter_slot_before_enqueue(store):

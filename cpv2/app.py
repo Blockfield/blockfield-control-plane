@@ -307,6 +307,9 @@ def create_app(dsn=None):
     # Anonymous public stats reads are cached briefly, so a probe flood
     # costs one aggregate per TTL window instead of one per request.
     app.state.pub_cache = {}
+    # Per-key singleflight locks for the cache above, same bound: anonymous
+    # misses for one effective query share a single aggregate.
+    app.state.pub_locks = {}
     limiter = Limits()
     # Public pre-auth budget: per-IP plus a public-global total, checked
     # before the allowlist and before any DB lookup, so anonymous floods
@@ -945,34 +948,54 @@ def create_app(dsn=None):
             params["period"] = default_period
         return params
 
-    # Anonymous public stats cache: one aggregate per query per TTL window
-    # instead of one per request. Authenticated reads bypass it; failures
-    # never cache.
+    # Anonymous public stats cache: one aggregate per effective query per
+    # TTL window instead of one per request. Authenticated reads bypass it;
+    # failures never cache.
     PUB_STATS_TTL = 20.0
 
-    def pub_cache_key(request):
-        return (
+    def pub_stats_key(request, params, query, extra=None):
+        # Key on the validated, effective filters only: unknown query params
+        # never enter it, so junk-param floods cannot bypass the cache, and
+        # normalization (defaults applied, limit/page parsed) means
+        # equivalent URLs share one entry. Volatile windows (since/until)
+        # stay out: a season id or period name names the window; the TTL
+        # absorbs rows ingested between two reads of the same window.
+        period = None if query["season"] is not None else params.get("period", "all")
+        key = (
             raw_path(request),
-            tuple(sorted((k, v) for k, v in request.query_params.items())),
+            query["mode"],
+            query["season"],
+            period,
+            query["sort"],
+            query["limit"],
+            query["page"],
         )
+        return key if extra is None else key + (extra,)
 
-    def pub_cached(request):
-        if request.state.identity is not None:
-            return None
-        entry = app.state.pub_cache.get(pub_cache_key(request))
+    async def pub_aggregate(request, key, compute):
+        # Anonymous-public singleflight around compute(): concurrent misses
+        # for one key share a single database aggregate instead of
+        # stampeding the pool. Authenticated callers bypass the cache
+        # entirely (their reads stay unshared); failures never store.
+        if request.state.identity is not None or not request.state.entry_public:
+            return await compute()
+        entry = app.state.pub_cache.get(key)
         if entry and entry[0] > time.monotonic():
             return JSONResponse(entry[1])
-        if entry:
-            del app.state.pub_cache[pub_cache_key(request)]
-        return None
-
-    def pub_store(request, payload):
-        if request.state.identity is None and request.state.entry_public:
-            key = pub_cache_key(request)
+        lock = app.state.pub_locks.get(key)
+        if lock is None:
+            if len(app.state.pub_locks) > 512:
+                app.state.pub_locks.pop(next(iter(app.state.pub_locks)))
+            lock = app.state.pub_locks[key] = asyncio.Lock()
+        async with lock:
+            entry = app.state.pub_cache.get(key)
+            if entry and entry[0] > time.monotonic():
+                return JSONResponse(entry[1])
+            payload = await compute()
             app.state.pub_cache[key] = (time.monotonic() + PUB_STATS_TTL, payload)
             if len(app.state.pub_cache) > 512:
                 app.state.pub_cache.pop(next(iter(app.state.pub_cache)))
-        return payload
+            return payload
 
     def stats_require(request):
         # Anonymous on the public instance (owner decision «Без токена»);
@@ -987,35 +1010,44 @@ def create_app(dsn=None):
     @app.get("/v2/stats/seasons")
     async def stats_seasons(request: Request):
         stats_require(request)
-        if (hit := pub_cached(request)) is not None:
-            return hit
-        seasons = core.stat_seasons()
-        return pub_store(
-            request,
-            {
+
+        async def compute():
+            seasons = core.stat_seasons()
+            return {
                 "schemaVersion": 1,
                 "current": seasons[-1]["id"] if seasons else None,
                 "seasons": seasons,
-            },
-        )
+            }
+
+        return await pub_aggregate(request, (raw_path(request),), compute)
 
     @app.get("/v2/stats/leaderboard")
     async def stats_leaderboard(request: Request):
         stats_require(request)
-        if (hit := pub_cached(request)) is not None:
-            return hit
-        query = core.stat_filters(stats_query(request))
-        async with database.transaction() as conn:
-            return pub_store(request, await core.stat_leaderboard(conn, query))
+        params = stats_query(request)
+        query = core.stat_filters(params)
+
+        async def compute():
+            async with database.transaction() as conn:
+                return await core.stat_leaderboard(conn, query)
+
+        return await pub_aggregate(
+            request, pub_stats_key(request, params, query), compute
+        )
 
     @app.get("/v2/stats/players/{player_uuid}")
     async def stats_player(player_uuid: str, request: Request):
         stats_require(request)
-        if (hit := pub_cached(request)) is not None:
-            return hit
-        query = core.stat_filters(stats_query(request))
-        async with database.transaction() as conn:
-            return pub_store(request, await core.stat_player(conn, query, player_uuid))
+        params = stats_query(request)
+        query = core.stat_filters(params)
+
+        async def compute():
+            async with database.transaction() as conn:
+                return await core.stat_player(conn, query, player_uuid)
+
+        return await pub_aggregate(
+            request, pub_stats_key(request, params, query, player_uuid), compute
+        )
 
     @app.get("/v2/stats/hitreg")
     async def stats_hitreg(request: Request):
@@ -1078,7 +1110,14 @@ def create_app(dsn=None):
     @app.get("/v2/operations/{operation_id}")
     async def operation(operation_id: UUID, request: Request):
         async with database.transaction() as conn:
-            return await core.read_operation(conn, request.state.identity, operation_id)
+            return await core.read_operation(
+                conn,
+                request.state.identity,
+                operation_id,
+                # Public reads are own-credential-only (coordination#35): the
+                # general operations.read/audit.read policy stays internal.
+                issuer_only=request.state.entry_public,
+            )
 
     @app.post("/v2/console/logs", status_code=201)
     async def console_log_push(body: dict, request: Request):
@@ -1122,15 +1161,22 @@ def create_app(dsn=None):
             if isinstance(consumer_id, str)
             else None
         )
+        # Cancellation-safe ownership: a cancellation while write waits on
+        # the database must release the preallocated waiter (CancelledError
+        # is not an Exception, so the old handler leaked it and 64
+        # cancellations exhausted the slots permanently). Ownership moves to
+        # console_suggest_output — whose finally releases it — only once
+        # write returns.
+        transferred = False
         try:
             result = await write(request, core.console_suggest, body)
-        except Exception:
-            if waiter is not None:
+            transferred = True
+            output = await core.console_suggest_output(
+                database, wakeups, consumer_id, result["operationId"], waiter=waiter
+            )
+        finally:
+            if not transferred and waiter is not None:
                 wakeups.unsubscribe_suggest(consumer_id, waiter)
-            raise
-        output = await core.console_suggest_output(
-            database, wakeups, consumer_id, result["operationId"], waiter=waiter
-        )
         if output is None:
             raise Problem("suggest_timeout", 504)
         return core.check_suggest_output(output)
