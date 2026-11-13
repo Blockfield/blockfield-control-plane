@@ -10454,7 +10454,25 @@ async def test_public_entrypoint_rejects_stats_mutations(store):
     assert void.json() == {"error": "not_found"}
 
 
-async def test_public_traffic_does_not_consume_shared_budget(store):
+@pytest.fixture
+def frozen_limits_window(monkeypatch):
+    """Pin the Limits minute window: a rollover mid-test clears every bucket."""
+    fixed = time.monotonic()
+
+    class Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        @staticmethod
+        def monotonic():
+            return fixed
+
+    monkeypatch.setattr(cpv2_app, "time", Clock())
+
+
+async def test_public_traffic_does_not_consume_shared_budget(
+    store, frozen_limits_window
+):
     await service_token(store, "launcher", ["stats.read"])
     extra = {"X-CP-Public": "1"}
     for _ in range(10):
@@ -10468,7 +10486,9 @@ async def test_public_traffic_does_not_consume_shared_budget(store):
     assert store["app"].state.limiter.total == 1
 
 
-async def test_public_and_internal_buckets_are_fully_isolated(store):
+async def test_public_and_internal_buckets_are_fully_isolated(
+    store, frozen_limits_window
+):
     # Public traffic must never consume an internal bucket and vice versa:
     # each side 429s on its own exhausted budget while the other still
     # passes. Buckets are filled directly (same 600/request limits the
