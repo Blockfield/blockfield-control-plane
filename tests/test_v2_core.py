@@ -1135,10 +1135,22 @@ async def test_console_run_scopes_allowlist_and_audit(store):
     assert core.CONSOLE_READ_ONLY.fullmatch("spark tickmonitor --threshold 100")
     for unsafe in ("op Steve", "list; stop", "listx", "spark profiler start", "stop"):
         assert not core.CONSOLE_READ_ONLY.fullmatch(unsafe), unsafe
-    # No role holds console scopes: admins cannot run even read-only lines.
+    # Admins hold only console.read; moderators no console scope at all.
     assert (
         await request(
-            store, "POST", "/v2/actions/console.run", console_body(store, "c0", "list")
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, "c0", "op Steve"),
+        )
+    ).status_code == 403
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/actions/console.run",
+            console_body(store, "c0m", "list"),
+            "moderator",
         )
     ).status_code == 403
     for command in ("say hi\nstop", "   ", "/"):
@@ -1237,11 +1249,21 @@ async def test_console_service_tokens_read_only_and_owner_assertion(store):
         "POST",
         "/v2/actions/console.run",
         console_body(
-            store, "s1", "list", actorAccountId=str(store["accounts"]["admin"])
+            store, "s1", "save-all", actorAccountId=str(store["accounts"]["admin"])
         ),
         "site-console",
     )
     assert as_admin.status_code == 403, as_admin.text
+    admin_tick = await request(
+        store,
+        "POST",
+        "/v2/actions/console.run",
+        console_body(
+            store, "s1t", "tick query", actorAccountId=str(store["accounts"]["admin"])
+        ),
+        "site-console",
+    )
+    assert admin_tick.status_code == 202, admin_tick.text
     as_owner = await request(
         store,
         "POST",
@@ -1257,6 +1279,7 @@ async def test_console_service_tokens_read_only_and_owner_assertion(store):
     assert [(f["payload"]["command"], f["executable"]) for f in frames] == [
         ("tick query", True),
         ("save-all", True),
+        ("tick query", True),
         ("save-all", True),
     ]
     await ack_chain(store, frames[0], output="The game is running normally")

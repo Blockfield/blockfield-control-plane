@@ -39,10 +39,11 @@ MODERATION_ADMIN_SCOPES = {"moderation.pardon", "moderation.maintenance"}
 # credential with no human actor (see core.action). In no role.
 ANNOUNCE_SCOPES = {"moderation.announce"}
 # Owner console (coordination#35): console.read runs only the read-only
-# allowlist (core.CONSOLE_READ_ONLY), console.run any command line. In no
-# role, so only owners hold them; a service credential holds them only when
-# an owner provisions it (the site console principal asserting an owner, the
-# agent MCP tokens).
+# allowlist (core.CONSOLE_READ_ONLY), console.run any command line. Admins
+# hold console.read (the site live tick check is an admin view); console.run
+# is in no role, so only owners hold it. A service credential holds them only
+# when an owner provisions it (the site console principal asserting the
+# actor, the agent MCP tokens).
 CONSOLE_SCOPES = {"console.read", "console.run"}
 # Site moderation via the service principal: a service credential may hold
 # any moderation kind, but every call must assert the acting human account
@@ -92,6 +93,7 @@ ROLE_SCOPES = {
         # The workshop controller reports its own gate leg (gate settings at
         # target "workshop"); admins keep manual PATCH access to the same leg.
         "workshop.gate",
+        "console.read",
     },
 }
 OWNER_SCOPES = set().union(*ROLE_SCOPES.values()) | {
