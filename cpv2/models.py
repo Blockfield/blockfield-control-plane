@@ -163,7 +163,8 @@ class Ack(Strict):
     # Command output (list, maintenance status, console lines). Informational:
     # stored with the receipt, excluded from its fingerprint, so the same
     # receipt resent without the text (the executor keeps none) still matches.
-    output: str | None = Field(default=None, max_length=65536)
+    # Requests are capped at 32 KiB; the game sends at most 12 KiB of UTF-8.
+    output: str | None = Field(default=None, max_length=16384)
 
     @field_validator("actualAt")
     @classmethod

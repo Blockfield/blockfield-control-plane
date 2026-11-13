@@ -1128,7 +1128,7 @@ async def test_maintenance_kinds_and_ack_output_round_trip(store):
     )
     assert read.json()["status"] == "effective"
     assert read.json()["receipts"][-1]["result"] == {"code": "ok", "output": line}
-    oversized = ack_body(frames[1], "received") | {"output": "x" * 65537}
+    oversized = ack_body(frames[1], "received") | {"output": "x" * 16385}
     assert (
         await request(store, "POST", "/v2/agents/game/acks", oversized, "game-agent")
     ).status_code == 422
