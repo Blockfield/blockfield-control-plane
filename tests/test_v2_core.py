@@ -2011,6 +2011,20 @@ async def test_c7_rebind_refuses_capability_or_client_change(store):
         await provision(store["admin"], stolen)
     row = (await sql(store, "SELECT credential_id FROM consumers WHERE id='rot2'"))[0]
     assert row["credential_id"] == first
+    # A migration appended console kinds after the spec was written: the old
+    # spec still rotates, and the stored set keeps the migrated kinds.
+    await sql(
+        store,
+        "UPDATE consumers SET capabilities=array_append(capabilities,'console.suggest') WHERE id='rot2'",
+    )
+    await provision(store["admin"], rot_spec())
+    row = (
+        await sql(
+            store, "SELECT credential_id,capabilities FROM consumers WHERE id='rot2'"
+        )
+    )[0]
+    assert row["credential_id"] != first
+    assert "console.suggest" in row["capabilities"]
 
 
 async def test_c7_second_rotation_refused_while_previous_valid(store):

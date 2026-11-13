@@ -176,6 +176,15 @@ async def provision(dsn, spec, bearer_sink=None):
 # Service credentials (account-less) live at most 30 days and are re-issued
 # monthly; human session credentials stay at 24h, like staff rotation.
 HUMAN_TTL_CAP = 86400
+# Kinds migrations 010/011 append to existing game consumers. Operator specs
+# written before them must still rotate the credential, so these never count
+# as a capability mismatch; a rebind keeps the stored set either way.
+MIGRATION_GRANTED = {
+    "moderation.maintenance",
+    "moderation.announce",
+    "console.run",
+    "console.suggest",
+}
 
 
 async def revoke(dsn, credential_id):
@@ -377,7 +386,8 @@ async def _provision(dsn, spec, bearer_sink=None):
                     or existing["backend"] != spec["backend"]
                     or existing["resource"] != spec["resource"]
                     or existing["generation"] != UUID(c["generation"])
-                    or set(existing["capabilities"]) != set(c["capabilities"])
+                    or set(existing["capabilities"]) - MIGRATION_GRANTED
+                    != set(c["capabilities"]) - MIGRATION_GRANTED
                 ):
                     raise ValueError("consumer scope or generation mismatch")
                 old_cred = await one(
