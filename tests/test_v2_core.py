@@ -10112,7 +10112,8 @@ async def test_console_suggest_round_trip_and_validation(store):
     )
     await asyncio.sleep(0.2)
     frames = await envelopes(store)
-    broken = next(f for f in frames if f["payload"].get("input") == "wea")
+    # Non-executable frames (the acked s3 one) carry no payload.
+    broken = next(f for f in frames if (f["payload"] or {}).get("input") == "wea")
     await ack_chain(store, broken, output="not-json{{")
     response = await asyncio.wait_for(pending, 10)
     assert response.status_code == 502, response.text
