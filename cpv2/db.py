@@ -26,6 +26,7 @@ MIGRATIONS = [
     "013_workshop_state.sql",
     "014_workshop_game.sql",
     "015_game_presence.sql",
+    "016_rewind_received_cursor.sql",
 ]
 
 
