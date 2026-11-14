@@ -2864,6 +2864,22 @@ async def test_c3_terminal_receipt_never_skips_a_missing_sequence(store):
             store, "POST", "/v2/agents/game/acks", ack_body(frames[0]), "game-agent"
         )
     ).status_code == 200
+    assert (await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'"))[
+        0
+    ]["received_cursor"] == 0
+    for state in ("validated", "applied", "effective"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frames[0], state),
+                "game-agent",
+            )
+        ).status_code == 200
+    assert (await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'"))[
+        0
+    ]["received_cursor"] == 1
     # Reconcile persisted receipts conservatively even if a restored cursor trails them.
     await sql(
         store,
@@ -2886,6 +2902,18 @@ async def test_c3_terminal_receipt_never_skips_a_missing_sequence(store):
     assert (
         await request(
             store, "POST", "/v2/agents/game/acks", ack_body(frames[1]), "game-agent"
+        )
+    ).status_code == 200
+    assert (await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'"))[
+        0
+    ]["received_cursor"] == 1
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frames[1], "rejected"),
+            "game-agent",
         )
     ).status_code == 200
     cursor = (
@@ -4647,7 +4675,7 @@ async def test_c12_randomized_delivery_walk_preserves_invariants(store):
             covered = {
                 r["sequence"]
                 for r in receipts
-                if r["state"] in ("received", "rejected", "unknown")
+                if r["state"] in ("effective", "rejected", "unknown")
             }
             expect, seq = 0, 1
             while seq in covered:
@@ -4829,11 +4857,11 @@ async def test_c12_randomized_delivery_walk_preserves_invariants(store):
             store,
             "POST",
             f"/v2/agents/{cid}/acks",
-            ack_body(tail, "rejected"),
+            ack_body(tail, "unknown") | {"result": "effect_uncertain"},
             cid + "-agent",
         )
         assert response.status_code == 200, response.text
-        acked["rejected"] += 1
+        acked["unknown"] += 1
         await check_invariants()
     # The seed must exercise every operator: issuing, each ack outcome class,
     # replacement, expiry and revocation. Otherwise the walk proves nothing.
@@ -12097,3 +12125,214 @@ async def test_presence_clears_and_rejects_old_observations(store):
     assert presence["maintenance"] is None
     assert presence["applied"]["disabledMapIds"] == ["arena"]
     assert presence["gunCatalogHash"] == "gun2" and presence["kitCatalogHash"] == "kit2"
+
+
+async def test_non_terminal_acks_do_not_advance_cursor_and_redeliver(store):
+    from starlette.requests import Request
+
+    op = await queued(store, "non-terminal-cursor")
+    frame = (await envelopes(store))[0]
+    for state in ("received", "validated", "applied"):
+        response = await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frame, state),
+            "game-agent",
+        )
+        assert response.status_code == 200, response.text
+        snapshot = await request(
+            store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+        )
+        assert snapshot.status_code == 200
+        assert snapshot.json()["cursor"] == 0, state
+        assert [f["operationId"] for f in await envelopes(store)] == [op["operationId"]]
+    app = store["app"]
+    token = store["tokens"]["game-agent"]
+    async with app.state.db.transaction() as conn:
+        identity = await authenticate(conn, token)
+    endpoint = next(
+        r.endpoint for r in app.routes if r.path == "/v2/agents/{cid}/events"
+    )
+    req = Request(
+        {
+            "type": "http",
+            "headers": [
+                (b"last-event-id", f"{frame['epoch']}:{frame['sequence']}".encode())
+            ],
+        }
+    )
+    req.state.identity, req.state.token = identity, token
+    stream_resp = await endpoint("game", req, UUID(frame["epoch"]), frame["sequence"])
+    try:
+        chunk = await anext(stream_resp.body_iterator)
+        assert f"id: {frame['epoch']}:{frame['sequence']}" in chunk
+        assert op["operationId"] in chunk
+    finally:
+        await stream_resp.body_iterator.aclose()
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frame, "effective"),
+            "game-agent",
+        )
+    ).status_code == 200
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.json()["cursor"] == 1
+    assert await envelopes(store, cursor=snapshot.json()["cursor"]) == []
+
+
+async def test_applied_operation_expires_on_deadline(store):
+    op = await queued(store, "applied-expiry")
+    frame = (await envelopes(store))[0]
+    for state in ("received", "validated", "applied"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frame, state),
+                "game-agent",
+            )
+        ).status_code == 200
+    await sql(
+        store,
+        "UPDATE operations SET deadline=now()-interval '1 second' WHERE id=%s",
+        (UUID(op["operationId"]),),
+    )
+    read = await request(
+        store, "GET", "/v2/operations/" + op["operationId"], role="moderator"
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["status"] == "expired"
+
+
+async def test_fallback_unknown_clamps_clock_skew_while_effective_rejects(store):
+    op_ahead = await queued(store, "skew-ahead")
+    op_behind = await queued(store, "skew-behind")
+    frames = await envelopes(store)
+    created_behind = (
+        await sql(
+            store,
+            "SELECT created_at FROM operations WHERE id=%s",
+            (UUID(op_behind["operationId"]),),
+        )
+    )[0]["created_at"]
+    ahead_iso = (now() + timedelta(hours=1)).isoformat()
+    for state in ("received", "validated", "applied"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frames[0], state),
+                "game-agent",
+            )
+        ).status_code == 200
+    rejected_eff = await request(
+        store,
+        "POST",
+        "/v2/agents/game/acks",
+        ack_body(frames[0], "effective") | {"actualAt": ahead_iso},
+        "game-agent",
+    )
+    assert rejected_eff.status_code == 422
+    assert rejected_eff.json()["error"] == "receipt_time"
+    fallback_ahead = ack_body(frames[0], "unknown") | {
+        "actualAt": ahead_iso,
+        "result": "effect_uncertain",
+    }
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", fallback_ahead, "game-agent"
+        )
+    ).status_code == 200
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", fallback_ahead, "game-agent"
+        )
+    ).status_code == 200
+    stored_ahead = (
+        await sql(
+            store,
+            "SELECT actual_at FROM consumer_acks WHERE consumer_id='game' AND sequence=1 AND state='unknown'",
+        )
+    )[0]["actual_at"]
+    assert stored_ahead <= now() + timedelta(seconds=5)
+    behind_iso = (created_behind - timedelta(hours=1)).isoformat()
+    fallback_behind = ack_body(frames[1], "unknown") | {
+        "actualAt": behind_iso,
+        "result": "effect_uncertain",
+    }
+    assert (
+        await request(
+            store, "POST", "/v2/agents/game/acks", fallback_behind, "game-agent"
+        )
+    ).status_code == 200
+    stored_behind = (
+        await sql(
+            store,
+            "SELECT actual_at FROM consumer_acks WHERE consumer_id='game' AND sequence=2 AND state='unknown'",
+        )
+    )[0]["actual_at"]
+    assert stored_behind >= created_behind
+    assert (
+        await request(
+            store, "GET", "/v2/operations/" + op_ahead["operationId"], role="moderator"
+        )
+    ).json()["status"] == "unknown"
+    assert (
+        await request(
+            store, "GET", "/v2/operations/" + op_behind["operationId"], role="moderator"
+        )
+    ).json()["status"] == "unknown"
+
+
+async def test_skewed_422_resnapshot_redelivers_until_fallback_unknown_settles(store):
+    op = await queued(store, "resnapshot-after-422")
+    frame = (await envelopes(store))[0]
+    for state in ("received", "validated", "applied"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frame, state),
+                "game-agent",
+            )
+        ).status_code == 200
+    skewed_iso = (now() + timedelta(minutes=10)).isoformat()
+    eff_resp = await request(
+        store,
+        "POST",
+        "/v2/agents/game/acks",
+        ack_body(frame, "effective") | {"actualAt": skewed_iso},
+        "game-agent",
+    )
+    assert eff_resp.status_code == 422
+    before_fallback = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert before_fallback.status_code == 200
+    assert before_fallback.json()["cursor"] == 0
+    redelivered = await envelopes(store, cursor=before_fallback.json()["cursor"])
+    assert [f["operationId"] for f in redelivered] == [op["operationId"]]
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frame, "unknown")
+            | {"actualAt": skewed_iso, "result": "effect_uncertain"},
+            "game-agent",
+        )
+    ).status_code == 200
+    after_fallback = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert after_fallback.json()["cursor"] == 1
+    assert await envelopes(store, cursor=after_fallback.json()["cursor"]) == []

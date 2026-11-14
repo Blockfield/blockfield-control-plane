@@ -53,18 +53,22 @@ Computed under the operation row lock from ALL required consumer receipts:
 
 `batch` settlement uses the same reduction (known effects AND uncertainty
 are preserved; authorization failure is a per-frame delivery verdict, never
-a rewrite of shared fact). `read_operation` never lazily expires an
-operation with no outbox rows: with nothing queued there is no failed
-delivery to declare. Async operations need all target confirmations for
-`effective`; a consumer-less settings commit stays `accepted` with its head
-intact.
+a rewrite of shared fact). `read_operation` lazily expires `accepted`,
+`received`, `validated`, and `applied` operations after their deadline if
+they have outbox rows, never fabricating failure when nothing was queued.
+Async operations need all target confirmations for `effective`; a
+consumer-less settings commit stays `accepted` with its head intact.
 
 ## Cursor and generation
 
-- `received_cursor` is the largest contiguous prefix covered by
-  received/rejected/unknown receipts, never the largest seen sequence.
-- New received/first-terminal receipts enter at cursor+1 only; reconnects
-  replay the durable cursor, never advance it from a socket event id.
+- `received_cursor` is the largest contiguous prefix covered by terminal
+  receipts (`effective`/`rejected`/`unknown`), never the largest seen or
+  merely `received` sequence.
+- New `received`/first-terminal receipts cannot skip an earlier sequence
+  that lacks a `received` or terminal receipt; reconnects replay the durable
+  cursor, never advancing it from a socket event id.
+- Fallback `unknown` (`effect_uncertain`) timestamps are clamped into the
+  operation window rather than failing receipt validation on clock skew.
 - Generation/epoch replacement fences old effects. Retired frames settle
   only through a documented endpoint identity — historical
   `(record.epoch, record.generation)` or current `(consumer.epoch,

@@ -1642,6 +1642,7 @@ async def read_operation(conn, identity, op_id, *, issuer_only=False):
         "accepted",
         "received",
         "validated",
+        "applied",
     ):
         # Desired state persists in settings heads; expiry settles delivery.
         # With no outbox rows nothing was ever queued, so there is no failed

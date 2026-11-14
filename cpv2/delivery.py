@@ -448,15 +448,27 @@ async def acknowledge(conn, identity, attempt, cid, model):
         index = STATES.index(model.state)
         if index and STATES[index - 1] not in states:
             raise Problem("receipt_order", 409)
-        if model.state == "received" and model.sequence != c["received_cursor"] + 1:
-            raise Problem("receipt_gap", 409)
         # Post-policy received/validated are recorded as historical facts: the
         # executor reports what it did before losing authorization. Execution
         # itself stays fenced at batch time, so recording grants nothing.
-    elif model.sequence != c["received_cursor"] + 1 and "received" not in states:
+    if (
+        model.state == "received"
+        or (model.state not in STATES and "received" not in states)
+    ) and await one(
+        conn,
+        "SELECT 1 FROM outbox o WHERE o.consumer_id=%s AND o.sequence>%s AND o.sequence<%s "
+        "AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('received','effective','rejected','unknown'))",
+        (cid, c["received_cursor"], model.sequence),
+    ):
         raise Problem("receipt_gap", 409)
     actual = datetime.fromisoformat(model.actualAt)
-    if actual > now() + timedelta(seconds=5) or actual < op["created_at"]:
+    current = now()
+    if model.state == "unknown" and model.result == "effect_uncertain":
+        # Fallback uncertainty can originate under consumer clock skew; clamp
+        # after fingerprinting so identical skewed retries still deduplicate.
+        ceiling = max(current, op["created_at"])
+        actual = max(op["created_at"], min(actual, ceiling))
+    elif actual > current + timedelta(seconds=5) or actual < op["created_at"]:
         raise Problem("receipt_time", 422)
     await conn.execute(
         "INSERT INTO consumer_acks(consumer_id,sequence,state,receipt_hash,result,actual_at) VALUES(%s,%s,%s,%s,%s,%s)",
@@ -472,11 +484,12 @@ async def acknowledge(conn, identity, attempt, cid, model):
             actual,
         ),
     )
-    if model.state in ("received", "rejected", "unknown"):
-        # A factual receipt above a hole must not authorize skipping that hole on reconnect.
+    if model.state in ("effective", "rejected", "unknown"):
+        # Only terminal receipts advance the durable cursor; a terminal receipt
+        # above an unsettled frame must not authorize skipping it on reconnect.
         missing = await one(
             conn,
-            "SELECT min(o.sequence) AS sequence FROM outbox o WHERE o.consumer_id=%s AND o.sequence>%s AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('received','rejected','unknown'))",
+            "SELECT min(o.sequence) AS sequence FROM outbox o WHERE o.consumer_id=%s AND o.sequence>%s AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
             (cid, c["received_cursor"]),
         )
         cursor = (
