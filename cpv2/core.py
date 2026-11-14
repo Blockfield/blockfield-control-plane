@@ -18,6 +18,7 @@ from cpv2.auth import (
     Identity,
     Problem,
     audit,
+    bound,
     covers,
     invalidate,
     now,
@@ -1432,54 +1433,192 @@ def _workshop_map_title(value):
     return name
 
 
+_WORKSHOP_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_WORKSHOP_MAP_PATH = re.compile(
+    r"^(map\.json|world/(region|entities|poi)/[rc]\.-?\d+\.-?\d+\.(mca|mcc))$"
+)
+_WORKSHOP_MAP_POINTER = re.compile(r"^map\.json#(?:/(?:[^~]|~[01])*)*$")
+# Merge resolutions mirror the site writer (<= 10000 paths of <= 4096 chars);
+# the route body cap (core.WORKSHOP_MAP_MAX_BODY) bounds the whole request.
+_WORKSHOP_RESOLUTIONS_LIMIT = 10000
+WORKSHOP_MAP_MAX_BODY = 1048576
+
+
+def _matches(pattern):
+    def check(value):
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            raise Problem("invalid_workshop_map", 422)
+        return value
+
+    return check
+
+
+def _workshop_new_map_id(value):
+    _matches(_WORKSHOP_NEW_MAP_ID)(value)
+    if value in _WORKSHOP_RESERVED_MAP_IDS:
+        raise Problem("invalid_workshop_map", 422)
+    return value
+
+
+def _workshop_head(value):
+    # null = the map has no history yet (first commit/review).
+    return None if value is None else _matches(_WORKSHOP_DIGEST)(value)
+
+
+def _workshop_snapshot_name(value):
+    if _matches(_WORKSHOP_BRANCH)(value) == "main":
+        raise Problem("invalid_workshop_map", 422)
+    return value
+
+
+def _workshop_note(value):
+    if (
+        not isinstance(value, str)
+        or any(unicodedata.category(char) == "Cc" for char in value)
+        or not value.strip()
+        or len(value) > 200
+    ):
+        raise Problem("invalid_workshop_map", 422)
+    return value.strip()
+
+
+def _workshop_flag(value):
+    if type(value) is not bool:
+        raise Problem("invalid_workshop_map", 422)
+    return value
+
+
+def _workshop_revision(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise Problem("invalid_workshop_map", 422)
+    return value
+
+
+def _workshop_modes(value):
+    if (
+        not isinstance(value, list)
+        or not 1 <= len(value) <= 7
+        # str check before set(): unhashable elements must 422, not 500.
+        or not all(isinstance(mode, str) for mode in value)
+        or len(set(value)) != len(value)
+        or any(mode not in _WORKSHOP_ARENA_MODES for mode in value)
+    ):
+        raise Problem("invalid_workshop_map", 422)
+    return list(value)
+
+
+def _workshop_resolutions(value):
+    if (
+        not isinstance(value, dict)
+        or len(value) > _WORKSHOP_RESOLUTIONS_LIMIT
+        or not all(
+            len(path) <= 4096
+            and (
+                _WORKSHOP_MAP_PATH.fullmatch(path) is not None
+                or _WORKSHOP_MAP_POINTER.fullmatch(path) is not None
+            )
+            and choice in ("ours", "theirs")
+            for path, choice in value.items()
+        )
+    ):
+        raise Problem("invalid_workshop_map", 422)
+    return dict(value)
+
+
+_map_id = _matches(_WORKSHOP_MAP_ID)
+_copy_id = _matches(_WORKSHOP_COPY_UUID)
+_version = _matches(_WORKSHOP_DIGEST)
+_candidate = _matches(_WORKSHOP_HEX32)
+# Map operations (the former inbox map kinds): op -> (required, optional)
+# argument validators. Shapes mirror the site writer; catalog membership,
+# map scopes and admin-only ops stay consumer-side (the controller ACL).
+WORKSHOP_MAP_OPS = {
+    "map-create": (
+        {
+            "mapId": _workshop_new_map_id,
+            "name": _workshop_map_title,
+            "supportedModes": _workshop_modes,
+            "expectedRevision": _workshop_revision,
+            "sessionId": _copy_id,
+        },
+        {},
+    ),
+    "map-properties": (
+        {
+            "mapId": _map_id,
+            "name": _workshop_map_title,
+            "workingCopyId": _copy_id,
+            "expectedRevision": _workshop_revision,
+        },
+        {},
+    ),
+    "limbo-export": ({"versionDigest": _version}, {}),
+    "commit": (
+        {
+            "mapId": _map_id,
+            "workingCopyId": _copy_id,
+            "expectedHead": _workshop_head,
+            "note": _workshop_note,
+        },
+        {},
+    ),
+    "compare": ({"mapId": _map_id, "before": _version, "after": _version}, {}),
+    "snapshots": ({"mapId": _map_id}, {}),
+    "snapshot-create": (
+        {"mapId": _map_id, "name": _workshop_snapshot_name, "versionDigest": _version},
+        {},
+    ),
+    "snapshot-delete": ({"mapId": _map_id, "name": _workshop_snapshot_name}, {}),
+    "snapshot-copy": (
+        {"mapId": _map_id, "name": _workshop_snapshot_name, "workingCopyId": _copy_id},
+        {},
+    ),
+    "checkout-fresh": ({"mapId": _map_id, "workingCopyId": _copy_id}, {}),
+    "candidate": (
+        {"mapId": _map_id},
+        {
+            "workingCopyId": _copy_id,
+            "expectedHead": _workshop_head,
+            "commit": _workshop_flag,
+            "note": _workshop_note,
+        },
+    ),
+    "rollback": (
+        {"mapId": _map_id, "versionDigest": _version, "expectedHead": _workshop_head},
+        {},
+    ),
+    "publish": (
+        {"candidateId": _candidate},
+        {
+            "force": _workshop_flag,
+            "expectedHead": _workshop_head,
+            "resolutions": _workshop_resolutions,
+        },
+    ),
+    "reject": ({"candidateId": _candidate}, {}),
+    "export": ({"candidateId": _candidate}, {}),
+}
+
+
 def _workshop_map(model):
     # Map ids are outside any scoped grant (same rule as members maps): map
-    # operations require a global target; the consumer checks catalog membership.
-    if model.target != "*":
+    # operations require a global target; the consumer checks catalog
+    # membership and the actor's map scope/role before applying.
+    if model.target != "*" or model.mapOp not in WORKSHOP_MAP_OPS:
         raise Problem("invalid_workshop_map", 422)
-    map_op = model.mapOp
-    if map_op not in ("map-create", "map-properties"):
+    required, optional = WORKSHOP_MAP_OPS[model.mapOp]
+    args = model.args or {}
+    if (
+        not isinstance(args, dict)
+        or set(required) - set(args)
+        or set(args) - set(required) - set(optional)
+    ):
         raise Problem("invalid_workshop_map", 422)
-    map_id = model.mapId
-    if map_op == "map-create":
-        if (
-            not isinstance(map_id, str)
-            or _WORKSHOP_NEW_MAP_ID.fullmatch(map_id) is None
-            or map_id in _WORKSHOP_RESERVED_MAP_IDS
-        ):
-            raise Problem("invalid_workshop_map", 422)
-    elif not isinstance(map_id, str) or _WORKSHOP_MAP_ID.fullmatch(map_id) is None:
-        raise Problem("invalid_workshop_map", 422)
-    name = _workshop_map_title(model.name)
-    revision = model.expectedRevision
-    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-        raise Problem("invalid_workshop_map", 422)
-    partial = {
-        "mapOp": map_op,
-        "mapId": map_id,
-        "name": name,
-        "expectedRevision": revision,
+    checks = {**required, **optional}
+    return {
+        "mapOp": model.mapOp,
+        "args": {key: checks[key](value) for key, value in args.items()},
     }
-    if map_op == "map-create":
-        modes = model.supportedModes
-        if (
-            not isinstance(modes, list)
-            or not 1 <= len(modes) <= 7
-            # str check before set(): unhashable elements must 422, not 500.
-            or not all(isinstance(mode, str) for mode in modes)
-            or len(set(modes)) != len(modes)
-            or any(mode not in _WORKSHOP_ARENA_MODES for mode in modes)
-        ):
-            raise Problem("invalid_workshop_map", 422)
-        partial["supportedModes"] = list(modes)
-    else:
-        if (
-            not isinstance(model.workingCopyId, str)
-            or _WORKSHOP_COPY_UUID.fullmatch(model.workingCopyId) is None
-        ):
-            raise Problem("invalid_workshop_map", 422)
-        partial["workingCopyId"] = model.workingCopyId
-    return partial
 
 
 def _workshop_sessions(model):
@@ -1645,15 +1784,107 @@ async def _workshop_caller(conn, identity, actor):
     return expected
 
 
+# Kinds the site issues for the logged-in human under an asserted account
+# (actorAccountId): admin/owner authority comes from that actor's own grants,
+# never from workshop.act. Every other service kind rides workshop.act.
+WORKSHOP_ASSERTED_KINDS = ("members", "mode", "ai-key")
+WORKSHOP_OP_KINDS = tuple(f"workshop.{kind}" for kind in WORKSHOP_SCOPES)
+
+
+async def _asserted_identity(conn, identity, account_id):
+    """The site principal acting for one human (see core.action): CP
+    re-resolves the account, live grants and owner membership."""
+    # Only the unbound site principal may assert an actor; a scoped
+    # consumer would otherwise act as any admin whose grant covers it.
+    if identity.credential["resource"] != "*":
+        raise Problem("actor_forbidden")
+    # FOR SHARE like authenticate(): a concurrent revocation of this actor
+    # (FOR UPDATE + invalidate) waits for this change to commit.
+    actor = await one(
+        conn, "SELECT * FROM accounts WHERE id=%s FOR SHARE", (account_id,)
+    )
+    if not actor:
+        raise Problem("account_not_found", 404)
+    if actor["is_test"] or actor["status"] != "active":
+        raise Problem("ineligible_account")
+    return Identity(
+        identity.credential,
+        identity.client,
+        actor,
+        await rows(
+            conn,
+            "SELECT * FROM role_grants WHERE account_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+            (actor["id"], now()),
+        ),
+        bool(
+            await one(
+                conn,
+                "SELECT 1 FROM owner_memberships WHERE account_id=%s",
+                (actor["id"],),
+            )
+        ),
+    )
+
+
+async def _workshop_admins_hold_cp_admin(conn, members, model):
+    # A service-asserted members list cannot pass the owner step-up (that
+    # needs a direct owner session), so CP stays the role authority instead:
+    # every Workshop admin entry must be a CP owner or hold a live admin
+    # grant at the target. Account ids are Drasl player UUIDs.
+    for entry in members:
+        if entry.get("role") != "admin":
+            continue
+        account = UUID(entry["draslId"])
+        if await one(
+            conn, "SELECT 1 FROM owner_memberships WHERE account_id=%s", (account,)
+        ):
+            continue
+        grants = await rows(
+            conn,
+            "SELECT * FROM role_grants WHERE account_id=%s AND role='admin' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>%s)",
+            (account, now()),
+        )
+        if not any(
+            bound(grant, model.environment, model.backend, model.target)
+            for grant in grants
+        ):
+            raise Problem("workshop_admin_not_cp_admin")
+
+
 async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path=""):
     if kind not in WORKSHOP_SCOPES:
         raise Problem("unknown_action", 404)
     data = model.model_dump(mode="json")
-    if identity.account is None:
+    service = identity.credential["kind"] == "service"
+    asserted = service and kind in WORKSHOP_ASSERTED_KINDS
+    # The release CI selects a verified release with no human behind it; the
+    # consumer then verifies the record against its own catalog.
+    release_ci = (
+        service
+        and kind == "release.select"
+        and model.actor is None
+        and model.actorAccountId is None
+    )
+    if model.actorAccountId is not None and not asserted:
+        raise Problem("actor_forbidden")
+    if asserted:
+        if model.actorAccountId is None:
+            raise Problem("service_actor_required")
+        identity = await _asserted_identity(conn, identity, model.actorAccountId)
+        identity.require(
+            WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target
+        )
+        scope = WORKSHOP_SCOPES[kind]
+    elif release_ci:
+        identity.require(
+            "workshop.release.select", model.environment, model.backend, model.target
+        )
+        scope = "workshop.release.select"
+    elif identity.account is None:
         # A service may only supply the actor (workshop.act) for a kind it is
         # also provisioned for: workshop.act alone never authorizes a kind.
-        # The admin-only kinds are not service-holdable (see SERVICE_SCOPES),
-        # so no service credential can mint them.
+        # The admin-only kinds are not service-holdable this way (see
+        # SERVICE_SCOPES), so no service credential can mint them.
         identity.require("workshop.act", model.environment, model.backend, model.target)
         identity.require(
             WORKSHOP_SCOPES[kind], model.environment, model.backend, model.target
@@ -1704,8 +1935,19 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
             # Full provenance is verified consumer-side against its catalog.
             partial["record"] = record
         key = "actor"
-    caller = await _workshop_caller(conn, identity, model.actor)
-    payload = {"kind": kind, "target": model.target, key: caller, **partial}
+    if release_ci:
+        caller = None
+        payload = {"kind": kind, "target": model.target, **partial}
+    else:
+        if asserted:
+            # The workshop identity is the asserted account itself (account
+            # ids are Drasl player UUIDs); the site supplies the current name.
+            caller = _workshop_identity(model.actor)
+            if caller["draslId"] != identity.actor.hex:
+                raise Problem("invalid_workshop_actor", 422)
+        else:
+            caller = await _workshop_caller(conn, identity, model.actor)
+        payload = {"kind": kind, "target": model.target, key: caller, **partial}
     op, duplicate = await operation(
         conn,
         identity,
@@ -1733,14 +1975,11 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
     unsettled = await one(
         conn,
         "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id "
-        "WHERE o.consumer_id=%s AND p.kind IN "
-        "('workshop.members','workshop.message','workshop.wake','workshop.cancel',"
-        "'workshop.release.select','workshop.map','workshop.sessions',"
-        "'workshop.ai-key','workshop.mode') AND p.deadline>now() AND NOT EXISTS(SELECT 1 "
+        "WHERE o.consumer_id=%s AND p.kind = ANY(%s) AND p.deadline>now() AND NOT EXISTS(SELECT 1 "
         "FROM consumer_acks a WHERE a.consumer_id=o.consumer_id AND "
         "a.sequence=o.sequence AND a.state IN "
         "('effective','rejected','unknown'))",
-        (model.consumerId,),
+        (model.consumerId, list(WORKSHOP_OP_KINDS)),
     )
     if (
         consumer["next_sequence"] - consumer["received_cursor"] > 128
@@ -1748,9 +1987,12 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
     ):
         raise Problem("consumer_lag", 409)
     if kind == "members" and any(entry.get("role") == "admin" for entry in members):
-        # Same owner step-up as grant_change: neither a non-owner admin nor
-        # a service principal can mint Workshop admins without it.
-        await step_up(conn, identity, assertion, "POST", path, data)
+        if asserted:
+            await _workshop_admins_hold_cp_admin(conn, members, model)
+        else:
+            # Same owner step-up as grant_change: neither a non-owner admin
+            # nor a service principal can mint Workshop admins without it.
+            await step_up(conn, identity, assertion, "POST", path, data)
     await enqueue(conn, op, [consumer], payload)
     return await finish(
         conn,
@@ -1767,6 +2009,299 @@ async def workshop_op(conn, identity, attempt, kind, model, assertion=None, path
             },
         },
     )
+
+
+# Workshop controller state (coordination#64): the controller reports its
+# documents here instead of the shared admin directory; the site and the
+# release CI read them (GET or the pushed stream). Results of Workshop
+# operations land as result:<operationId>, newest WORKSHOP_RESULTS_KEPT kept.
+WORKSHOP_STATE_NAMES = (
+    "status",
+    "session",
+    "members",
+    "candidates",
+    "maps",
+    "ai-keys",
+    "game-desired",
+)
+WORKSHOP_GAME_STATE_NAMES = ("game-ready", "game-activity")
+WORKSHOP_GAME_STATE_MAX_BODY = 16384
+WORKSHOP_STATE_RESULT = re.compile(
+    r"result:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+WORKSHOP_RESULTS_KEPT = 200
+# shortcut: one document per PUT up to 4 MiB (the map catalog is the largest,
+# ~3.5 KB per map); split catalogs when maps outgrow it.
+WORKSHOP_STATE_MAX_BODY = 4 << 20
+WORKSHOP_STATE_BATCH = 64
+WORKSHOP_STATE_CHANNEL = "workshop-state"
+# The controller reports under the gate leg's coordinates (target "workshop").
+WORKSHOP_STATE_REPORT = ("workshop.report", "prod", "game", "workshop")
+WORKSHOP_STATE_READ = ("workshop.read", "prod", "game", "workshop")
+
+
+def _workshop_state_name(name, *, read=False):
+    if name in WORKSHOP_STATE_NAMES or WORKSHOP_STATE_RESULT.fullmatch(name):
+        return name
+    if name in WORKSHOP_GAME_STATE_NAMES:
+        if read:
+            return name
+        raise Problem("forbidden")
+    raise Problem("unknown_workshop_state", 404)
+
+
+async def _workshop_state_upsert(conn, name, value):
+    # Hold through commit so stream cursors follow commit order.
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("workshop-state",)
+    )
+    # Unchanged documents keep their revision and wake nobody.
+    changed = await one(
+        conn,
+        "INSERT INTO workshop_state(name,value,revision,seq) "
+        "VALUES(%s,%s,1,nextval('workshop_state_seq')) ON CONFLICT(name) DO UPDATE "
+        "SET value=EXCLUDED.value, revision=workshop_state.revision+1, "
+        "seq=EXCLUDED.seq, updated_at=now() "
+        "WHERE workshop_state.value IS DISTINCT FROM EXCLUDED.value "
+        "RETURNING revision, seq",
+        (name, Jsonb(value)),
+    )
+    if changed is None:
+        current = await one(
+            conn, "SELECT revision, seq FROM workshop_state WHERE name=%s", (name,)
+        )
+        return {"name": name, "changed": False, **current}
+    if name.startswith("result:"):
+        await conn.execute(
+            "DELETE FROM workshop_state WHERE name LIKE 'result:%%' AND name NOT IN "
+            "(SELECT name FROM workshop_state WHERE name LIKE 'result:%%' "
+            "ORDER BY seq DESC LIMIT %s)",
+            (WORKSHOP_RESULTS_KEPT,),
+        )
+    await conn.execute("SELECT pg_notify('cp_events',%s)", (WORKSHOP_STATE_CHANNEL,))
+    return {"name": name, "changed": True, **changed}
+
+
+async def workshop_state_put(conn, identity, attempt, name, value):
+    identity.require(*WORKSHOP_STATE_REPORT)
+    _workshop_state_name(name)
+    return await _workshop_state_upsert(conn, name, value)
+
+
+async def _workshop_game_consumer(
+    conn, identity, consumer_id, generation=None, *, capability
+):
+    consumer = await _server_consumer(conn, consumer_id, generation, capability)
+    if (consumer["environment"], consumer["backend"], consumer["resource"]) != (
+        "prod",
+        "game",
+        "workshop",
+    ):
+        raise Problem("consumer_generation_or_capability", 409)
+    if (
+        identity.credential["id"] != consumer["credential_id"]
+        and identity.credential["id"] != consumer["previous_credential_id"]
+    ) or identity.credential["kind"] != "service":
+        raise Problem("consumer_identity_mismatch")
+    return consumer
+
+
+async def workshop_game(conn, identity, attempt, model):
+    try:
+        data = models.WorkshopGameAction.model_validate(model).model_dump(mode="json")
+    except ValidationError:
+        raise Problem("invalid_action", 422) from None
+    identity.require("workshop.game", data["environment"], data["backend"], "workshop")
+    consumer = await _server_consumer(
+        conn, data["consumerId"], data["generation"], "workshop.game"
+    )
+    if (
+        consumer["environment"] != data["environment"]
+        or consumer["backend"] != data["backend"]
+        or not covers(consumer["resource"], "workshop")
+    ):
+        raise Problem("consumer_generation_or_capability", 409)
+    unsettled = await one(
+        conn,
+        "SELECT count(*) AS n FROM outbox o JOIN operations p ON p.id=o.operation_id "
+        "WHERE o.consumer_id=%s AND p.kind='workshop.game' AND p.deadline>now() "
+        "AND NOT EXISTS(SELECT 1 FROM consumer_acks a WHERE a.consumer_id=o.consumer_id "
+        "AND a.sequence=o.sequence AND a.state IN ('effective','rejected','unknown'))",
+        (data["consumerId"],),
+    )
+    if (
+        consumer["next_sequence"] - consumer["received_cursor"] > 128
+        or unsettled["n"] >= 128
+    ):
+        raise Problem("consumer_lag", 409)
+    payload = {
+        "kind": "workshop.game",
+        "target": "workshop",
+        "gameOp": data["gameOp"],
+        **({"job": data["job"]} if data.get("job") is not None else {}),
+    }
+    op, duplicate = await operation(
+        conn,
+        identity,
+        "workshop.game",
+        "workshop",
+        data,
+        "workshop.game",
+        data["expiresInSeconds"],
+        data["generation"],
+    )
+    if duplicate:
+        return receipt(op)
+    await enqueue(conn, op, [consumer], payload)
+    return await finish(
+        conn,
+        attempt,
+        identity,
+        op,
+        {
+            "consumerId": data["consumerId"],
+            "gameOp": data["gameOp"],
+            "payloadHash": digest(payload),
+            **({"job": data["job"]} if data.get("job") is not None else {}),
+        },
+    )
+
+
+async def workshop_game_desired(conn, identity, consumer_id, generation=None):
+    await _workshop_game_consumer(
+        conn, identity, consumer_id, generation, capability="workshop.ready"
+    )
+    row = await one(
+        conn,
+        "SELECT value, revision, seq, updated_at FROM workshop_state WHERE name='game-desired'",
+    )
+    if row is None:
+        return {
+            "name": "game-desired",
+            "initialized": False,
+            "revision": 0,
+            "value": {"schema": 1, "selected": None},
+        }
+    return {
+        "name": "game-desired",
+        "initialized": True,
+        "revision": row["revision"],
+        "seq": row["seq"],
+        "value": row["value"],
+        "updatedAt": int(row["updated_at"].timestamp() * 1000),
+    }
+
+
+async def workshop_game_state_put(conn, identity, attempt, name, model):
+    if name not in WORKSHOP_GAME_STATE_NAMES:
+        raise Problem("unknown_workshop_state", 404)
+    consumer = await _workshop_game_consumer(
+        conn, identity, model.consumerId, model.generation, capability="workshop.ready"
+    )
+    encoded = json.dumps(model.value, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > WORKSHOP_GAME_STATE_MAX_BODY:
+        raise Problem("invalid_workshop_state", 422)
+    await conn.execute(
+        "UPDATE consumers SET last_heartbeat=now() WHERE id=%s", (consumer["id"],)
+    )
+    return await _workshop_state_upsert(conn, name, model.value)
+
+
+async def workshop_game_op_status(conn, identity, operation_id):
+    op = await one(conn, "SELECT * FROM operations WHERE id=%s", (operation_id,))
+    if not op or op["kind"] != "workshop.game":
+        raise Problem("operation_not_found", 404)
+    identity.require("workshop.game", op["environment"], op["backend"], "workshop")
+    if op["client_id"] != identity.client["id"]:
+        raise Problem("forbidden")
+    box = await one(
+        conn,
+        "SELECT consumer_id, sequence FROM outbox WHERE operation_id=%s",
+        (operation_id,),
+    )
+    ack = (
+        await one(
+            conn,
+            "SELECT state, result, recorded_at FROM consumer_acks "
+            "WHERE consumer_id=%s AND sequence=%s "
+            "ORDER BY recorded_at DESC, CASE state WHEN 'unknown' THEN 6 WHEN 'rejected' THEN 5 WHEN 'effective' THEN 4 WHEN 'applied' THEN 3 WHEN 'validated' THEN 2 ELSE 1 END DESC LIMIT 1",
+            (box["consumer_id"], box["sequence"]),
+        )
+        if box
+        else None
+    )
+    if ack and ack["state"] in ("effective", "rejected", "unknown"):
+        return (
+            True,
+            box["consumer_id"],
+            {
+                "operationId": str(operation_id),
+                "status": op["status"],
+                "state": ack["state"],
+                "code": ack["result"].get("code"),
+                "output": ack["result"].get("output"),
+            },
+        )
+    if op["status"] in ("rejected", "expired", "unknown", "effective"):
+        return (
+            True,
+            box["consumer_id"] if box else None,
+            {
+                "operationId": str(operation_id),
+                "status": op["status"],
+                "state": op["status"],
+                "code": None,
+                "output": None,
+            },
+        )
+    if op["deadline"] <= now():
+        return (
+            True,
+            box["consumer_id"] if box else None,
+            {
+                "operationId": str(operation_id),
+                "status": "expired",
+                "state": "expired",
+                "code": None,
+                "output": None,
+            },
+        )
+    return False, box["consumer_id"] if box else None, op["deadline"]
+
+
+def _workshop_state_record(row):
+    return {
+        "name": row["name"],
+        "value": row["value"],
+        "revision": row["revision"],
+        "seq": row["seq"],
+        "updatedAt": int(row["updated_at"].timestamp() * 1000),
+    }
+
+
+async def workshop_state_read(conn, identity, names=""):
+    identity.require(*WORKSHOP_STATE_READ)
+    wanted = [
+        _workshop_state_name(name, read=True) for name in names.split(",") if name
+    ]
+    if len(wanted) > WORKSHOP_STATE_BATCH:
+        raise Problem("invalid_workshop_state", 422)
+    all_names = list(WORKSHOP_STATE_NAMES + WORKSHOP_GAME_STATE_NAMES)
+    found = await rows(
+        conn,
+        "SELECT * FROM workshop_state WHERE name = ANY(%s) ORDER BY seq",
+        (wanted or all_names,),
+    )
+    return {"documents": {row["name"]: _workshop_state_record(row) for row in found}}
+
+
+async def workshop_state_since(conn, cursor):
+    found = await rows(
+        conn,
+        "SELECT * FROM workshop_state WHERE seq>%s ORDER BY seq LIMIT %s",
+        (cursor, WORKSHOP_STATE_BATCH),
+    )
+    return [_workshop_state_record(row) for row in found]
 
 
 # Site player sessions (coordination#29 U1): sealed Drasl tokens live in CP,

@@ -23,6 +23,8 @@ MIGRATIONS = [
     "010_console_capabilities.sql",
     "011_console_stream.sql",
     "012_console_seq.sql",
+    "013_workshop_state.sql",
+    "014_workshop_game.sql",
 ]
 
 
