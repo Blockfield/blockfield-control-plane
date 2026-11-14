@@ -12069,17 +12069,31 @@ async def test_presence_clears_and_rejects_old_observations(store):
         gunCatalogHash="gun2",
         kitCatalogHash="kit2",
     )
-    assert (
-        await request(store, "POST", "/v2/rooms/report", second, "game-agent")
-    ).status_code == 201
+    response = await request(store, "POST", "/v2/rooms/report", second, "game-agent")
+    assert response.status_code == 201
+    assert response.json()["missingCatalogs"] == ["gun", "kit"]
+    missing = (await request(store, "GET", "/v2/rooms?consumerId=game")).json()[
+        "presence"
+    ]
+    assert "gunCatalog" not in missing and "kitCatalog" not in missing
+    retry = presence_body(
+        store,
+        timestamp + 2,
+        gunCatalog=catalog,
+        gunCatalogHash="gun2",
+        kitCatalog=kits,
+        kitCatalogHash="kit2",
+    )
+    restored = await request(store, "POST", "/v2/rooms/report", retry, "game-agent")
+    assert restored.json()["missingCatalogs"] == []
     assert (
         await request(store, "POST", "/v2/rooms/report", first, "game-agent")
     ).status_code == 409
     presence = (await request(store, "GET", "/v2/rooms?consumerId=game")).json()[
         "presence"
     ]
-    assert presence["checkedAt"] == timestamp + 1 and presence["rooms"] == []
+    assert presence["checkedAt"] == timestamp + 2
+    assert presence["gunCatalog"] == catalog and presence["kitCatalog"] == kits
     assert presence["maintenance"] is None
     assert presence["applied"]["disabledMapIds"] == ["arena"]
-    assert "gunCatalog" not in presence and "kitCatalog" not in presence
     assert presence["gunCatalogHash"] == "gun2" and presence["kitCatalogHash"] == "kit2"

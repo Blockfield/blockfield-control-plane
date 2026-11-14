@@ -1517,7 +1517,15 @@ async def presence_report(conn, identity, attempt, consumer_id, body):
         "accepted",
         {"rooms": len(value["rooms"])},
     )
-    return {"reportedAt": now().isoformat(), "rooms": len(value["rooms"])}
+    return {
+        "reportedAt": now().isoformat(),
+        "rooms": len(value["rooms"]),
+        "missingCatalogs": [
+            name
+            for name in ("gun", "kit")
+            if name + "CatalogHash" in value and name + "Catalog" not in value
+        ],
+    }
 
 
 async def presence_read(conn, identity, consumer_id, environment, backend):
