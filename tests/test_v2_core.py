@@ -31,7 +31,7 @@ from psycopg.types.json import Jsonb
 from webauthn.helpers import bytes_to_base64url
 
 from cpv2 import app as cpv2_app
-from cpv2 import core, delivery
+from cpv2 import core, delivery, models
 from cpv2.admin import (
     bootstrap,
     enroll_owner,
@@ -49,7 +49,7 @@ from cpv2.auth import (
     now,
     verifier,
 )
-from cpv2.db import MIGRATIONS, migrate, one
+from cpv2.db import Database, MIGRATIONS, migrate, one
 from cpv2.legacy import import_u1
 from cpv2.settings import canonical, digest
 
@@ -12489,3 +12489,94 @@ async def test_rewind_received_cursor_migration_and_redelivery(store):
         store, "GET", "/v2/agents/game/snapshot", role="game-agent"
     )
     assert after_settle.json()["cursor"] == 3
+
+
+async def test_rewind_received_cursor_migration_concurrent_ack(store):
+    for key in ("race-1", "race-2"):
+        await queued(store, key)
+    frames = await envelopes(store)
+    for state in ("received", "validated", "applied"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frames[0], state),
+                "game-agent",
+            )
+        ).status_code == 200
+    for state in delivery.STATES:
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frames[1], state),
+                "game-agent",
+            )
+        ).status_code == 200
+    await sql(store, "UPDATE consumers SET received_cursor=2 WHERE id='game'")
+
+    dbname = conninfo_to_dict(store["admin"])["dbname"]
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"], autocommit=True
+    ) as conn:
+        await conn.execute("DELETE FROM control.schema_migrations WHERE version=16")
+
+    db = Database(store["runtime"])
+    await db.open()
+    try:
+        async with db.transaction() as ack_conn:
+            identity = await authenticate(ack_conn, store["tokens"]["game-agent"])
+            await ack_conn.execute("SELECT * FROM consumers WHERE id='game' FOR UPDATE")
+            migrate_task = asyncio.create_task(migrate(store["admin"], dbname))
+            try:
+                async with await psycopg.AsyncConnection.connect(
+                    store["admin"], autocommit=True, row_factory=psycopg.rows.dict_row
+                ) as probe:
+                    deadline = time.monotonic() + 5.0
+                    blocked = False
+                    while time.monotonic() < deadline:
+                        row = await one(
+                            probe,
+                            """
+                            SELECT 1 AS ok
+                            FROM pg_stat_activity a
+                            JOIN pg_locks l ON l.pid = a.pid
+                            WHERE a.datname = current_database()
+                              AND a.pid <> %s
+                              AND a.wait_event_type = 'Lock'
+                              AND NOT l.granted
+                              AND l.relation = 'control.consumers'::regclass
+                            """,
+                            (ack_conn.info.backend_pid,),
+                        )
+                        if row:
+                            blocked = True
+                            break
+                        await asyncio.sleep(0.01)
+                assert blocked
+                assert not migrate_task.done()
+                await delivery.acknowledge(
+                    ack_conn,
+                    identity,
+                    uuid4(),
+                    "game",
+                    models.Ack(**ack_body(frames[0], "effective")),
+                )
+            except BaseException:
+                migrate_task.cancel()
+                await asyncio.gather(migrate_task, return_exceptions=True)
+                raise
+        await migrate_task
+    finally:
+        await db.close()
+
+    rows = await sql(store, "SELECT received_cursor FROM consumers WHERE id='game'")
+    assert rows[0]["received_cursor"] == 2
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert snapshot.json()["cursor"] == 2
+    assert await envelopes(store, cursor=2) == []

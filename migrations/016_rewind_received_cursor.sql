@@ -7,7 +7,17 @@
 -- using the same definition as cpv2/delivery.py:acknowledge, and never move a
 -- cursor forward. Idempotent and transactional. After deploy, consumers
 -- reconnect from the rewound cursor and receive unsettled operations again.
+--
+-- Lock order (matches cpv2/delivery.py:acknowledge to avoid deadlocks):
+--   1. consumers (EXCLUSIVE; conflicts with SELECT ... FOR UPDATE's ROW SHARE and
+--      UPDATE's ROW EXCLUSIVE, matching the ack path's first lock on consumers)
+--   2. consumer_acks (EXCLUSIVE; ack path inserts into consumer_acks after)
+-- Acquiring both locks before the target CTE ensures a fresh READ COMMITTED
+-- snapshot that observes any ACK serialized ahead of the migration and blocks
+-- concurrent ACK writes until the rewind commits.
 SET search_path = control, pg_catalog, pg_temp;
+LOCK TABLE consumers IN EXCLUSIVE MODE;
+LOCK TABLE consumer_acks IN EXCLUSIVE MODE;
 WITH target AS (
   SELECT
     c.id,
