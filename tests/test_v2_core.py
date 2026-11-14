@@ -176,7 +176,6 @@ def test_docker_default_runs_cpv2():
 @pytest.fixture(scope="session")
 def postgres():
     Path(".cache").mkdir(exist_ok=True)
-    subprocess.run(["ss", "-ltnp"], check=True, capture_output=True, timeout=5)
     with tempfile.TemporaryDirectory(prefix="cp-pg-", dir=".cache") as temp:
         server = get_server(Path(temp).resolve(), cleanup_mode="stop")
         try:
