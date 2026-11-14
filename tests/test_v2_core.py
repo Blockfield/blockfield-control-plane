@@ -7290,6 +7290,28 @@ async def test_workshop_state_report_read_and_stream(store, monkeypatch):
         await iterator.aclose()
 
 
+async def test_workshop_state_cursor_follows_commit_order(store):
+    started = asyncio.Event()
+
+    async def second():
+        async with store["app"].state.db.transaction() as conn:
+            started.set()
+            return await core._workshop_state_upsert(conn, "maps", {"n": 2})
+
+    async with store["app"].state.db.transaction() as conn:
+        first = await core._workshop_state_upsert(conn, "status", {"n": 1})
+        task = asyncio.create_task(second())
+        await started.wait()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 0.1)
+    later = await asyncio.wait_for(task, 5)
+    assert first["seq"] < later["seq"]
+    async with store["app"].state.db.transaction() as conn:
+        assert [
+            x["name"] for x in await core.workshop_state_since(conn, first["seq"])
+        ] == ["maps"]
+
+
 async def _site_sessions_token(store, cid="site-sessions"):
     if cid not in store["tokens"]:
         store["tokens"][cid] = await provision(
@@ -11353,6 +11375,7 @@ async def test_workshop_game_migration_adds_capabilities_idempotently(store):
         ("legacy-ws-game", ["console.run"], "workshop"),
         ("legacy-game-main", ["console.run", "moderation.say"], "*"),
         ("legacy-ws-ctrl", ["workshop.members"], "workshop"),
+        ("legacy-ws-other", ["console.run"], "other"),
     ):
         await provision(
             store["admin"],
@@ -11393,6 +11416,50 @@ async def test_workshop_game_migration_adds_capabilities_idempotently(store):
     ]
     assert rows_["legacy-game-main"] == ["console.run", "moderation.say"]
     assert rows_["legacy-ws-ctrl"] == ["workshop.members"]
+    assert rows_["legacy-ws-other"] == ["console.run"]
+
+
+async def test_workshop_game_state_rejects_other_resource_consumer(store):
+    generation = str(store["generation"])
+    store["tokens"]["foreign-agent"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "foreign-agent",
+                "via": "game",
+                "ceiling": ["agents.events", "agents.acks"],
+            },
+            "ceiling": ["agents.events", "agents.acks"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "other",
+            "consumer": {
+                "id": "foreign-agent",
+                "generation": generation,
+                "capabilities": ["workshop.ready"],
+            },
+        },
+    )
+    snapshot = await request(
+        store, "GET", "/v2/agents/foreign-agent/snapshot", role="foreign-agent"
+    )
+    assert snapshot.status_code == 200
+    assert "workshopDesired" not in snapshot.json()
+    desired = await request(
+        store,
+        "GET",
+        "/v2/workshop/game/desired?consumerId=foreign-agent",
+        role="foreign-agent",
+    )
+    assert desired.status_code == 409
+    put = await request(
+        store,
+        "PUT",
+        "/v2/workshop/game/state/game-ready",
+        {"consumerId": "foreign-agent", "generation": generation, "value": {}},
+        "foreign-agent",
+    )
+    assert put.status_code == 409
 
 
 async def test_workshop_game_dispatch_sse_and_state(store):

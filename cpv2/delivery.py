@@ -567,7 +567,11 @@ async def snapshot(conn, identity, cid):
         "settings": result,
         "hash": digest(result),
     }
-    if "workshop.ready" in c["capabilities"]:
+    if "workshop.ready" in c["capabilities"] and (
+        c["environment"],
+        c["backend"],
+        c["resource"],
+    ) == ("prod", "game", "workshop"):
         desired = await one(
             conn,
             "SELECT value, revision, seq, updated_at FROM workshop_state WHERE name='game-desired'",

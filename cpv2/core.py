@@ -2051,6 +2051,10 @@ def _workshop_state_name(name, *, read=False):
 
 
 async def _workshop_state_upsert(conn, name, value):
+    # Hold through commit so stream cursors follow commit order.
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("workshop-state",)
+    )
     # Unchanged documents keep their revision and wake nobody.
     changed = await one(
         conn,
@@ -2088,6 +2092,12 @@ async def _workshop_game_consumer(
     conn, identity, consumer_id, generation=None, *, capability
 ):
     consumer = await _server_consumer(conn, consumer_id, generation, capability)
+    if (consumer["environment"], consumer["backend"], consumer["resource"]) != (
+        "prod",
+        "game",
+        "workshop",
+    ):
+        raise Problem("consumer_generation_or_capability", 409)
     if (
         identity.credential["id"] != consumer["credential_id"]
         and identity.credential["id"] != consumer["previous_credential_id"]
