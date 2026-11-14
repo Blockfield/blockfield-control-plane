@@ -12037,3 +12037,49 @@ async def test_presence_snapshot_delivers_provisioned_namespaces(store):
     assert full.json()["settings"] == sorted(
         full.json()["settings"], key=lambda s: (s["namespace"], s["target"])
     )
+
+
+async def test_presence_clears_and_rejects_old_observations(store):
+    timestamp = int(time.time() * 1000)
+    catalog = {"fields": {}, "guns": [{"id": "tacz:ak47"}]}
+    kits = {"fields": {}, "kits": [{"id": "soldier"}]}
+    first = presence_body(
+        store,
+        timestamp,
+        maintenance={"message": "pause"},
+        gunCatalog=catalog,
+        applied={
+            "revision": 1,
+            "attemptedRevision": 1,
+            "errors": [],
+            "disabledMapIds": ["arena"],
+        },
+        gunCatalogHash="gun1",
+        kitCatalog=kits,
+        kitCatalogHash="kit1",
+    )
+    assert (
+        await request(store, "POST", "/v2/rooms/report", first, "game-agent")
+    ).status_code == 201
+    second = presence_body(
+        store,
+        timestamp + 1,
+        rooms=[],
+        maintenance=None,
+        gunCatalogHash="gun2",
+        kitCatalogHash="kit2",
+    )
+    assert (
+        await request(store, "POST", "/v2/rooms/report", second, "game-agent")
+    ).status_code == 201
+    assert (
+        await request(store, "POST", "/v2/rooms/report", first, "game-agent")
+    ).status_code == 409
+    presence = (await request(store, "GET", "/v2/rooms?consumerId=game")).json()[
+        "presence"
+    ]
+    assert presence["checkedAt"] == timestamp + 1 and presence["rooms"] == []
+    assert presence["maintenance"] is None
+    assert presence["applied"]["disabledMapIds"] == ["arena"]
+    assert "gunCatalog" not in presence and "kitCatalog" not in presence
+    assert presence["gunCatalogHash"] == "gun2" and presence["kitCatalogHash"] == "kit2"

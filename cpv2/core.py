@@ -1403,7 +1403,9 @@ async def presence_report(conn, identity, attempt, consumer_id, body):
         if not isinstance(body["draining"], bool):
             raise Problem("invalid_presence", 422)
         value["draining"] = body["draining"]
-    if "maintenance" in body and body["maintenance"] is not None:
+    if "maintenance" in body and body["maintenance"] is None:
+        value["maintenance"] = None
+    elif "maintenance" in body:
         maintenance = body["maintenance"]
         if not isinstance(maintenance, dict):
             raise Problem("invalid_presence", 422)
@@ -1437,6 +1439,19 @@ async def presence_report(conn, identity, attempt, consumer_id, body):
             "attemptedRevision": attempted,
             "errors": errors,
         }
+        if "disabledMapIds" in applied:
+            ids = applied["disabledMapIds"]
+            if (
+                not isinstance(ids, list)
+                or len(ids) > 4096
+                or any(
+                    not isinstance(item, str)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", item) is None
+                    for item in ids
+                )
+            ):
+                raise Problem("invalid_presence", 422)
+            value["applied"]["disabledMapIds"] = ids
     if "gunCatalogHash" in body and body["gunCatalogHash"] is not None:
         if _presence_str(body["gunCatalogHash"], 128) is None:
             raise Problem("invalid_presence", 422)
@@ -1445,9 +1460,10 @@ async def presence_report(conn, identity, attempt, consumer_id, body):
         value["gunCatalog"] = _presence_catalog(
             body["gunCatalog"], "guns", PRESENCE_CATALOG_GUNS_MAX
         )
-        value["gunCatalogHash"] = hashlib.sha256(
-            canonical(value["gunCatalog"]).encode()
-        ).hexdigest()
+        value["gunCatalogHash"] = (
+            body.get("gunCatalogHash")
+            or hashlib.sha256(canonical(value["gunCatalog"]).encode()).hexdigest()
+        )
     if "kitCatalogHash" in body and body["kitCatalogHash"] is not None:
         if _presence_str(body["kitCatalogHash"], 128) is None:
             raise Problem("invalid_presence", 422)
@@ -1456,9 +1472,10 @@ async def presence_report(conn, identity, attempt, consumer_id, body):
         value["kitCatalog"] = _presence_catalog(
             body["kitCatalog"], "kits", PRESENCE_CATALOG_KITS_MAX
         )
-        value["kitCatalogHash"] = hashlib.sha256(
-            canonical(value["kitCatalog"]).encode()
-        ).hexdigest()
+        value["kitCatalogHash"] = (
+            body.get("kitCatalogHash")
+            or hashlib.sha256(canonical(value["kitCatalog"]).encode()).hexdigest()
+        )
     # Latest-only, but fields persist until replaced: the game sends full
     # catalogs only on change (hashes always), so a rooms-only report must not
     # wipe the previously reported catalogs. Every field above is validated
@@ -1467,7 +1484,18 @@ async def presence_report(conn, identity, attempt, consumer_id, body):
         conn, "SELECT value FROM game_presence WHERE consumer_id=%s", (consumer_id,)
     )
     if old:
-        value = {**old["value"], **value}
+        previous = old["value"]
+        if checked_at < previous["checkedAt"]:
+            raise Problem("stale_presence", 409)
+        for name in ("gun", "kit"):
+            catalog, catalog_hash = name + "Catalog", name + "CatalogHash"
+            if (
+                catalog_hash in value
+                and catalog not in value
+                and value[catalog_hash] != previous.get(catalog_hash)
+            ):
+                previous.pop(catalog, None)
+        value = {**previous, **value}
     await conn.execute(
         "INSERT INTO game_presence(consumer_id,environment,backend,resource,value) VALUES(%s,%s,%s,%s,%s)"
         " ON CONFLICT(consumer_id) DO UPDATE SET reported_at=now(),environment=EXCLUDED.environment,"
