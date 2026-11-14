@@ -27,7 +27,7 @@ from cpv2.auth import (
 )
 from cpv2 import models
 from cpv2.db import one, record, rows
-from cpv2.settings import DEFINITIONS, WorkshopGate, changed, digest, merge
+from cpv2.settings import DEFINITIONS, WorkshopGate, canonical, changed, digest, merge
 
 
 def gate_model(namespace, target, definition):
@@ -1197,6 +1197,355 @@ async def console_log_read(conn, identity, consumer_id, since):
             for row in found
         ],
         "next": found[-1]["seq"] if found else latest_seq,
+    }
+
+
+# Game presence (coordination#64 rows 10-11): the game agent pushes its live
+# room/status report; the site reads rooms (+ gate) from CP instead of direct
+# status TCP, status.json or the gate file. Same trust shape as the console
+# log ingest: the caller must be the consumer it reports for, so no new
+# scope or provisioning. Latest-only per consumer (upsert, no history).
+ROOM_PHASES = ("IDLE", "VOTING", "PREPARING", "GAME", "MATCH_END")
+ROOM_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+ROOM_BUILD = re.compile(r"^(v\d+\.\d+\.\d+|[0-9a-f]{7,40})$")
+PRESENCE_MAX_ROOMS = 100
+PRESENCE_CHECKED_SKEW_MS = 120_000
+PRESENCE_MAX_ERRORS = 64
+PRESENCE_ERROR_MAX = 500
+PRESENCE_MESSAGE_MAX = 500
+PRESENCE_ROOM_NAME_MAX = 200
+PRESENCE_ROOM_FIELD_MAX = 64
+PRESENCE_CATALOG_GUNS_MAX = 2000
+PRESENCE_CATALOG_KITS_MAX = 64
+PRESENCE_CATALOG_ID_MAX = 256
+
+
+def _presence_int(value, floor=None, ceiling=None):
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    if (floor is not None and value < floor) or (
+        ceiling is not None and value > ceiling
+    ):
+        return None
+    return value
+
+
+def _presence_str(value, limit, pattern=None):
+    if not isinstance(value, str) or len(value) > limit:
+        return None
+    if pattern is not None and not pattern.fullmatch(value):
+        return None
+    return value
+
+
+def _presence_battle(value):
+    # Mirrors the site rooms.ts shape (blockfield-mod#28 pass-through room
+    # fields): red/blue counters plus capture points. Structural only; the
+    # game owns the semantics.
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise Problem("invalid_presence", 422)
+    red = _presence_int(value.get("red"), 0)
+    blue = _presence_int(value.get("blue"), 0)
+    points = value.get("points")
+    if red is None or blue is None or not isinstance(points, list):
+        raise Problem("invalid_presence", 422)
+    if len(points) > PRESENCE_MAX_ROOMS:
+        raise Problem("invalid_presence", 422)
+    cleaned = []
+    for point in points:
+        if not isinstance(point, dict):
+            raise Problem("invalid_presence", 422)
+        owner = point.get("owner")
+        claiming = point.get("claiming")
+        capturing = point.get("capturing")
+        progress = _presence_int(point.get("progress"), 0, 100)
+        if (
+            _presence_str(point.get("id"), PRESENCE_ROOM_FIELD_MAX) is None
+            or _presence_str(point.get("name"), PRESENCE_ROOM_FIELD_MAX) is None
+            or owner not in ("RED", "BLUE", "NEUTRAL")
+            or claiming not in ("RED", "BLUE", "NONE")
+            or capturing not in ("RED", "BLUE", "NONE")
+            or progress is None
+        ):
+            raise Problem("invalid_presence", 422)
+        cleaned.append(
+            {
+                "id": point["id"],
+                "name": point["name"],
+                "owner": owner,
+                "claiming": claiming,
+                "capturing": capturing,
+                "progress": progress,
+            }
+        )
+    return {"red": red, "blue": blue, "points": cleaned}
+
+
+def _presence_room(room):
+    if not isinstance(room, dict):
+        raise Problem("invalid_presence", 422)
+    if _presence_str(room.get("id"), 36, ROOM_ID) is None:
+        raise Problem("invalid_presence", 422)
+    name = _presence_str(room.get("name"), PRESENCE_ROOM_NAME_MAX)
+    mode = _presence_str(room.get("mode"), PRESENCE_ROOM_FIELD_MAX)
+    game_map = _presence_str(room.get("map"), PRESENCE_ROOM_FIELD_MAX)
+    players = _presence_int(room.get("players"), 0)
+    if (
+        name is None
+        or mode is None
+        or game_map is None
+        or players is None
+        or not isinstance(room.get("joinable"), bool)
+        or room.get("phase") not in ROOM_PHASES
+    ):
+        raise Problem("invalid_presence", 422)
+    cleaned = {
+        "id": room["id"],
+        "name": name,
+        "mode": mode,
+        "map": game_map,
+        "phase": room["phase"],
+        "players": players,
+        "joinable": room["joinable"],
+    }
+    battle = _presence_battle(room.get("battle"))
+    if battle is not None:
+        cleaned["battle"] = battle
+    elif "battle" in room and room["battle"] is not None:
+        raise Problem("invalid_presence", 422)
+    for key in ("format", "admission"):
+        if key in room and room[key] is not None:
+            if _presence_str(room[key], PRESENCE_ROOM_FIELD_MAX) is None:
+                raise Problem("invalid_presence", 422)
+            cleaned[key] = room[key]
+    if "ready" in room and room["ready"] is not None:
+        ready = room["ready"]
+        if not isinstance(ready, dict):
+            raise Problem("invalid_presence", 422)
+        ready_count = _presence_int(ready.get("ready"), 0)
+        required = _presence_int(ready.get("required"), 0)
+        if ready_count is None or required is None:
+            raise Problem("invalid_presence", 422)
+        cleaned["ready"] = {"ready": ready_count, "required": required}
+    return cleaned
+
+
+def _presence_catalog(catalog, entry_key, max_entries):
+    # A game-generated catalog the site admin needs (replaces the shared-dir
+    # gun-balance.json and kits.json mirrors). Structural only: the registry
+    # lives in the game, CP is the transport. The entry list is validated
+    # (each entry carries a string id); every other top-level key passes
+    # through verbatim, so the site keeps the shape it validates (schema,
+    # revision, modes, items, ...). The report body cap bounds the row.
+    if not isinstance(catalog, dict):
+        raise Problem("invalid_presence", 422)
+    fields = catalog.get("fields")
+    entries = catalog.get(entry_key)
+    if not isinstance(fields, dict) or not isinstance(entries, list):
+        raise Problem("invalid_presence", 422)
+    if len(entries) > max_entries:
+        raise Problem("invalid_presence", 422)
+    cleaned = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise Problem("invalid_presence", 422)
+        entry_id = _presence_str(entry.get("id"), PRESENCE_CATALOG_ID_MAX)
+        if entry_id is None:
+            raise Problem("invalid_presence", 422)
+        cleaned.append({**entry, "id": entry_id})
+    out = {
+        key: value for key, value in catalog.items() if key not in ("fields", entry_key)
+    }
+    out["fields"] = fields
+    out[entry_key] = cleaned
+    return out
+
+
+async def presence_report(conn, identity, attempt, consumer_id, body):
+    """One live room/status report from the game itself, over its agent credential.
+
+    No new scope: the caller must be the consumer it reports for (same check
+    as the agent ack path and the console log ingest), so no credential
+    provisioning changes. Latest-only: the row is replaced, never appended,
+    but reported fields persist until replaced (catalogs travel only on
+    change, rooms-only reports keep them).
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("rooms"), list):
+        raise Problem("invalid_presence", 422)
+    consumer = await _server_consumer(conn, consumer_id, body.get("generation"))
+    if (
+        identity.credential["id"] != consumer["credential_id"]
+        and identity.credential["id"] != consumer["previous_credential_id"]
+    ) or identity.credential["kind"] != "service":
+        raise Problem("consumer_identity_mismatch")
+    if consumer["environment"] != body.get(
+        "environment", consumer["environment"]
+    ) or consumer["backend"] != body.get("backend", consumer["backend"]):
+        raise Problem("consumer_generation_or_capability", 409)
+    checked_at = _presence_int(body.get("checkedAt"), 0)
+    if checked_at is None or abs(time.time() * 1000 - checked_at) > (
+        PRESENCE_CHECKED_SKEW_MS
+    ):
+        raise Problem("invalid_presence", 422)
+    if len(body["rooms"]) > PRESENCE_MAX_ROOMS:
+        raise Problem("invalid_presence", 422)
+    value = {
+        "checkedAt": checked_at,
+        "rooms": [_presence_room(room) for room in body["rooms"]],
+    }
+    if "build" in body and body["build"] is not None:
+        if _presence_str(body["build"], 64, ROOM_BUILD) is None:
+            raise Problem("invalid_presence", 422)
+        value["build"] = body["build"]
+    if "draining" in body and body["draining"] is not None:
+        if not isinstance(body["draining"], bool):
+            raise Problem("invalid_presence", 422)
+        value["draining"] = body["draining"]
+    if "maintenance" in body and body["maintenance"] is None:
+        value["maintenance"] = None
+    elif "maintenance" in body:
+        maintenance = body["maintenance"]
+        if not isinstance(maintenance, dict):
+            raise Problem("invalid_presence", 422)
+        message = maintenance.get("message", "")
+        since = maintenance.get("since")
+        if not isinstance(message, str) or len(message) > PRESENCE_MESSAGE_MAX:
+            raise Problem("invalid_presence", 422)
+        if since is not None and _presence_int(since, 0) is None:
+            raise Problem("invalid_presence", 422)
+        value["maintenance"] = {"message": message, "since": since}
+    if "applied" in body and body["applied"] is not None:
+        applied = body["applied"]
+        if not isinstance(applied, dict):
+            raise Problem("invalid_presence", 422)
+        revision = _presence_int(applied.get("revision"), 0)
+        attempted = _presence_int(applied.get("attemptedRevision"), 0)
+        errors = applied.get("errors", [])
+        if (
+            revision is None
+            or attempted is None
+            or not isinstance(errors, list)
+            or len(errors) > PRESENCE_MAX_ERRORS
+            or any(
+                not isinstance(error, str) or len(error) > PRESENCE_ERROR_MAX
+                for error in errors
+            )
+        ):
+            raise Problem("invalid_presence", 422)
+        value["applied"] = {
+            "revision": revision,
+            "attemptedRevision": attempted,
+            "errors": errors,
+        }
+        if "disabledMapIds" in applied:
+            ids = applied["disabledMapIds"]
+            if (
+                not isinstance(ids, list)
+                or len(ids) > 4096
+                or any(
+                    not isinstance(item, str)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", item) is None
+                    for item in ids
+                )
+            ):
+                raise Problem("invalid_presence", 422)
+            value["applied"]["disabledMapIds"] = ids
+    if "gunCatalogHash" in body and body["gunCatalogHash"] is not None:
+        if _presence_str(body["gunCatalogHash"], 128) is None:
+            raise Problem("invalid_presence", 422)
+        value["gunCatalogHash"] = body["gunCatalogHash"]
+    if "gunCatalog" in body and body["gunCatalog"] is not None:
+        value["gunCatalog"] = _presence_catalog(
+            body["gunCatalog"], "guns", PRESENCE_CATALOG_GUNS_MAX
+        )
+        value["gunCatalogHash"] = (
+            body.get("gunCatalogHash")
+            or hashlib.sha256(canonical(value["gunCatalog"]).encode()).hexdigest()
+        )
+    if "kitCatalogHash" in body and body["kitCatalogHash"] is not None:
+        if _presence_str(body["kitCatalogHash"], 128) is None:
+            raise Problem("invalid_presence", 422)
+        value["kitCatalogHash"] = body["kitCatalogHash"]
+    if "kitCatalog" in body and body["kitCatalog"] is not None:
+        value["kitCatalog"] = _presence_catalog(
+            body["kitCatalog"], "kits", PRESENCE_CATALOG_KITS_MAX
+        )
+        value["kitCatalogHash"] = (
+            body.get("kitCatalogHash")
+            or hashlib.sha256(canonical(value["kitCatalog"]).encode()).hexdigest()
+        )
+    # Latest-only, but fields persist until replaced: the game sends full
+    # catalogs only on change (hashes always), so a rooms-only report must not
+    # wipe the previously reported catalogs. Every field above is validated
+    # before this merge, so a malformed report still touches nothing.
+    old = await one(
+        conn, "SELECT value FROM game_presence WHERE consumer_id=%s", (consumer_id,)
+    )
+    if old:
+        previous = old["value"]
+        if checked_at < previous["checkedAt"]:
+            raise Problem("stale_presence", 409)
+        for name in ("gun", "kit"):
+            catalog, catalog_hash = name + "Catalog", name + "CatalogHash"
+            if (
+                catalog_hash in value
+                and catalog not in value
+                and value[catalog_hash] != previous.get(catalog_hash)
+            ):
+                previous.pop(catalog, None)
+        value = {**previous, **value}
+    await conn.execute(
+        "INSERT INTO game_presence(consumer_id,environment,backend,resource,value) VALUES(%s,%s,%s,%s,%s)"
+        " ON CONFLICT(consumer_id) DO UPDATE SET reported_at=now(),environment=EXCLUDED.environment,"
+        " backend=EXCLUDED.backend,resource=EXCLUDED.resource,value=EXCLUDED.value",
+        (
+            consumer_id,
+            consumer["environment"],
+            consumer["backend"],
+            consumer["resource"],
+            Jsonb(value),
+        ),
+    )
+    await audit(
+        conn,
+        attempt,
+        identity,
+        "presence.report",
+        consumer_id,
+        "accepted",
+        {"rooms": len(value["rooms"])},
+    )
+    return {
+        "reportedAt": now().isoformat(),
+        "rooms": len(value["rooms"]),
+        "missingCatalogs": [
+            name
+            for name in ("gun", "kit")
+            if name + "CatalogHash" in value and name + "Catalog" not in value
+        ],
+    }
+
+
+async def presence_read(conn, identity, consumer_id, environment, backend):
+    consumer = await one(conn, "SELECT * FROM consumers WHERE id=%s", (consumer_id,))
+    if not consumer:
+        raise Problem("consumer_not_found", 404)
+    identity.require("settings.read", consumer["environment"], consumer["backend"], "*")
+    if environment != consumer["environment"] or backend != consumer["backend"]:
+        raise Problem("consumer_generation_or_capability", 409)
+    row = await one(
+        conn,
+        "SELECT reported_at, value FROM game_presence WHERE consumer_id=%s",
+        (consumer_id,),
+    )
+    if not row:
+        return {"initialized": False}
+    return {
+        "initialized": True,
+        "reportedAt": row["reported_at"].isoformat(),
+        "presence": row["value"],
     }
 
 
