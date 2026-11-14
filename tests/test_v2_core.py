@@ -12336,3 +12336,156 @@ async def test_skewed_422_resnapshot_redelivers_until_fallback_unknown_settles(s
     )
     assert after_fallback.json()["cursor"] == 1
     assert await envelopes(store, cursor=after_fallback.json()["cursor"]) == []
+
+
+async def test_rewind_received_cursor_migration_and_redelivery(store):
+    for key in ("mig-1", "mig-2", "mig-3"):
+        await queued(store, key)
+    frames = await envelopes(store)
+    for state in delivery.STATES:
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frames[0], state),
+                "game-agent",
+            )
+        ).status_code == 200
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/game/acks",
+            ack_body(frames[1], "received"),
+            "game-agent",
+        )
+    ).status_code == 200
+    for state in delivery.STATES:
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frames[2], state),
+                "game-agent",
+            )
+        ).status_code == 200
+    await sql(store, "UPDATE consumers SET received_cursor=3 WHERE id='game'")
+
+    await queued(store, "ws-1", consumer="workshop")
+    await queued(store, "ws-2", consumer="workshop")
+    ws_frames = await envelopes(store, cid="workshop")
+    for state in delivery.STATES:
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/workshop/acks",
+                ack_body(ws_frames[0], state),
+                "workshop-agent",
+            )
+        ).status_code == 200
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/agents/workshop/acks",
+            ack_body(ws_frames[1], "received"),
+            "workshop-agent",
+        )
+    ).status_code == 200
+
+    store["tokens"]["behind-agent"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "behind",
+                "via": "game",
+                "ceiling": ["agents.acks", "agents.events"],
+            },
+            "ceiling": ["agents.acks", "agents.events"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+            "consumer": {
+                "id": "behind",
+                "generation": str(store["generation"]),
+                "capabilities": ["moderation.kick"],
+            },
+        },
+    )
+    await queued(store, "behind-1", consumer="behind")
+    behind_frame = (await envelopes(store, cid="behind"))[0]
+    for state in delivery.STATES:
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/behind/acks",
+                ack_body(behind_frame, state),
+                "behind-agent",
+            )
+        ).status_code == 200
+    await sql(store, "UPDATE consumers SET received_cursor=0 WHERE id='behind'")
+
+    dbname = conninfo_to_dict(store["admin"])["dbname"]
+    async with await psycopg.AsyncConnection.connect(
+        store["admin"], autocommit=True
+    ) as conn:
+        await conn.execute("DELETE FROM control.schema_migrations WHERE version=16")
+    await migrate(store["admin"], dbname)
+    cursors = {
+        r["id"]: r["received_cursor"]
+        for r in await sql(
+            store,
+            "SELECT id, received_cursor FROM consumers WHERE id IN ('game','workshop','behind')",
+        )
+    }
+    assert cursors == {"game": 1, "workshop": 1, "behind": 0}
+
+    migration = "\n".join(
+        line
+        for line in (
+            Path(__file__).resolve().parents[1]
+            / "migrations/016_rewind_received_cursor.sql"
+        )
+        .read_text()
+        .splitlines()
+        if not line.startswith("SET search_path")
+    )
+    await migrate(store["admin"], dbname)
+    await sql(store, migration)
+    cursors_after = {
+        r["id"]: r["received_cursor"]
+        for r in await sql(
+            store,
+            "SELECT id, received_cursor FROM consumers WHERE id IN ('game','workshop','behind')",
+        )
+    }
+    assert cursors_after == {"game": 1, "workshop": 1, "behind": 0}
+
+    snapshot = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert snapshot.status_code == 200
+    assert snapshot.json()["cursor"] == 1
+    redelivered = await envelopes(store, cursor=snapshot.json()["cursor"])
+    assert [(f["sequence"], f["executable"], f["reason"]) for f in redelivered] == [
+        (2, True, None),
+        (3, False, "already_terminal"),
+    ]
+    for state in ("validated", "applied", "effective"):
+        assert (
+            await request(
+                store,
+                "POST",
+                "/v2/agents/game/acks",
+                ack_body(frames[1], state),
+                "game-agent",
+            )
+        ).status_code == 200
+    after_settle = await request(
+        store, "GET", "/v2/agents/game/snapshot", role="game-agent"
+    )
+    assert after_settle.json()["cursor"] == 3
