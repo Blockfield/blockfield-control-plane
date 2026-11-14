@@ -9,6 +9,8 @@ from cpv2.models import (
     ModerationAction,
     Rollback,
     SettingsChange,
+    WorkshopGameAction,
+    WorkshopGameState,
 )
 from cpv2.settings import (
     DEFINITIONS,
@@ -486,3 +488,46 @@ def test_public_per_ip_budget_keys_on_the_forwarded_client_not_the_proxy():
         )
         == "10.0.0.2"
     )
+
+
+def test_workshop_game_models_validate_job_and_scope_shape():
+    gen = "11111111-1111-1111-1111-111111111111"
+    job = "22222222-2222-2222-2222-222222222222"
+    base = {
+        "idempotencyKey": "k1",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "ws-game",
+        "generation": gen,
+        "gameOp": "save-flush",
+    }
+    assert WorkshopGameAction.model_validate(base).target == "workshop"
+    assert (
+        str(
+            WorkshopGameAction.model_validate(
+                base | {"gameOp": "export-limbo", "job": job}
+            ).job
+        )
+        == job
+    )
+    for bad in (
+        base | {"gameOp": "export-limbo"},
+        base | {"job": job},
+        base | {"target": "*"},
+        base | {"gameOp": "stop", "expiresInSeconds": 301},
+        base | {"gameOp": "list"},
+    ):
+        with pytest.raises(ValidationError):
+            WorkshopGameAction.model_validate(bad)
+    state = WorkshopGameState.model_validate(
+        {"consumerId": "ws-game", "generation": gen, "value": {"running": True}}
+    )
+    assert state.value == {"running": True}
+    with pytest.raises(ValidationError):
+        WorkshopGameState.model_validate(
+            {
+                "consumerId": "ws-game",
+                "generation": gen,
+                "value": [],
+            }
+        )

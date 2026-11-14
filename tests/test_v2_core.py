@@ -5520,20 +5520,32 @@ async def test_workshop_unknown_kind_rejected(store):
     assert response.status_code == 404
 
 
+WORKSHOP_COPY = "e10438e4-797b-4971-88cf-ecec6a8fa171"
 WORKSHOP_MAP_CREATE = {
     "mapOp": "map-create",
-    "mapId": "arena1",
-    "name": "Arena 1",
-    "supportedModes": ["tdm", "room"],
-    "expectedRevision": 3,
+    "args": {
+        "mapId": "arena1",
+        "name": "Arena 1",
+        "supportedModes": ["tdm", "room"],
+        "expectedRevision": 3,
+        "sessionId": "0f0d9a51-3f43-4f8d-9a37-0d6a3b1d2c4e",
+    },
 }
 WORKSHOP_MAP_PROPERTIES = {
     "mapOp": "map-properties",
-    "mapId": "arena1",
-    "name": "Arena One",
-    "workingCopyId": "e10438e4-797b-4971-88cf-ecec6a8fa171",
-    "expectedRevision": 4,
+    "args": {
+        "mapId": "arena1",
+        "name": "Arena One",
+        "workingCopyId": WORKSHOP_COPY,
+        "expectedRevision": 4,
+    },
 }
+
+
+def map_op(base, **changes):
+    """A map operation body with some arguments replaced (None drops one)."""
+    args = {**base["args"], **changes}
+    return {**base, "args": {k: v for k, v in args.items() if v is not None}}
 
 
 async def test_workshop_remaining_kinds_produce_exact_consumer_payloads(store):
@@ -5630,21 +5642,82 @@ async def test_workshop_remaining_kinds_reject_bad_shapes(store):
     key = "sk-" + "x" * 20
     cases = [
         ("moderator", "map", {**WORKSHOP_MAP_CREATE, "mapOp": "map-rename"}),
-        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "mapId": "hub"}),
-        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "mapId": "Arena!"}),
-        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "name": " §bad"}),
-        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "supportedModes": []}),
+        ("moderator", "map", map_op(WORKSHOP_MAP_CREATE, mapId="hub")),
+        ("moderator", "map", map_op(WORKSHOP_MAP_CREATE, mapId="Arena!")),
+        ("moderator", "map", map_op(WORKSHOP_MAP_CREATE, name=" §bad")),
+        ("moderator", "map", map_op(WORKSHOP_MAP_CREATE, supportedModes=[])),
         (
             "moderator",
             "map",
-            {**WORKSHOP_MAP_CREATE, "supportedModes": ["tdm", "nope"]},
+            map_op(WORKSHOP_MAP_CREATE, supportedModes=["tdm", "nope"]),
         ),
-        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "supportedModes": ["tdm", "tdm"]}),
+        (
+            "moderator",
+            "map",
+            map_op(WORKSHOP_MAP_CREATE, supportedModes=["tdm", "tdm"]),
+        ),
         # Unhashable elements must 422, not 500 (set() runs on validated strs).
-        ("moderator", "map", {**WORKSHOP_MAP_CREATE, "supportedModes": [[]]}),
-        ("moderator", "map", {**WORKSHOP_MAP_PROPERTIES, "workingCopyId": "nope"}),
-        ("moderator", "map", {**WORKSHOP_MAP_PROPERTIES, "expectedRevision": -1}),
+        ("moderator", "map", map_op(WORKSHOP_MAP_CREATE, supportedModes=[[]])),
+        ("moderator", "map", map_op(WORKSHOP_MAP_CREATE, sessionId="nope")),
+        ("moderator", "map", map_op(WORKSHOP_MAP_CREATE, sessionId=None)),
+        ("moderator", "map", map_op(WORKSHOP_MAP_PROPERTIES, workingCopyId="nope")),
+        ("moderator", "map", map_op(WORKSHOP_MAP_PROPERTIES, expectedRevision=-1)),
+        ("moderator", "map", map_op(WORKSHOP_MAP_PROPERTIES, extra=1)),
         ("moderator", "map", {**WORKSHOP_MAP_CREATE, "target": "arena1"}),
+        ("moderator", "map", {"mapOp": "snapshots"}),
+        ("moderator", "map", {"mapOp": "snapshots", "args": {"mapId": "A"}}),
+        (
+            "moderator",
+            "map",
+            {"mapOp": "commit", "args": {"mapId": "arena1", "note": "x"}},
+        ),
+        (
+            "moderator",
+            "map",
+            {
+                "mapOp": "commit",
+                "args": {
+                    "mapId": "arena1",
+                    "workingCopyId": WORKSHOP_COPY,
+                    "expectedHead": None,
+                    "note": "  ",
+                },
+            },
+        ),
+        (
+            "moderator",
+            "map",
+            {"mapOp": "snapshot-delete", "args": {"mapId": "arena1", "name": "main"}},
+        ),
+        (
+            "moderator",
+            "map",
+            {"mapOp": "publish", "args": {"candidateId": "a" * 32, "force": 1}},
+        ),
+        (
+            "moderator",
+            "map",
+            {
+                "mapOp": "publish",
+                "args": {
+                    "candidateId": "a" * 32,
+                    "resolutions": {"../etc/passwd": "ours"},
+                },
+            },
+        ),
+        (
+            "moderator",
+            "map",
+            {
+                "mapOp": "publish",
+                "args": {
+                    "candidateId": "a" * 32,
+                    "resolutions": {"map.json": "mine"},
+                },
+            },
+        ),
+        ("moderator", "map", {"mapOp": "reject", "args": {"candidateId": "A" * 32}}),
+        ("moderator", "map", {"mapOp": "limbo-export", "args": {"versionDigest": "1"}}),
         ("moderator", "sessions", {"offset": -1}),
         ("moderator", "sessions", {"offset": True}),
         ("moderator", "sessions", {"offset": 0, "limit": 101}),
@@ -5867,9 +5940,9 @@ async def test_workshop_remaining_kinds_service_split(store):
                 "site-maps",
             )
         ).status_code == 202
-    # Mode and keys are never service-holdable: provisioning such a ceiling
-    # is refused, and act-only credentials cannot mint them either.
-    with pytest.raises(ValueError, match="service credential ceiling"):
+    # Mode and keys need an asserted actor: only an unbound site principal
+    # may hold them, and act-only credentials cannot mint them either.
+    with pytest.raises(ValueError, match="unbound site credential"):
         await provision(
             store["admin"],
             {
@@ -5881,7 +5954,7 @@ async def test_workshop_remaining_kinds_service_split(store):
                 "ceiling": ["workshop.act", "workshop.mode"],
                 "environment": "prod",
                 "backend": "game",
-                "resource": "*",
+                "resource": "arena1",
             },
         )
     act_only = await provision(
@@ -6136,10 +6209,10 @@ async def test_workshop_admin_members_need_owner_step_up(store):
     response = await request(
         store, "POST", "/v2/workshop/members", service, "site-stepup"
     )
-    # Members needs the admin-only workshop.members scope, which no service
-    # credential may hold: rejected before any owner step-up is evaluated.
+    # Members needs an asserted human (the site principal's actor), never
+    # workshop.act: rejected before any owner step-up is evaluated.
     assert response.status_code == 403, response.text
-    assert response.json()["error"] == "forbidden"
+    assert response.json()["error"] == "service_actor_required"
 
 
 async def test_c20_health_reports_database_outage(store, monkeypatch):
@@ -6892,10 +6965,10 @@ async def test_cpp1r2_service_act_alone_cannot_post_members(store):
     assert response.status_code == 403, response.text
 
 
-async def test_cpp1r2_service_workshop_op_fenced_at_delivery(store):
-    # Accept-time per-kind scopes are not enough on their own: a NULL-account
-    # (service-issued) operation that is not the workshop gate leg must stay
-    # rejected at delivery, so its frame is never executable.
+async def test_service_workshop_op_rechecked_at_delivery(store):
+    # A workshop.act operation (site/proxy attesting a human) carries no
+    # account: delivery re-checks the provisioned scopes (SERVICE_ISSUED), so
+    # it executes while the credential holds them and fences once revoked.
     store["tokens"]["messenger"] = await provision(
         store["admin"],
         {
@@ -6922,8 +6995,304 @@ async def test_cpp1r2_service_workshop_op_fenced_at_delivery(store):
     assert rows[0]["account_id"] is None
     frames = await envelopes(store, cid="workshop")
     frame = next(item for item in frames if item["operationId"] == operation_id)
-    assert not frame["executable"]
-    assert frame["payload"] is None
+    assert frame["executable"] is True
+    assert frame["payload"]["actor"] == WORKSHOP_ACTOR
+    second = await request(
+        store,
+        "POST",
+        "/v2/workshop/message",
+        workshop_body(store, message="again"),
+        "messenger",
+    )
+    assert second.status_code == 202, second.text
+    await sql(
+        store,
+        "UPDATE credentials SET revoked_at=now() WHERE client_id='messenger'",
+    )
+    frames = await envelopes(store, cid="workshop")
+    fenced = next(
+        item for item in frames if item["operationId"] == second.json()["operationId"]
+    )
+    assert not fenced["executable"]
+    assert fenced["payload"] is None
+
+
+async def _workshop_service(store, client_id, ceiling, resource="*"):
+    store["tokens"][client_id] = await provision(
+        store["admin"],
+        {
+            "client": {"id": client_id, "via": "game", "ceiling": ceiling},
+            "ceiling": ceiling,
+            "environment": "prod",
+            "backend": "game",
+            "resource": resource,
+        },
+    )
+
+
+async def test_workshop_map_ops_produce_exact_payloads(store):
+    await bind(store, "moderator")
+    head, other = "a" * 64, "b" * 64
+    cases = {
+        "map-create": WORKSHOP_MAP_CREATE["args"],
+        "map-properties": WORKSHOP_MAP_PROPERTIES["args"],
+        "limbo-export": {"versionDigest": head},
+        "commit": {
+            "mapId": "arena1",
+            "workingCopyId": WORKSHOP_COPY,
+            "expectedHead": None,
+            "note": " tidy ",
+        },
+        "compare": {"mapId": "arena1", "before": head, "after": other},
+        "snapshots": {"mapId": "arena1"},
+        "snapshot-create": {"mapId": "arena1", "name": "v1", "versionDigest": head},
+        "snapshot-delete": {"mapId": "arena1", "name": "v1"},
+        "snapshot-copy": {
+            "mapId": "arena1",
+            "name": "draft.2",
+            "workingCopyId": WORKSHOP_COPY,
+        },
+        "checkout-fresh": {"mapId": "arena1", "workingCopyId": WORKSHOP_COPY},
+        "candidate": {
+            "mapId": "arena1",
+            "workingCopyId": WORKSHOP_COPY,
+            "expectedHead": head,
+            "commit": True,
+            "note": "ready",
+        },
+        "rollback": {"mapId": "arena1", "versionDigest": head, "expectedHead": other},
+        "publish": {
+            "candidateId": "c" * 32,
+            "force": True,
+            "expectedHead": None,
+            "resolutions": {
+                "map.json": "ours",
+                "world/region/r.0.-1.mca": "theirs",
+                "map.json#/spawn/0": "theirs",
+            },
+        },
+        "reject": {"candidateId": "c" * 32},
+        "export": {"candidateId": "c" * 32},
+    }
+    assert set(cases) == set(core.WORKSHOP_MAP_OPS)
+    for op, args in cases.items():
+        body = workshop_body(store, mapOp=op, args=args)
+        response = await request(store, "POST", "/v2/workshop/map", body, "moderator")
+        assert response.status_code == 202, (op, response.text)
+        rows = await workshop_outbox(store, response.json()["operationId"])
+        expected = {**args, "note": args["note"].strip()} if "note" in args else args
+        assert rows[0]["payload"] == {
+            "kind": "map",
+            "target": "*",
+            "actor": WORKSHOP_ACTOR,
+            "mapOp": op,
+            "args": expected,
+        }, op
+
+
+async def test_workshop_site_principal_asserts_admin_kinds(store):
+    await _workshop_service(
+        store,
+        "site-ws",
+        ["workshop.act", "workshop.members", "workshop.mode", "workshop.ai-key"],
+    )
+    accounts = store["accounts"]
+    admin = {"draslId": accounts["admin"].hex, "name": "Admin"}
+    owner = {"draslId": accounts["owner"].hex, "name": "Owner"}
+    mode = {"profile": "game", "expectedRevision": 0}
+
+    async def post(kind, role="site-ws", **fields):
+        return await request(
+            store, "POST", f"/v2/workshop/{kind}", workshop_body(store, **fields), role
+        )
+
+    # Admin/owner kinds never ride workshop.act: the human is asserted.
+    response = await post("mode", actor=admin, **mode)
+    assert response.status_code == 403
+    assert response.json()["error"] == "service_actor_required"
+    response = await post(
+        "mode", actor=admin, actorAccountId=str(accounts["admin"]), **mode
+    )
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["operationId"]
+    rows = await sql(
+        store, "SELECT account_id FROM operations WHERE id=%s", (operation_id,)
+    )
+    assert rows[0]["account_id"] == accounts["admin"]
+    payload = (await workshop_outbox(store, operation_id))[0]["payload"]
+    assert payload == {"kind": "mode", "target": "*", "actor": admin, **mode}
+    frames = await envelopes(store, cid="workshop")
+    frame = next(item for item in frames if item["operationId"] == operation_id)
+    assert frame["executable"] is True
+    # The workshop actor is the asserted account itself.
+    response = await post(
+        "mode", actor=owner, actorAccountId=str(accounts["admin"]), **mode
+    )
+    assert response.status_code == 422
+    # The asserted actor's own grants decide: moderators cannot switch
+    # modes, keys stay founders only.
+    moderator = {"draslId": accounts["moderator"].hex, "name": "Mod"}
+    response = await post(
+        "mode", actor=moderator, actorAccountId=str(accounts["moderator"]), **mode
+    )
+    assert response.status_code == 403
+    key = {"provider": "openrouter", "key": "sk-" + "x" * 20}
+    response = await post(
+        "ai-key", actor=admin, actorAccountId=str(accounts["admin"]), **key
+    )
+    assert response.status_code == 403
+    response = await post(
+        "ai-key", actor=owner, actorAccountId=str(accounts["owner"]), **key
+    )
+    assert response.status_code == 202, response.text
+    # Members: without an owner step-up, every Workshop admin must be a CP
+    # admin or owner.
+    members = [
+        {"draslId": accounts["admin"].hex, "name": "Admin", "role": "admin"},
+        {"draslId": "f" * 32, "name": "Stranger"},
+    ]
+    response = await post(
+        "members", actor=admin, actorAccountId=str(accounts["admin"]), members=members
+    )
+    assert response.status_code == 202, response.text
+    response = await post(
+        "members",
+        actor=admin,
+        actorAccountId=str(accounts["admin"]),
+        members=[{"draslId": "f" * 32, "name": "Stranger", "role": "admin"}],
+    )
+    assert response.status_code == 403
+    assert response.json()["error"] == "workshop_admin_not_cp_admin"
+    # Direct callers and workshop.act kinds never carry an asserted account.
+    response = await post(
+        "mode", "admin", actor=admin, actorAccountId=str(accounts["admin"]), **mode
+    )
+    assert response.json()["error"] == "actor_forbidden"
+    response = await post(
+        "message", actor=admin, actorAccountId=str(accounts["admin"]), message="hi"
+    )
+    assert response.json()["error"] == "actor_forbidden"
+
+
+async def test_workshop_release_ci_selects_without_actor(store):
+    await _workshop_service(store, "release-ci", ["workshop.release.select"])
+    record = {"release": "v9.1.0"}
+    body = workshop_body(store, actor=None, release="v9.1.0", record=record)
+    response = await request(
+        store, "POST", "/v2/workshop/release.select", body, "release-ci"
+    )
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["operationId"]
+    payload = (await workshop_outbox(store, operation_id))[0]["payload"]
+    assert payload == {
+        "kind": "release.select",
+        "target": "*",
+        "release": "v9.1.0",
+        "record": record,
+    }
+    frames = await envelopes(store, cid="workshop")
+    frame = next(item for item in frames if item["operationId"] == operation_id)
+    assert frame["executable"] is True
+    # The release principal never attests a human or reaches other kinds.
+    for kind, fields in (
+        ("release.select", {"release": "v9.1.0"}),
+        ("message", {"message": "hi"}),
+    ):
+        response = await request(
+            store,
+            "POST",
+            f"/v2/workshop/{kind}",
+            workshop_body(store, **fields),
+            "release-ci",
+        )
+        assert response.status_code == 403, kind
+    # An attesting service cannot select releases actorless.
+    await _workshop_service(store, "attester", ["workshop.act", "workshop.message"])
+    response = await request(
+        store,
+        "POST",
+        "/v2/workshop/release.select",
+        workshop_body(store, actor=None, release="v9.1.0"),
+        "attester",
+    )
+    assert response.status_code == 403
+
+
+async def test_workshop_state_report_read_and_stream(store, monkeypatch):
+    from types import SimpleNamespace
+
+    await _workshop_service(
+        store,
+        "ws-reporter",
+        ["workshop.gate", "workshop.report"],
+        resource="workshop",
+    )
+    await _workshop_service(store, "ws-reader", ["workshop.read"])
+
+    async def put(name, value, role="ws-reporter"):
+        return await request(
+            store, "PUT", f"/v2/workshop/state/{name}", {"value": value}, role
+        )
+
+    status = {"phase": "workshop", "revision": 3}
+    response = await put("status", status)
+    assert response.status_code == 200, response.text
+    assert response.json()["changed"] is True and response.json()["revision"] == 1
+    response = await put("status", status)
+    assert response.json()["changed"] is False and response.json()["revision"] == 1
+    response = await put("status", {**status, "revision": 4})
+    assert response.json()["revision"] == 2
+    assert (await put("nope", {})).status_code == 404
+    assert (await put("status", status, "ws-reader")).status_code == 403
+    assert (
+        await request(store, "GET", "/v2/workshop/state", role="ws-reporter")
+    ).status_code == 403
+    document = (
+        await request(store, "GET", "/v2/workshop/state", role="ws-reader")
+    ).json()
+    assert document["documents"]["status"]["value"] == {**status, "revision": 4}
+    # Results keep only the newest WORKSHOP_RESULTS_KEPT.
+    monkeypatch.setattr(core, "WORKSHOP_RESULTS_KEPT", 2)
+    ids = [str(uuid4()) for _ in range(3)]
+    for index, op in enumerate(ids):
+        assert (await put(f"result:{op}", {"ok": True, "n": index})).status_code == 200
+    names = ",".join(f"result:{op}" for op in ids)
+    kept = (
+        await request(
+            store, "GET", f"/v2/workshop/state?names={names}", role="ws-reader"
+        )
+    ).json()["documents"]
+    assert set(kept) == {f"result:{op}" for op in ids[1:]}
+    # The stream replays past the cursor, then pushes each change.
+    async with store["app"].state.db.transaction() as conn:
+        identity = await authenticate(conn, store["tokens"]["ws-reader"])
+    endpoint = next(
+        route.endpoint
+        for route in store["app"].routes
+        if route.path == "/v2/workshop/state/events"
+    )
+    req = SimpleNamespace(
+        state=SimpleNamespace(identity=identity, token=store["tokens"]["ws-reader"])
+    )
+    response = await endpoint(req, after=0)
+    iterator = response.body_iterator
+    try:
+        replayed = [await asyncio.wait_for(anext(iterator), 2) for _ in range(3)]
+        assert [
+            json.loads(item.split("data: ", 1)[1])["name"] for item in replayed
+        ] == [
+            "status",
+            f"result:{ids[1]}",
+            f"result:{ids[2]}",
+        ]
+        await put("maps", {"schema": 1, "maps": []})
+        pushed = await asyncio.wait_for(anext(iterator), 5)
+        assert json.loads(pushed.split("data: ", 1)[1])["value"] == {
+            "schema": 1,
+            "maps": [],
+        }
+    finally:
+        await iterator.aclose()
 
 
 async def _site_sessions_token(store, cid="site-sessions"):
@@ -10398,6 +10767,10 @@ async def test_public_instance_serves_only_exact_allowlist(store, monkeypatch):
             ("GET", "/v2/agents/game/snapshot"),
             ("POST", "/v2/agents/game/acks"),
             ("GET", f"/v2/operations/{epoch}"),
+            ("POST", "/v2/workshop/game"),
+            ("GET", "/v2/workshop/game/desired?consumerId=ws-game"),
+            ("PUT", "/v2/workshop/game/state/game-ready"),
+            ("GET", f"/v2/workshop/game/{epoch}/events"),
             ("GET", "/v2/settings/catalog"),
             ("GET", "/v2/openapi.json"),
             ("GET", "/v1/openapi.json"),
@@ -10609,6 +10982,10 @@ def test_public_allowlist_is_exact_and_uses_raw_scope():
         ("GET", "/v2/stats/players/a/b"),
         ("GET", "/v2/stats/players/"),
         ("GET", "/v2/operations/a/b"),
+        ("POST", "/v2/workshop/game"),
+        ("GET", "/v2/workshop/game/desired"),
+        ("PUT", "/v2/workshop/game/state/game-ready"),
+        ("GET", "/v2/workshop/game/12345678-1234-1234-1234-123456789abc/events"),
         ("GET", "/hea%09lth"),
         ("OPTIONS", "/health"),
         ("POST", "/v2/stats/seasons"),
@@ -10973,3 +11350,383 @@ async def test_public_and_internal_buckets_are_fully_isolated(
         assert (
             await request(store, "GET", "/v2/stats/seasons", None, "launcher-b")
         ).status_code == 200
+
+
+async def test_workshop_game_migration_adds_capabilities_idempotently(store):
+    generation = str(store["generation"])
+    for cid, caps, resource in (
+        ("legacy-ws-game", ["console.run"], "workshop"),
+        ("legacy-game-main", ["console.run", "moderation.say"], "*"),
+        ("legacy-ws-ctrl", ["workshop.members"], "workshop"),
+    ):
+        await provision(
+            store["admin"],
+            {
+                "client": {
+                    "id": cid,
+                    "via": "game",
+                    "ceiling": ["agents.acks", "agents.events"],
+                },
+                "ceiling": ["agents.acks", "agents.events"],
+                "environment": "prod",
+                "backend": "game",
+                "resource": resource,
+                "consumer": {"id": cid, "generation": generation, "capabilities": caps},
+            },
+        )
+    migration = (
+        Path(__file__).resolve().parents[1] / "migrations/014_workshop_game.sql"
+    ).read_text()
+    migration = "\n".join(
+        line
+        for line in migration.splitlines()
+        if not line.startswith("SET search_path")
+    )
+    for _ in range(2):
+        await sql(store, migration)
+    rows_ = {
+        r["id"]: r["capabilities"]
+        for r in await sql(
+            store,
+            "SELECT id, capabilities FROM consumers WHERE id LIKE 'legacy-ws-%%' OR id = 'legacy-game-main'",
+        )
+    }
+    assert rows_["legacy-ws-game"] == [
+        "console.run",
+        "workshop.game",
+        "workshop.ready",
+    ]
+    assert rows_["legacy-game-main"] == ["console.run", "moderation.say"]
+    assert rows_["legacy-ws-ctrl"] == ["workshop.members"]
+
+
+async def test_workshop_game_dispatch_sse_and_state(store):
+    from types import SimpleNamespace
+
+    generation = str(store["generation"])
+    await _workshop_service(
+        store,
+        "ws-controller",
+        ["workshop.gate", "workshop.report", "workshop.game"],
+        resource="workshop",
+    )
+    await _workshop_service(store, "ws-site-reader", ["workshop.read"])
+    store["tokens"]["ws-game-agent"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "ws-game",
+                "via": "game",
+                "ceiling": ["agents.events", "agents.acks"],
+            },
+            "ceiling": ["agents.events", "agents.acks"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "workshop",
+            "consumer": {
+                "id": "ws-game",
+                "generation": generation,
+                "capabilities": ["console.run", "workshop.game", "workshop.ready"],
+            },
+        },
+    )
+
+    body = {
+        "idempotencyKey": "ws-save-1",
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "ws-game",
+        "generation": generation,
+        "gameOp": "save-flush",
+    }
+    # Human owners and non-controller credentials never invoke workshop.game.
+    assert (
+        await request(store, "POST", "/v2/workshop/game", body, "owner")
+    ).status_code == 403
+    assert (
+        await request(store, "POST", "/v2/workshop/game", body, "ws-site-reader")
+    ).status_code == 403
+    # Target consumer must carry workshop.game capability and cover workshop.
+    assert (
+        await request(
+            store,
+            "POST",
+            "/v2/workshop/game",
+            body | {"idempotencyKey": "ws-wrong-consumer", "consumerId": "game"},
+            "ws-controller",
+        )
+    ).status_code == 409
+
+    accepted = await request(store, "POST", "/v2/workshop/game", body, "ws-controller")
+    assert accepted.status_code == 202, accepted.text
+    op_id = accepted.json()["operationId"]
+    # Exact idempotent replay returns the same receipt; conflict returns 409.
+    replay = await request(store, "POST", "/v2/workshop/game", body, "ws-controller")
+    assert replay.status_code == 202 and replay.json()["operationId"] == op_id
+    conflict = await request(
+        store,
+        "POST",
+        "/v2/workshop/game",
+        body | {"gameOp": "stop"},
+        "ws-controller",
+    )
+    assert conflict.status_code == 409
+
+    [frame] = await envelopes(store, cid="ws-game")
+    assert frame["payload"] == {
+        "kind": "workshop.game",
+        "target": "workshop",
+        "gameOp": "save-flush",
+    }
+
+    # SSE settled stream wakes on ACK without polling and denies foreign callers.
+    assert (
+        await request(
+            store, "GET", f"/v2/workshop/game/{op_id}/events", role="ws-site-reader"
+        )
+    ).status_code == 403
+    assert (
+        await request(
+            store, "GET", f"/v2/workshop/game/{op_id}/events", role="ws-game-agent"
+        )
+    ).status_code == 403
+    async with store["app"].state.db.transaction() as conn:
+        ctrl_identity = await authenticate(conn, store["tokens"]["ws-controller"])
+    game_events_endpoint = next(
+        route.endpoint
+        for route in store["app"].routes
+        if route.path == "/v2/workshop/game/{operation_id}/events"
+    )
+    req = SimpleNamespace(
+        state=SimpleNamespace(
+            identity=ctrl_identity, token=store["tokens"]["ws-controller"]
+        )
+    )
+    sse_resp = await game_events_endpoint(UUID(op_id), req)
+    iterator = sse_resp.body_iterator
+    try:
+        for st in delivery.STATES:
+            ack_req = ack_body(frame, st)
+            if st == "effective":
+                ack_req["output"] = "saved"
+            ack_res = await request(
+                store, "POST", "/v2/agents/ws-game/acks", ack_req, "ws-game-agent"
+            )
+            assert ack_res.status_code == 200, ack_res.text
+        settled_chunk = await asyncio.wait_for(anext(iterator), 5)
+        assert "event: settled\n" in settled_chunk
+        settled_data = json.loads(settled_chunk.split("data: ", 1)[1])
+        assert settled_data == {
+            "operationId": op_id,
+            "status": "effective",
+            "state": "effective",
+            "code": "ok",
+            "output": "saved",
+        }
+    finally:
+        await iterator.aclose()
+
+    job_id = str(uuid4())
+    limbo = await request(
+        store,
+        "POST",
+        "/v2/workshop/game",
+        body
+        | {
+            "idempotencyKey": "ws-export-1",
+            "gameOp": "export-limbo",
+            "job": job_id,
+        },
+        "ws-controller",
+    )
+    assert limbo.status_code == 202, limbo.text
+    [limbo_frame] = await envelopes(store, cid="ws-game", cursor=1)
+    assert limbo_frame["payload"] == {
+        "kind": "workshop.game",
+        "target": "workshop",
+        "gameOp": "export-limbo",
+        "job": job_id,
+    }
+
+    # game-desired flows controller -> CP -> ws-game (snapshot + /desired),
+    # while game-ready/game-activity accept only the bound ws-game consumer.
+    assert (
+        await request(
+            store,
+            "PUT",
+            "/v2/workshop/state/game-ready",
+            {"value": {"running": True}},
+            "ws-controller",
+        )
+    ).status_code == 403
+    desired_doc = {
+        "schema": 1,
+        "selected": {"profile": "workshop", "generation": "gen-7", "session": "s1"},
+    }
+    assert (
+        await request(
+            store,
+            "PUT",
+            "/v2/workshop/state/game-desired",
+            {"value": desired_doc},
+            "ws-controller",
+        )
+    ).status_code == 200
+
+    desired_res = await request(
+        store,
+        "GET",
+        f"/v2/workshop/game/desired?consumerId=ws-game&generation={generation}",
+        role="ws-game-agent",
+    )
+    assert desired_res.status_code == 200, desired_res.text
+    assert desired_res.json()["initialized"] is True
+    assert desired_res.json()["value"] == desired_doc
+    ws_snap = (
+        await request(store, "GET", "/v2/agents/ws-game/snapshot", role="ws-game-agent")
+    ).json()
+    assert ws_snap["workshopDesired"]["value"] == desired_doc
+    main_snap = (
+        await request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    ).json()
+    assert "workshopDesired" not in main_snap
+    assert (
+        await request(
+            store,
+            "GET",
+            "/v2/workshop/game/desired?consumerId=game",
+            role="game-agent",
+        )
+    ).status_code == 409
+    assert (
+        await request(
+            store,
+            "GET",
+            "/v2/workshop/game/desired?consumerId=ws-game",
+            role="game-agent",
+        )
+    ).status_code == 403
+
+    ready_doc = {
+        "schema": 1,
+        "running": True,
+        "profile": "workshop",
+        "generation": "gen-7",
+        "session": "s1",
+        "release": "v9.1.0",
+        "updatedAt": 1_700_000_000_000,
+    }
+    activity_doc = {"schema": 1, "activeAt": 1_700_000_000_000, "players": 0}
+    assert (
+        await request(
+            store,
+            "PUT",
+            "/v2/workshop/game/state/game-ready",
+            {
+                "consumerId": "ws-game",
+                "generation": generation,
+                "value": ready_doc,
+            },
+            "ws-controller",
+        )
+    ).status_code == 403
+    assert (
+        await request(
+            store,
+            "PUT",
+            "/v2/workshop/game/state/status",
+            {"consumerId": "ws-game", "generation": generation, "value": {}},
+            "ws-game-agent",
+        )
+    ).status_code == 404
+    assert (
+        await request(
+            store,
+            "PUT",
+            "/v2/workshop/game/state/game-ready",
+            {
+                "consumerId": "ws-game",
+                "generation": str(uuid4()),
+                "value": ready_doc,
+            },
+            "ws-game-agent",
+        )
+    ).status_code == 409
+    assert (
+        await request(
+            store,
+            "PUT",
+            "/v2/workshop/game/state/game-ready",
+            {
+                "consumerId": "ws-game",
+                "generation": generation,
+                "value": {"blob": "x" * 20000},
+            },
+            "ws-game-agent",
+        )
+    ).status_code == 422
+
+    async with store["app"].state.db.transaction() as conn:
+        reader_id = await authenticate(conn, store["tokens"]["ws-site-reader"])
+    state_events_endpoint = next(
+        route.endpoint
+        for route in store["app"].routes
+        if route.path == "/v2/workshop/state/events"
+    )
+    reader_req = SimpleNamespace(
+        state=SimpleNamespace(
+            identity=reader_id, token=store["tokens"]["ws-site-reader"]
+        )
+    )
+    # Catch current sequence before subscribing so we observe pushes live.
+    before_state = (
+        await request(
+            store,
+            "GET",
+            "/v2/workshop/state?names=game-desired,game-ready,game-activity",
+            role="ws-site-reader",
+        )
+    ).json()["documents"]
+    cursor = before_state["game-desired"]["seq"]
+    state_sse = await state_events_endpoint(reader_req, after=cursor)
+    state_iter = state_sse.body_iterator
+    try:
+        r_ready = await request(
+            store,
+            "PUT",
+            "/v2/workshop/game/state/game-ready",
+            {"consumerId": "ws-game", "generation": generation, "value": ready_doc},
+            "ws-game-agent",
+        )
+        assert r_ready.status_code == 200 and r_ready.json()["changed"] is True
+        r_act = await request(
+            store,
+            "PUT",
+            "/v2/workshop/game/state/game-activity",
+            {
+                "consumerId": "ws-game",
+                "generation": generation,
+                "value": activity_doc,
+            },
+            "ws-game-agent",
+        )
+        assert r_act.status_code == 200 and r_act.json()["changed"] is True
+
+        pushed = [await asyncio.wait_for(anext(state_iter), 5) for _ in range(2)]
+        assert [json.loads(c.split("data: ", 1)[1])["name"] for c in pushed] == [
+            "game-ready",
+            "game-activity",
+        ]
+    finally:
+        await state_iter.aclose()
+
+    docs = (
+        await request(
+            store,
+            "GET",
+            "/v2/workshop/state?names=game-desired,game-ready,game-activity",
+            role="ws-site-reader",
+        )
+    ).json()["documents"]
+    assert docs["game-ready"]["value"] == ready_doc
+    assert docs["game-activity"]["value"] == activity_doc

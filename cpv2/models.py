@@ -1,7 +1,7 @@
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BeforeValidator, Field, field_validator
+from pydantic import BeforeValidator, Field, field_validator, model_validator
 
 from cpv2.settings import Strict
 
@@ -139,11 +139,10 @@ class WorkshopAction(Mutation):
     record: dict | None = None
     # Remaining inbox kinds (map/sessions/ai-key/mode): kind-specific shapes
     # are validated in core.workshop_op, which rejects unknown combinations.
+    # Map operations carry their per-op arguments in `args`
+    # (core.WORKSHOP_MAP_OPS).
     mapOp: str | None = None
-    mapId: str | None = None
-    name: str | None = None
-    supportedModes: list | None = None
-    workingCopyId: str | None = None
+    args: dict | None = None
     expectedRevision: int | None = None
     offset: int | None = None
     limit: int | None = None
@@ -158,6 +157,14 @@ class WorkshopAction(Mutation):
     candidateId: str | None = None
     modeId: str | None = None
     expiresInSeconds: int = Field(default=30, ge=1, le=60)
+    # Service-asserted acting account for the admin/owner kinds
+    # (core.WORKSHOP_ASSERTED_KINDS, site principal only).
+    actorAccountId: ID | None = None
+
+
+class WorkshopState(Strict):
+    # One controller-reported Workshop document (core.WORKSHOP_STATE_NAMES).
+    value: dict | list
 
 
 class Ack(Strict):
@@ -266,3 +273,26 @@ def request_body(model):
     ):
         data.pop("actorAccountId", None)
     return data
+
+
+class WorkshopGameAction(Mutation):
+    target: Literal["workshop"] = "workshop"
+    consumerId: str = Field(min_length=1, max_length=64)
+    generation: ID
+    gameOp: Literal["save-flush", "save-off", "save-on", "stop", "export-limbo"]
+    job: ID | None = None
+    expiresInSeconds: int = Field(default=60, ge=1, le=300)
+
+    @model_validator(mode="after")
+    def _check_job(self):
+        if self.gameOp == "export-limbo" and self.job is None:
+            raise ValueError("export-limbo requires a job UUID")
+        if self.gameOp != "export-limbo" and self.job is not None:
+            raise ValueError("job is only valid for export-limbo")
+        return self
+
+
+class WorkshopGameState(Strict):
+    consumerId: str = Field(min_length=1, max_length=64)
+    generation: ID
+    value: dict

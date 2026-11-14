@@ -22,6 +22,20 @@ WORKSHOP_WRITE_SCOPES = {
     "workshop.sessions",
 }
 WORKSHOP_ADMIN_SCOPES = {"workshop.members", "workshop.release.select", "workshop.mode"}
+# Site principal only, and only with an asserted actor (core.workshop_op): the
+# admin/owner Workshop kinds the site issues for the logged-in human. The
+# actor's own grants (owner membership for ai-key) decide, like moderation.
+SITE_WORKSHOP_SCOPES = {"workshop.members", "workshop.mode", "workshop.ai-key"}
+# Release CI principal: selects a verified release with no human actor (the
+# consumer verifies the record against its catalog). Owner-provisioned.
+RELEASE_SCOPES = {"workshop.release.select"}
+# Workshop controller state reports (status, catalogs, op results) and their
+# readers (site, release CI). Service-only, never in a human role.
+WORKSHOP_STATE_SCOPES = {"workshop.report", "workshop.read"}
+# Workshop controller <-> Workshop game lifecycle dispatch (coordination#64).
+# Service-only: held by the controller credential (resource "workshop"), while
+# the Workshop game consumer holds capabilities workshop.game & workshop.ready.
+WORKSHOP_GAME_SCOPES = {"workshop.game"}
 # Site RCON replacements every moderator may issue (mirrors site `moderate`).
 MODERATION_SCOPES = {
     "moderation.say",
@@ -153,6 +167,18 @@ STATS_SCOPES = {"stats.ingest"}
 # it — never in a human role; admins and owners hold it via their role (see
 # ROLE_SCOPES). The public-exposure unit adds domain/rate-limit policy later.
 STATS_READ_SCOPES = {"stats.read"}
+# Everything a service credential may use without an asserted actor.
+SERVICE_ACTORLESS_SCOPES = (
+    SERVICE_SCOPES
+    | STAFF_SCOPES
+    | SITE_SETTINGS_SCOPES
+    | SITE_SESSIONS_SCOPES
+    | STATS_SCOPES
+    | STATS_READ_SCOPES
+    | RELEASE_SCOPES
+    | WORKSHOP_STATE_SCOPES
+    | WORKSHOP_GAME_SCOPES
+)
 
 
 class Problem(Exception):
@@ -218,27 +244,11 @@ class Identity:
             return False
         if c["kind"] == "service":
             if self.account is None:
-                return (
-                    scope
-                    in SERVICE_SCOPES
-                    | STAFF_SCOPES
-                    | SITE_SETTINGS_SCOPES
-                    | SITE_SESSIONS_SCOPES
-                    | STATS_SCOPES
-                    | STATS_READ_SCOPES
-                )
+                return scope in SERVICE_ACTORLESS_SCOPES
             # Service-asserted actor (staff/settings writes via the site
             # principal): the service must be provisioned for the scope, and
             # the asserted actor must hold it exactly like a direct caller.
-            if (
-                scope
-                not in SERVICE_SCOPES
-                | STAFF_SCOPES
-                | SITE_SETTINGS_SCOPES
-                | SITE_SESSIONS_SCOPES
-                | STATS_SCOPES
-                | STATS_READ_SCOPES
-            ):
+            if scope not in SERVICE_ACTORLESS_SCOPES | SITE_WORKSHOP_SCOPES:
                 return False
         if self.owner:
             return scope in OWNER_SCOPES

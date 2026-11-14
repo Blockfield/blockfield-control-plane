@@ -37,6 +37,7 @@ BODY_LIMITS = {
     "/v2/stats/diagnostics": core.DIAG_MAX_BODY,
     "/v2/console/logs": 65536,
     "/v2/console/suggest": 4096,
+    "/v2/workshop/map": core.WORKSHOP_MAP_MAX_BODY,
 }
 
 # Public HTTPS entrypoint (coordination#35): CP runs twice from the same
@@ -464,7 +465,12 @@ def create_app(dsn=None):
                         "pending",
                     )
                 chunks, size = [], 0
-                limit = BODY_LIMITS.get(path, 32768)
+                limit = BODY_LIMITS.get(
+                    path,
+                    core.WORKSHOP_STATE_MAX_BODY
+                    if path.startswith("/v2/workshop/state/")
+                    else 32768,
+                )
                 async with asyncio.timeout(5):
                     async for chunk in request.stream():
                         size += len(chunk)
@@ -885,6 +891,108 @@ def create_app(dsn=None):
         return await write(request, core.action, kind, body)
 
     @app.post(
+        "/v2/workshop/game",
+        status_code=202,
+        response_model=models.OperationReceipt,
+    )
+    async def workshop_game(body: models.WorkshopGameAction, request: Request):
+        return await write(request, core.workshop_game, body)
+
+    @app.get("/v2/workshop/game/desired")
+    async def workshop_game_desired(
+        request: Request, consumerId: str, generation: UUID | None = None
+    ):
+        async with database.transaction() as conn:
+            result = await core.workshop_game_desired(
+                conn, request.state.identity, consumerId, generation
+            )
+            await audit(
+                conn,
+                request.state.attempt,
+                request.state.identity,
+                "workshop.game.desired",
+                consumerId,
+                "allowed",
+            )
+            return result
+
+    @app.put("/v2/workshop/game/state/{name}")
+    async def workshop_game_state_put(
+        name: str, body: models.WorkshopGameState, request: Request
+    ):
+        return await write(request, core.workshop_game_state_put, name, body)
+
+    @app.get("/v2/workshop/game/{operation_id}/events")
+    async def workshop_game_events(operation_id: UUID, request: Request):
+        from cpv2.auth import now as cp_now
+
+        async with database.transaction() as conn:
+            settled, consumer_id, detail = await core.workshop_game_op_status(
+                conn, request.state.identity, operation_id
+            )
+        if not settled:
+            waiter = wakeups.subscribe_suggest(consumer_id)
+        else:
+            waiter = None
+
+        async def stream():
+            try:
+                if settled:
+                    yield (
+                        f"id: {operation_id}\nevent: settled\ndata: "
+                        + json.dumps(detail, separators=(",", ":"))
+                        + "\n\n"
+                    )
+                    return
+                while True:
+                    waiter.clear()
+                    async with database.transaction() as conn:
+                        i = await authenticate(conn, request.state.token)
+                        done, _, payload = await core.workshop_game_op_status(
+                            conn, i, operation_id
+                        )
+                    if done:
+                        yield (
+                            f"id: {operation_id}\nevent: settled\ndata: "
+                            + json.dumps(payload, separators=(",", ":"))
+                            + "\n\n"
+                        )
+                        return
+                    remaining = max(0.0, (payload - cp_now()).total_seconds())
+                    if remaining <= 0:
+                        yield (
+                            f"id: {operation_id}\nevent: settled\ndata: "
+                            + json.dumps(
+                                {
+                                    "operationId": str(operation_id),
+                                    "status": "expired",
+                                    "state": "expired",
+                                    "code": None,
+                                    "output": None,
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n\n"
+                        )
+                        return
+                    try:
+                        await asyncio.wait_for(waiter.wait(), min(10.0, remaining))
+                    except TimeoutError:
+                        if remaining > 10.0:
+                            yield ": heartbeat\n\n"
+            except (Problem, psycopg.Error):
+                yield 'event: resync\ndata: {"error":"reconnect_required"}\n\n'
+            finally:
+                if waiter is not None:
+                    wakeups.unsubscribe_suggest(consumer_id, waiter)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},
+        )
+
+    @app.post(
         "/v2/workshop/{kind}",
         status_code=202,
         response_model=models.OperationReceipt,
@@ -897,6 +1005,61 @@ def create_app(dsn=None):
             body,
             assertion(request),
             raw_path(request),
+        )
+
+    @app.put("/v2/workshop/state/{name}")
+    async def workshop_state_put(
+        name: str, body: models.WorkshopState, request: Request
+    ):
+        return await write(request, core.workshop_state_put, name, body.value)
+
+    @app.get("/v2/workshop/state")
+    async def workshop_state(request: Request, names: str = ""):
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            return await core.workshop_state_read(conn, identity, names)
+
+    @app.get("/v2/workshop/state/events")
+    async def workshop_state_events(request: Request, after: int = 0):
+        # Pushed Workshop state (site admin views, release CI waits): every
+        # document past the cursor, then each change as the controller
+        # reports it (LISTEN/NOTIFY wake, 10 s heartbeat).
+        request.state.identity.require(*core.WORKSHOP_STATE_READ)
+        if after < 0:
+            raise Problem("invalid_cursor", 422)
+        waiter = wakeups.subscribe_watch(core.WORKSHOP_STATE_CHANNEL)
+
+        async def stream():
+            cursor = after
+            try:
+                while True:
+                    waiter.clear()
+                    async with database.transaction() as conn:
+                        i = await authenticate(conn, request.state.token)
+                        i.require(*core.WORKSHOP_STATE_READ)
+                        records = await core.workshop_state_since(conn, cursor)
+                    for record in records:
+                        yield (
+                            f"id: {record['seq']}\nevent: state\ndata: "
+                            + json.dumps(record, separators=(",", ":"))
+                            + "\n\n"
+                        )
+                        cursor = record["seq"]
+                    if len(records) == core.WORKSHOP_STATE_BATCH:
+                        continue
+                    try:
+                        await asyncio.wait_for(waiter.wait(), 10)
+                    except TimeoutError:
+                        yield ": heartbeat\n\n"
+            except (Problem, psycopg.Error):
+                yield 'event: resync\ndata: {"error":"reconnect_required"}\n\n'
+            finally:
+                wakeups.unsubscribe_watch(core.WORKSHOP_STATE_CHANNEL, waiter)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},
         )
 
     @app.post("/v2/delegations", status_code=201)

@@ -20,6 +20,15 @@ SERVICE_ISSUED = {
     ("console.run", "console.read"),
     ("console.run", "console.run"),
     ("console.suggest", "console.read"),
+    # Workshop ops a provisioned service attests for a human over workshop.act
+    # (site, proxy wake-on-connect); the consumer checks that actor against
+    # its own member ACL. The release CI selects with no actor at all.
+    *(
+        (f"workshop.{kind}", f"workshop.act,workshop.{kind}")
+        for kind in ("message", "wake", "cancel", "map", "sessions")
+    ),
+    ("workshop.release.select", "workshop.release.select"),
+    ("workshop.game", "workshop.game"),
 }
 TERMINAL = {"rejected", "unknown", "effective", "expired"}
 
@@ -33,6 +42,8 @@ class Wakeups:
         # Completion waiters never take agent stream slots: with the stream
         # limit reached, a completion would otherwise 504 immediately.
         self.suggest_waiters = defaultdict(set)
+        # Read-only change streams (Workshop state): no agent stream slots.
+        self.watchers = defaultdict(set)
         self.ready = asyncio.Event()
         self.task = None
 
@@ -57,6 +68,7 @@ class Wakeups:
                     for waiters in (
                         *self.waiters.values(),
                         *self.suggest_waiters.values(),
+                        *self.watchers.values(),
                     ):
                         for waiter in waiters:
                             waiter.set()
@@ -70,6 +82,8 @@ class Wakeups:
                             for waiter in self.waiters.get(cid, ()):
                                 waiter.set()
                             for waiter in self.suggest_waiters.get(cid, ()):
+                                waiter.set()
+                            for waiter in self.watchers.get(cid, ()):
                                 waiter.set()
             except psycopg.Error:
                 # Bounded stream recovery sweep also drains while LISTEN reconnects.
@@ -119,6 +133,18 @@ class Wakeups:
         self.suggest_waiters[consumer].add(waiter)
         return waiter
 
+    def subscribe_watch(self, channel):
+        if sum(len(items) for items in self.watchers.values()) >= 64:
+            raise Problem("stream_limit", 429)
+        waiter = asyncio.Event()
+        self.watchers[channel].add(waiter)
+        return waiter
+
+    def unsubscribe_watch(self, channel, waiter):
+        self.watchers[channel].discard(waiter)
+        if not self.watchers[channel]:
+            del self.watchers[channel]
+
     def unsubscribe_suggest(self, consumer, waiter):
         self.suggest_waiters[consumer].discard(waiter)
         if not self.suggest_waiters[consumer]:
@@ -151,8 +177,8 @@ async def valid_operation(conn, op):
         return "rejected"
     # Service-issued operation: only the workshop gate leg (settings.gate.patch
     # at target "workshop" with the service-holdable workshop.gate scope), the
-    # fixed deploy announce and owner-provisioned console lines may be
-    # service-issued. Every other NULL-account kind stays rejected, as before
+    # fixed deploy announce, owner-provisioned console lines and the attested
+    # Workshop kinds (SERVICE_ISSUED) may be service-issued. Every other NULL-account kind stays rejected, as before
     # this branch existed: then SELECT * FROM accounts WHERE id=NULL returned
     # no row and the function fenced them. Delivery rechecks the provisioned
     # scope exactly like the accept-time check. A narrowed or revoked
@@ -532,7 +558,7 @@ async def snapshot(conn, identity, cid):
     # database's physical return order. Documented as (namespace, target).
     result.sort(key=lambda r: (r["namespace"], r["target"]))
     # A snapshot bootstraps desired state only; it never advances receipt ACKs.
-    return {
+    snap = {
         "schema": 2,
         "audience": cid,
         "epoch": str(c["epoch"]),
@@ -541,6 +567,27 @@ async def snapshot(conn, identity, cid):
         "settings": result,
         "hash": digest(result),
     }
+    if "workshop.ready" in c["capabilities"]:
+        desired = await one(
+            conn,
+            "SELECT value, revision, seq, updated_at FROM workshop_state WHERE name='game-desired'",
+        )
+        snap["workshopDesired"] = (
+            {
+                "initialized": True,
+                "revision": desired["revision"],
+                "seq": desired["seq"],
+                "value": desired["value"],
+                "updatedAt": int(desired["updated_at"].timestamp() * 1000),
+            }
+            if desired is not None
+            else {
+                "initialized": False,
+                "revision": 0,
+                "value": {"schema": 1, "selected": None},
+            }
+        )
+    return snap
 
 
 def sse(envelope):
