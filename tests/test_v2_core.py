@@ -11792,3 +11792,248 @@ async def test_workshop_game_dispatch_sse_and_state(store):
     ).json()["documents"]
     assert docs["game-ready"]["value"] == ready_doc
     assert docs["game-activity"]["value"] == activity_doc
+
+
+def presence_room(room_id="12345678-1234-4234-8234-123456789012", **extra):
+    room = {
+        "id": room_id,
+        "name": "Комната 1",
+        "mode": "tdm",
+        "map": "arena",
+        "phase": "GAME",
+        "players": 12,
+        "joinable": True,
+        **extra,
+    }
+    return room
+
+
+def presence_body(store, now_ms, **extra):
+    return {
+        "environment": "prod",
+        "backend": "game",
+        "consumerId": "game",
+        "generation": str(store["generation"]),
+        "checkedAt": now_ms,
+        "build": "v2.82.0",
+        "rooms": [presence_room()],
+        **extra,
+    }
+
+
+async def test_presence_report_and_read(store):
+    now_ms = int(time.time() * 1000)
+    # No report yet: uninitialized, not 404 (the consumer exists).
+    empty = await request(store, "GET", "/v2/rooms?consumerId=game")
+    assert empty.status_code == 200, empty.text
+    assert empty.json() == {"initialized": False}
+    assert (await request(store, "GET", "/v2/rooms?consumerId=nope")).status_code == 404
+    assert (
+        await request(store, "GET", "/v2/rooms?consumerId=game", None, "ordinary")
+    ).status_code == 403
+    body = presence_body(
+        store,
+        now_ms,
+        applied={"revision": 41, "attemptedRevision": 41, "errors": []},
+        gunCatalogHash="0" * 64,
+    )
+    pushed = await request(store, "POST", "/v2/rooms/report", body, "game-agent")
+    assert pushed.status_code == 201, pushed.text
+    assert pushed.json()["rooms"] == 1
+    read = await request(store, "GET", "/v2/rooms?consumerId=game")
+    assert read.status_code == 200, read.text
+    payload = read.json()
+    assert payload["initialized"] is True
+    assert payload["presence"]["checkedAt"] == now_ms
+    assert payload["presence"]["rooms"] == [presence_room()]
+    assert payload["presence"]["build"] == "v2.82.0"
+    assert payload["presence"]["applied"] == {
+        "revision": 41,
+        "attemptedRevision": 41,
+        "errors": [],
+    }
+    assert "reportedAt" in payload
+    # A report without the catalog keeps the old one untouched: latest-only
+    # means fields persist until replaced, and a catalog report replaces them.
+    catalog = {
+        "fields": {"type": "object"},
+        "guns": [{"id": "tacz:ak47", "name": "AK"}],
+    }
+    with_catalog = presence_body(
+        store, int(time.time() * 1000), rooms=[], gunCatalog=catalog
+    )
+    assert (
+        await request(store, "POST", "/v2/rooms/report", with_catalog, "game-agent")
+    ).status_code == 201
+    reread = await request(store, "GET", "/v2/rooms?consumerId=game")
+    assert reread.json()["presence"]["gunCatalog"] == catalog
+    assert len(reread.json()["presence"]["gunCatalogHash"]) == 64
+    assert reread.json()["presence"]["rooms"] == []
+    # A rooms-only report keeps the previously reported catalogs and applied
+    # summary: fields persist until replaced.
+    rooms_only = presence_body(store, int(time.time() * 1000))
+    assert (
+        await request(store, "POST", "/v2/rooms/report", rooms_only, "game-agent")
+    ).status_code == 201
+    merged = await request(store, "GET", "/v2/rooms?consumerId=game")
+    assert merged.json()["presence"]["gunCatalog"] == catalog
+    assert merged.json()["presence"]["applied"] == {
+        "revision": 41,
+        "attemptedRevision": 41,
+        "errors": [],
+    }
+    assert len(merged.json()["presence"]["rooms"]) == 1
+    # Another consumer's credential cannot report for this consumer.
+    foreign = presence_body(store, int(time.time() * 1000), consumerId="workshop")
+    assert (
+        await request(store, "POST", "/v2/rooms/report", foreign, "game-agent")
+    ).status_code == 403
+    # A stale generation fails closed instead of replacing the report.
+    stale = presence_body(store, int(time.time() * 1000))
+    stale["generation"] = "00000000-0000-0000-0000-000000000000"
+    assert (
+        await request(store, "POST", "/v2/rooms/report", stale, "game-agent")
+    ).status_code == 409
+    # Malformed reports never touch the stored presence.
+    for bad in (
+        presence_body(store, int(time.time() * 1000), rooms={}),
+        presence_body(store, int(time.time() * 1000), rooms=[{"id": "nope"}]),
+        presence_body(
+            store, int(time.time() * 1000), rooms=[presence_room(phase="LOBBY")]
+        ),
+        presence_body(
+            store,
+            int(time.time() * 1000),
+            rooms=[presence_room() for _ in range(101)],
+        ),
+        presence_body(store, int(time.time() * 1000) - 600_000),
+        presence_body(store, int(time.time() * 1000), build="tomorrow"),
+        presence_body(
+            store, int(time.time() * 1000), maintenance={"message": "x" * 501}
+        ),
+        presence_body(
+            store,
+            int(time.time() * 1000),
+            applied={"revision": -1, "attemptedRevision": 0, "errors": []},
+        ),
+        presence_body(
+            store,
+            int(time.time() * 1000),
+            gunCatalog={"fields": {}, "guns": [{"name": "no id"}]},
+        ),
+    ):
+        response = await request(store, "POST", "/v2/rooms/report", bad, "game-agent")
+        assert response.status_code == 422, (bad, response.text)
+
+
+async def test_presence_kit_catalog_roundtrip(store):
+    now_ms = int(time.time() * 1000)
+    kits = {
+        "schema": 1,
+        "revision": 7,
+        "fields": {"idPattern": "[a-z0-9_]{1,32}"},
+        "kits": [{"id": "scout", "name": "Scout"}],
+        "items": [{"id": "minecraft:stick", "name": "Stick"}],
+    }
+    body = presence_body(store, now_ms, kitCatalog=kits)
+    pushed = await request(store, "POST", "/v2/rooms/report", body, "game-agent")
+    assert pushed.status_code == 201, pushed.text
+    read = await request(store, "GET", "/v2/rooms?consumerId=game")
+    assert read.json()["presence"]["kitCatalog"] == kits
+    assert len(read.json()["presence"]["kitCatalogHash"]) == 64
+    # Entry lists are validated structurally; other top-level keys pass through.
+    bad = presence_body(
+        store, int(time.time() * 1000), kitCatalog={"fields": {}, "kits": [{}]}
+    )
+    assert (
+        await request(store, "POST", "/v2/rooms/report", bad, "game-agent")
+    ).status_code == 422
+    too_many = presence_body(
+        store,
+        int(time.time() * 1000),
+        kitCatalog={"fields": {}, "kits": [{"id": f"k{i}"} for i in range(65)]},
+    )
+    assert (
+        await request(store, "POST", "/v2/rooms/report", too_many, "game-agent")
+    ).status_code == 422
+
+
+async def test_presence_snapshot_delivers_provisioned_namespaces(store):
+    # A rooms PATCH fans out like gameplay, but the fixture game consumer
+    # holds no settings.rooms capability: the snapshot omits it until the
+    # capability is provisioned, and scoped consumers stay unaffected.
+    # The bare snapshot only lists initialized namespaces, so gameplay and
+    # gate are initialized first.
+    init = await request(
+        store,
+        "PATCH",
+        "/v2/settings/gameplay/*",
+        {
+            "idempotencyKey": "gameplay-probe",
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": 0,
+            "patch": {"lobby": {"pvpEnabled": True}},
+        },
+    )
+    assert init.status_code == 202, init.text
+    store["tokens"]["sitegate"] = await provision(
+        store["admin"],
+        {
+            "client": {
+                "id": "sitegate",
+                "via": "game",
+                "ceiling": ["settings.read", "moderation.ban"],
+            },
+            "ceiling": ["settings.read", "moderation.ban"],
+            "environment": "prod",
+            "backend": "game",
+            "resource": "*",
+        },
+    )
+    gate = await request(
+        store,
+        "POST",
+        "/v2/gate/toggle",
+        {
+            "idempotencyKey": "gate-probe",
+            "environment": "prod",
+            "backend": "game",
+            "mode": "open",
+            "message": "",
+            "actorAccountId": str(store["accounts"]["admin"]),
+        },
+        "sitegate",
+    )
+    assert gate.status_code == 202, gate.text
+    accepted = await request(
+        store,
+        "PATCH",
+        "/v2/settings/rooms/*",
+        {
+            "idempotencyKey": "rooms-probe",
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": 0,
+            "patch": {"maxRooms": 8},
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    bare = await request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    assert bare.status_code == 200, bare.text
+    assert [s["namespace"] for s in bare.json()["settings"]] == ["gameplay", "gate"]
+    await sql(
+        store,
+        "UPDATE consumers SET capabilities=array_append(capabilities,'settings.rooms') WHERE id='game'",
+    )
+    full = await request(store, "GET", "/v2/agents/game/snapshot", role="game-agent")
+    assert full.status_code == 200, full.text
+    rooms = [s for s in full.json()["settings"] if s["namespace"] == "rooms"]
+    assert len(rooms) == 1 and rooms[0]["value"] == {
+        "maxRooms": 8,
+        "idleCloseSeconds": None,
+        "abandonCloseSeconds": None,
+    }
+    assert full.json()["settings"] == sorted(
+        full.json()["settings"], key=lambda s: (s["namespace"], s["target"])
+    )

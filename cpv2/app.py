@@ -38,6 +38,9 @@ BODY_LIMITS = {
     "/v2/console/logs": 65536,
     "/v2/console/suggest": 4096,
     "/v2/workshop/map": core.WORKSHOP_MAP_MAX_BODY,
+    # Game presence carries the optional gun catalog (the shared-dir
+    # gun-balance.json moves here); steady-state reports without it are small.
+    "/v2/rooms/report": 4 * 1024 * 1024,
 }
 
 # Public HTTPS entrypoint (coordination#35): CP runs twice from the same
@@ -1308,6 +1311,40 @@ def create_app(dsn=None):
         async with database.transaction() as conn:
             identity = await authenticate(conn, request.state.token)
             return await core.console_log_read(conn, identity, consumerId, since)
+
+    @app.post("/v2/rooms/report", status_code=201)
+    async def rooms_report(body: dict, request: Request):
+        # Live room/status report from the game itself, over its own agent
+        # credential (no new scope, no new provisioning): core checks the
+        # caller IS the consumer it reports for. The ingest wrote its own
+        # accepted audit; the pipeline must not add a second completed row.
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            result = await core.presence_report(
+                conn,
+                identity,
+                request.state.attempt,
+                (body or {}).get("consumerId"),
+                body,
+            )
+            request.state.completed_audited = True
+            return result
+
+    @app.get("/v2/rooms")
+    async def rooms_read(
+        request: Request,
+        consumerId: str = "game",
+        environment: str = "prod",
+        backend: str = "game",
+    ):
+        # Site/launcher rooms read: latest game report, no game-port polling
+        # and no status files. Scope settings.read rides the site token, so
+        # no provisioning changes.
+        async with database.transaction() as conn:
+            identity = await authenticate(conn, request.state.token)
+            return await core.presence_read(
+                conn, identity, consumerId, environment, backend
+            )
 
     @app.post("/v2/console/suggest")
     async def console_suggest(body: dict, request: Request):

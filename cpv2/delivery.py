@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 from cpv2.auth import Identity, Problem, audit, is_owner_session, now
 from cpv2.core import current_settings, event
 from cpv2.db import one, rows
-from cpv2.settings import canonical, digest
+from cpv2.settings import DEFINITIONS, canonical, digest
 
 STATES = ("received", "validated", "applied", "effective")
 # (kind, required scope) pairs a service credential may issue without an actor.
@@ -530,7 +530,12 @@ async def snapshot(conn, identity, cid):
     await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
     c = await consumer_for(conn, identity, cid, "agents.events")
     result = []
-    for namespace in ("gameplay", "gate"):
+    # Every settings namespace the consumer holds (gameplay, gate plus the
+    # settings.json-section namespaces rooms/deathmatch/classLocks/campaign/
+    # parcool/gunBalance/kits/disabledMapIds/ai-limits/workshop-ai from
+    # coordination#64 rows 10-11): capabilities gate delivery, so the proxy
+    # (settings.gate only) and scoped consumers are unaffected.
+    for namespace in DEFINITIONS:
         if f"settings.{namespace}" not in c["capabilities"]:
             continue
         settings = await rows(
